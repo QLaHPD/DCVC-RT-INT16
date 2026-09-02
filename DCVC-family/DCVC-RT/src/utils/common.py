@@ -4,10 +4,17 @@
 import json
 import os
 from unittest.mock import patch
+from pathlib import Path
 
 import torch
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 import numpy as np
+
+from ..layers.int16_inference import int16_inference_enabled, load_int16_lut_state, \
+    load_model_int16_state
+
+
+INT16_PREP_VERSION = 3
 
 
 def str2bool(v):
@@ -44,6 +51,58 @@ def get_state_dict(ckpt_path):
         ckpt = ckpt["net"]
     consume_prefix_in_state_dict_if_present(ckpt, prefix="module.")
     return ckpt
+
+
+def get_int16_prep_path(ckpt_path):
+    ckpt_path = Path(ckpt_path)
+    return ckpt_path.parent / f"{ckpt_path.name}.int16prep.pt"
+
+
+def load_int16_prep_state(ckpt_path):
+    prep_path = get_int16_prep_path(ckpt_path)
+    if not prep_path.exists():
+        return None
+    return torch.load(prep_path, map_location=torch.device('cpu'))
+
+
+def save_int16_prep_state(ckpt_path, prep_state):
+    prep_path = get_int16_prep_path(ckpt_path)
+    torch.save(prep_state, prep_path)
+
+
+def load_model_for_inference(model, ckpt_path, device, force_zero_thres=None):
+    state_dict = get_state_dict(ckpt_path)
+    if int16_inference_enabled() and torch.device(device).type == "cuda":
+        model = model.eval().float()
+        model.load_state_dict(state_dict)
+        if hasattr(model, "prepare_int16_inference"):
+            model.prepare_int16_inference()
+        prep_state = load_int16_prep_state(ckpt_path)
+        prep_state_is_current = prep_state is not None and prep_state.get("version", 0) >= INT16_PREP_VERSION
+        if prep_state_is_current:
+            if "int16_luts" in prep_state:
+                load_int16_lut_state(prep_state["int16_luts"])
+            if "int16_model_state" in prep_state:
+                load_model_int16_state(model, prep_state["int16_model_state"])
+        prepared_entropy_state = None
+        if prep_state_is_current and "gaussian_encoder" in prep_state and "bit_estimator_z" in prep_state:
+            prepared_entropy_state = prep_state
+        model.update(force_zero_thres, prepared_state=prepared_entropy_state)
+        needs_save = prep_state is None or prep_state.get("version", 0) < INT16_PREP_VERSION or \
+            "int16_model_state" not in prep_state or "int16_luts" not in prep_state
+        if needs_save and hasattr(model, "export_int16_prep"):
+            save_int16_prep_state(ckpt_path, model.export_int16_prep())
+        return model.to(device).eval()
+
+    device = torch.device(device)
+    model = model.to(device).eval()
+    if device.type == "cuda":
+        model = model.half()
+    else:
+        model = model.float()
+    model.load_state_dict(state_dict)
+    model.update(force_zero_thres)
+    return model
 
 
 @patch('json.encoder.c_make_encoder', None)

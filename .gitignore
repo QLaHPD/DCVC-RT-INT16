@@ -8,3 +8,17 @@ build/
 *.pyd
 *.egg-info
 *.json
+*.o
+*.a
+*.pt
+*.mkv
+*.mp4
+*.webm
+*.opus
+*.yuv
+__pycache__/
+.pytest_cache/
+.channel-state.json
+.archive-manifest.json
+.cleanup-audit.jsonl
+.progress.jsonl

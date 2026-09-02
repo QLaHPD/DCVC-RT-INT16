@@ -4,6 +4,9 @@
 import torch
 from torch import nn
 from .cuda_inference import CUSTOMIZED_CUDA_INFERENCE
+from .int16_inference import add_tensors_int16, apply_module_int16, clip_to_int16, \
+    conv2d_bias_pixel_shuffle_2_module_int16, conv2d_module_int16, depthwise_wsilu_module_int16, \
+    int16_inference_enabled, mul_feature_scale_int16, wsilu_chunk_add_int16, wsilu_int16
 if CUSTOMIZED_CUDA_INFERENCE:
     from .cuda_inference import DepthConvProxy, SubpelConv2xProxy
 
@@ -13,6 +16,8 @@ class WSiLU(nn.Module):
         super().__init__()
 
     def forward(self, x):
+        if x.dtype == torch.int16:
+            return wsilu_int16(x)
         return torch.sigmoid(4.0 * x) * x
 
 
@@ -22,6 +27,8 @@ class WSiLUChunkAdd(nn.Module):
         self.silu = WSiLU()
 
     def forward(self, x):
+        if x.dtype == torch.int16:
+            return wsilu_chunk_add_int16(x)
         x1, x2 = self.silu(x).chunk(2, 1)
         return x1 + x2
 
@@ -38,6 +45,8 @@ class SubpelConv2x(nn.Module):
         self.proxy = None
 
     def forward(self, x, to_cat=None, cat_at_front=True):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return self.forward_int(x, to_cat, cat_at_front)
         if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
             return self.forward_torch(x, to_cat, cat_at_front)
 
@@ -60,6 +69,14 @@ class SubpelConv2x(nn.Module):
             return self.proxy.forward(x)
 
         return self.proxy.forward_with_cat(x, to_cat, cat_at_front)
+
+    def forward_int(self, x, to_cat=None, cat_at_front=True):
+        out = conv2d_bias_pixel_shuffle_2_module_int16(x, self.conv[0])
+        if to_cat is None:
+            return out
+        if cat_at_front:
+            return torch.cat((to_cat, out), dim=1)
+        return torch.cat((out, to_cat), dim=1)
 
 
 class DepthConvBlock(nn.Module):
@@ -84,6 +101,8 @@ class DepthConvBlock(nn.Module):
         self.proxy = None
 
     def forward(self, x, quant_step=None, to_cat=None, cat_at_front=True):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return self.forward_int(x, quant_step, to_cat, cat_at_front)
         if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
             return self.forward_torch(x, quant_step, to_cat, cat_at_front)
 
@@ -131,6 +150,28 @@ class DepthConvBlock(nn.Module):
 
         return self.proxy.forward(x)
 
+    def forward_int(self, x, quant_step=None, to_cat=None, cat_at_front=True):
+        if self.adaptor is not None:
+            x = conv2d_module_int16(x, self.adaptor)
+        out = x
+        out = conv2d_module_int16(out, self.dc[0])
+        out = depthwise_wsilu_module_int16(out, self.dc[2])
+        out = conv2d_module_int16(out, self.dc[3])
+        out = add_tensors_int16(out, x)
+        identity = add_tensors_int16(out, x) if self.shortcut else out
+        ffn = conv2d_module_int16(out, self.ffn[0])
+        ffn = wsilu_chunk_add_int16(ffn)
+        out = conv2d_module_int16(ffn, self.ffn[2])
+        out = add_tensors_int16(out, identity)
+        if quant_step is not None:
+            out = mul_feature_scale_int16(out, quant_step)
+        if to_cat is not None:
+            if cat_at_front:
+                out = torch.cat((to_cat, out), dim=1)
+            else:
+                out = torch.cat((out, to_cat), dim=1)
+        return out
+
 
 class ResidualBlockWithStride2(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -139,6 +180,9 @@ class ResidualBlockWithStride2(nn.Module):
         self.conv = DepthConvBlock(out_ch, out_ch, shortcut=True)
 
     def forward(self, x):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            x = conv2d_module_int16(x, self.down)
+            return self.conv(x)
         x = self.down(x)
         out = self.conv(x)
         return out
@@ -151,6 +195,10 @@ class ResidualBlockUpsample(nn.Module):
         self.conv = DepthConvBlock(out_ch, out_ch, shortcut=True)
 
     def forward(self, x):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            out = self.up(x)
+            out = self.conv(out)
+            return out
         out = self.up(x)
         out = self.conv(out)
         return out

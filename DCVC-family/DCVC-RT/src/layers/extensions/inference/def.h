@@ -46,6 +46,37 @@ torch::Tensor round_and_to_int8_cuda(torch::Tensor& z);
 torch::Tensor clamp_reciprocal_with_quant_cuda(const torch::Tensor& q_dec, torch::Tensor& y,
                                                const float min_val);
 void add_and_multiply_cuda(torch::Tensor& x0, const torch::Tensor& x1, const torch::Tensor q);
+torch::Tensor conv2d_int16_cuda(const torch::Tensor& x, const torch::Tensor& weight,
+                                const torch::optional<torch::Tensor>& bias,
+                                const int stride_h, const int stride_w,
+                                const int pad_h, const int pad_w, const int groups);
+torch::Tensor add_bias_int16_cuda(const torch::Tensor& x, const torch::Tensor& bias);
+torch::Tensor add_tensors_int16_cuda(const torch::Tensor& x, const torch::Tensor& y);
+torch::Tensor mul_feature_scale_int16_cuda(const torch::Tensor& x, const torch::Tensor& scale);
+std::tuple<torch::Tensor, torch::Tensor> reciprocal_scale_int16_cuda(const torch::Tensor& q_dec,
+                                                                     const float min_val);
+torch::Tensor apply_lut_int16_cuda(const torch::Tensor& x, const torch::Tensor& lut);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+process_with_mask_int16_cuda(const torch::Tensor& y, const torch::Tensor& scales, const torch::Tensor& means,
+                             const torch::Tensor& mask, const int32_t force_zero_thres);
+void combine_for_reading_int16_cuda(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& mask,
+                                    const int parts);
+void restore_y_parts_int16_cuda(torch::Tensor& out, const torch::Tensor& y, const torch::Tensor& means,
+                                const torch::Tensor& mask, const int parts);
+std::tuple<torch::Tensor, torch::Tensor> build_index_dec_int16_cuda(const torch::Tensor& scales,
+                                                                    const torch::Tensor& lut,
+                                                                    const int32_t skip_thres);
+torch::Tensor build_index_enc_int16_cuda(const torch::Tensor& symbols, const torch::Tensor& scales,
+                                         const torch::Tensor& lut, const int32_t skip_thres);
+torch::Tensor add_and_multiply_int16_cuda(const torch::Tensor& x0, const torch::Tensor& x1,
+                                          const torch::Tensor& q);
+torch::Tensor bias_quant_int16_cuda(const torch::Tensor& x, const torch::Tensor& bias,
+                                    const torch::Tensor& quant_step);
+torch::Tensor wsilu_chunk_add_int16_cuda(const torch::Tensor& x, const torch::Tensor& lut);
+torch::Tensor bias_wsilu_depthwise_conv2d_int16_cuda(const torch::Tensor& x, const torch::Tensor& weight,
+                                                     const torch::Tensor& bias, const torch::Tensor& lut);
+torch::Tensor bias_pixel_shuffle_2_int16_cuda(const torch::Tensor& x, const torch::Tensor& bias);
+torch::Tensor bias_pixel_shuffle_8_int16_cuda(const torch::Tensor& x, const torch::Tensor& bias);
 
 torch::Tensor bias_wsilu_depthwise_conv2d_cuda(const torch::Tensor& x, const torch::Tensor& weight,
                                                const torch::Tensor& bias);

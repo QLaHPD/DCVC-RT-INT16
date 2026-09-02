@@ -4,9 +4,13 @@
 import torch
 from torch import nn
 
-from ..layers.cuda_inference import combine_for_reading_2x, \
+from ..layers.cuda_inference import combine_for_reading_2x, combine_for_reading_4x, \
     restore_y_2x, restore_y_2x_with_cat_after, add_and_multiply, \
     replicate_pad, restore_y_4x, clamp_reciprocal_with_quant
+from ..layers.int16_inference import add_tensors_int16, apply_module_int16, \
+    clamp_quant_step_int16, int16_inference_enabled, mul_feature_scale_int16, \
+    prior_quant_step_int16, reciprocal_scale_int16, export_int16_lut_state, \
+    export_model_int16_state
 from .entropy_models import BitEstimator, GaussianEncoder, EntropyCoder
 
 
@@ -28,6 +32,11 @@ class CompressionModel(nn.Module):
             self.cuda_streams[key] = torch.cuda.Stream(device, priority=priority)
         return self.cuda_streams[key]
 
+    def get_runtime_dtype(self, device):
+        if int16_inference_enabled() and device.type == "cuda":
+            return torch.int16
+        return next(self.parameters()).dtype
+
     @staticmethod
     def get_qp_num():
         return 64
@@ -46,13 +55,40 @@ class CompressionModel(nn.Module):
         new_w = (width + p - 1) // p * p
         return int(new_h / p + 0.5), int(new_w / p + 0.5)
 
-    def update(self, force_zero_thres=None):
+    def update(self, force_zero_thres=None, prepared_state=None):
         self.entropy_coder = EntropyCoder()
+        if prepared_state is not None:
+            self.gaussian_encoder.load_prepared(
+                self.entropy_coder,
+                prepared_state["gaussian_encoder"],
+                force_zero_thres=force_zero_thres,
+            )
+            self.bit_estimator_z.load_prepared(
+                self.entropy_coder,
+                prepared_state["bit_estimator_z"],
+            )
+            return
         self.gaussian_encoder.update(self.entropy_coder, force_zero_thres=force_zero_thres)
         self.bit_estimator_z.update(self.entropy_coder)
 
     def set_use_two_entropy_coders(self, use_two_entropy_coders):
         self.entropy_coder.set_use_two_entropy_coders(use_two_entropy_coders)
+
+    def export_int16_prep(self):
+        return {
+            "version": 3,
+            "bit_estimator_z": self.bit_estimator_z.get_serialized_cdf_info(),
+            "gaussian_encoder": self.gaussian_encoder.get_serialized_cdf_info(),
+            "int16_model_state": export_model_int16_state(self),
+            "int16_luts": export_int16_lut_state((
+                (
+                    self.gaussian_encoder.scale_min,
+                    self.gaussian_encoder.scale_max,
+                    self.gaussian_encoder.log_scale_min,
+                    self.gaussian_encoder.log_step_recip,
+                ),
+            )),
+        }
 
     def pad_for_y(self, y):
         _, _, H, W = y.size()
@@ -63,11 +99,20 @@ class CompressionModel(nn.Module):
     def separate_prior(self, params, is_video=False):
         if is_video:
             quant_step, scales, means = params.chunk(3, 1)
+            if int16_inference_enabled() and params.dtype == torch.int16 and params.is_cuda:
+                quant_step = clamp_quant_step_int16(quant_step)
+                q_enc = reciprocal_scale_int16(quant_step, 0.5)[1]
+                q_dec = quant_step
+                return q_enc, q_dec, scales, means
             quant_step = torch.clamp_min(quant_step, 0.5)
             q_enc = 1. / quant_step
             q_dec = quant_step
         else:
             q = params[:, :2, :, :]
+            if int16_inference_enabled() and params.dtype == torch.int16 and params.is_cuda:
+                q_enc, q_dec = prior_quant_step_int16(q).chunk(2, 1)
+                scales, means = params[:, 2:, :, :].chunk(2, 1)
+                return q_enc, q_dec, scales, means
             q_enc, q_dec = (torch.sigmoid(q) * 1.5 + 0.5).chunk(2, 1)
             scales, means = params[:, 2:, :, :].chunk(2, 1)
         return q_enc, q_dec, scales, means
@@ -81,11 +126,20 @@ class CompressionModel(nn.Module):
     @staticmethod
     def separate_prior_for_video_decoding(params):
         quant_step, scales, means = params.chunk(3, 1)
+        if int16_inference_enabled() and params.dtype == torch.int16 and params.is_cuda:
+            quant_step = clamp_quant_step_int16(quant_step)
+            return quant_step, scales, means
         quant_step = torch.clamp_min(quant_step, 0.5)
         return quant_step, scales, means
 
     def process_with_mask(self, y, scales, means, mask):
         return self.gaussian_encoder.process_with_mask(y, scales, means, mask)
+
+    @staticmethod
+    def apply_module(module, x):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return apply_module_int16(module, x)
+        return module(x)
 
     @staticmethod
     def get_one_mask(micro_mask, height, width, dtype, device):
@@ -149,7 +203,7 @@ class CompressionModel(nn.Module):
 
         _, y_q_0, y_hat_0, s_hat_0 = self.process_with_mask(y, scales, means, mask_0)
         cat_params = torch.cat((y_hat_0, common_params), dim=1)
-        scales, means = y_spatial_prior(cat_params).chunk(2, 1)
+        scales, means = self.apply_module(y_spatial_prior, cat_params).chunk(2, 1)
         _, y_q_1, y_hat_1, s_hat_1 = self.process_with_mask(y, scales, means, mask_1)
 
         y_hat = add_and_multiply(y_hat_0, y_hat_1, q_dec)
@@ -195,7 +249,7 @@ class CompressionModel(nn.Module):
                                             infos["skip_cond"], infos["indexes"])
         y_hat_0, cat_params = restore_y_2x_with_cat_after(y_q_r, infos["means"], infos["mask_0"],
                                                           common_params)
-        scales, means = y_spatial_prior(cat_params).chunk(2, 1)
+        scales, means = self.apply_module(y_spatial_prior, cat_params).chunk(2, 1)
         scales_r = combine_for_reading_2x(scales, infos["mask_1"], inplace=True)
         y_q_r = self.gaussian_encoder.decode_and_get_y(scales_r, dtype, device)
         y_hat_1 = restore_y_2x(y_q_r, means, infos["mask_1"])
@@ -217,33 +271,49 @@ class CompressionModel(nn.Module):
         y_?_3, means multiply with mask_3
         '''
         q_enc, q_dec, scales, means = self.separate_prior(common_params, False)
-        common_params = y_spatial_prior_reduction(common_params)
+        common_params = self.apply_module(y_spatial_prior_reduction, common_params)
         dtype = y.dtype
         device = y.device
         B, C, H, W = y.size()
         mask_0, mask_1, mask_2, mask_3 = self.get_mask_4x(B, C, H, W, dtype, device)
 
-        y = y * q_enc
+        if int16_inference_enabled() and y.dtype == torch.int16 and y.is_cuda:
+            y = mul_feature_scale_int16(y, q_enc)
+        else:
+            y = y * q_enc
 
         _, y_q_0, y_hat_0, s_hat_0 = self.process_with_mask(y, scales, means, mask_0)
 
         y_hat_so_far = y_hat_0
         params = torch.cat((y_hat_so_far, common_params), dim=1)
-        scales, means = y_spatial_prior(y_spatial_prior_adaptor_1(params)).chunk(2, 1)
+        scales, means = self.apply_module(
+            y_spatial_prior, self.apply_module(y_spatial_prior_adaptor_1, params)).chunk(2, 1)
         _, y_q_1, y_hat_1, s_hat_1 = self.process_with_mask(y, scales, means, mask_1)
 
-        y_hat_so_far = y_hat_so_far + y_hat_1
+        if int16_inference_enabled() and y_hat_so_far.dtype == torch.int16 and y_hat_so_far.is_cuda:
+            y_hat_so_far = add_tensors_int16(y_hat_so_far, y_hat_1)
+        else:
+            y_hat_so_far = y_hat_so_far + y_hat_1
         params = torch.cat((y_hat_so_far, common_params), dim=1)
-        scales, means = y_spatial_prior(y_spatial_prior_adaptor_2(params)).chunk(2, 1)
+        scales, means = self.apply_module(
+            y_spatial_prior, self.apply_module(y_spatial_prior_adaptor_2, params)).chunk(2, 1)
         _, y_q_2, y_hat_2, s_hat_2 = self.process_with_mask(y, scales, means, mask_2)
 
-        y_hat_so_far = y_hat_so_far + y_hat_2
+        if int16_inference_enabled() and y_hat_so_far.dtype == torch.int16 and y_hat_so_far.is_cuda:
+            y_hat_so_far = add_tensors_int16(y_hat_so_far, y_hat_2)
+        else:
+            y_hat_so_far = y_hat_so_far + y_hat_2
         params = torch.cat((y_hat_so_far, common_params), dim=1)
-        scales, means = y_spatial_prior(y_spatial_prior_adaptor_3(params)).chunk(2, 1)
+        scales, means = self.apply_module(
+            y_spatial_prior, self.apply_module(y_spatial_prior_adaptor_3, params)).chunk(2, 1)
         _, y_q_3, y_hat_3, s_hat_3 = self.process_with_mask(y, scales, means, mask_3)
 
-        y_hat = y_hat_so_far + y_hat_3
-        y_hat = y_hat * q_dec
+        if int16_inference_enabled() and y_hat_so_far.dtype == torch.int16 and y_hat_so_far.is_cuda:
+            y_hat = add_tensors_int16(y_hat_so_far, y_hat_3)
+            y_hat = mul_feature_scale_int16(y_hat, q_dec)
+        else:
+            y_hat = y_hat_so_far + y_hat_3
+            y_hat = y_hat * q_dec
 
         y_q_w_0 = self.single_part_for_writing_4x(y_q_0)
         y_q_w_1 = self.single_part_for_writing_4x(y_q_1)
@@ -259,38 +329,65 @@ class CompressionModel(nn.Module):
                             y_spatial_prior_adaptor_1, y_spatial_prior_adaptor_2,
                             y_spatial_prior_adaptor_3, y_spatial_prior):
         _, quant_step, scales, means = self.separate_prior(common_params, False)
-        common_params = y_spatial_prior_reduction(common_params)
+        common_params = self.apply_module(y_spatial_prior_reduction, common_params)
         dtype = means.dtype
         device = means.device
         B, C, H, W = means.size()
         mask_0, mask_1, mask_2, mask_3 = self.get_mask_4x(B, C, H, W, dtype, device)
 
-        scales_r = self.single_part_for_writing_4x(scales * mask_0)
+        if int16_inference_enabled() and scales.dtype == torch.int16 and scales.is_cuda:
+            scales_r = combine_for_reading_4x(scales, mask_0)
+        else:
+            scales_r = self.single_part_for_writing_4x(scales * mask_0)
         y_q_r = self.gaussian_encoder.decode_and_get_y(scales_r, dtype, device)
         y_hat_curr_step = restore_y_4x(y_q_r, means, mask_0)
         y_hat_so_far = y_hat_curr_step
 
         params = torch.cat((y_hat_so_far, common_params), dim=1)
-        scales, means = y_spatial_prior(y_spatial_prior_adaptor_1(params)).chunk(2, 1)
-        scales_r = self.single_part_for_writing_4x(scales * mask_1)
+        scales, means = self.apply_module(
+            y_spatial_prior, self.apply_module(y_spatial_prior_adaptor_1, params)).chunk(2, 1)
+        if int16_inference_enabled() and scales.dtype == torch.int16 and scales.is_cuda:
+            scales_r = combine_for_reading_4x(scales, mask_1)
+        else:
+            scales_r = self.single_part_for_writing_4x(scales * mask_1)
         y_q_r = self.gaussian_encoder.decode_and_get_y(scales_r, dtype, device)
         y_hat_curr_step = restore_y_4x(y_q_r, means, mask_1)
-        y_hat_so_far = y_hat_so_far + y_hat_curr_step
+        if int16_inference_enabled() and y_hat_so_far.dtype == torch.int16 and y_hat_so_far.is_cuda:
+            y_hat_so_far = add_tensors_int16(y_hat_so_far, y_hat_curr_step)
+        else:
+            y_hat_so_far = y_hat_so_far + y_hat_curr_step
 
         params = torch.cat((y_hat_so_far, common_params), dim=1)
-        scales, means = y_spatial_prior(y_spatial_prior_adaptor_2(params)).chunk(2, 1)
-        scales_r = self.single_part_for_writing_4x(scales * mask_2)
+        scales, means = self.apply_module(
+            y_spatial_prior, self.apply_module(y_spatial_prior_adaptor_2, params)).chunk(2, 1)
+        if int16_inference_enabled() and scales.dtype == torch.int16 and scales.is_cuda:
+            scales_r = combine_for_reading_4x(scales, mask_2)
+        else:
+            scales_r = self.single_part_for_writing_4x(scales * mask_2)
         y_q_r = self.gaussian_encoder.decode_and_get_y(scales_r, dtype, device)
         y_hat_curr_step = restore_y_4x(y_q_r, means, mask_2)
-        y_hat_so_far = y_hat_so_far + y_hat_curr_step
+        if int16_inference_enabled() and y_hat_so_far.dtype == torch.int16 and y_hat_so_far.is_cuda:
+            y_hat_so_far = add_tensors_int16(y_hat_so_far, y_hat_curr_step)
+        else:
+            y_hat_so_far = y_hat_so_far + y_hat_curr_step
 
         params = torch.cat((y_hat_so_far, common_params), dim=1)
-        scales, means = y_spatial_prior(y_spatial_prior_adaptor_3(params)).chunk(2, 1)
-        scales_r = self.single_part_for_writing_4x(scales * mask_3)
+        scales, means = self.apply_module(
+            y_spatial_prior, self.apply_module(y_spatial_prior_adaptor_3, params)).chunk(2, 1)
+        if int16_inference_enabled() and scales.dtype == torch.int16 and scales.is_cuda:
+            scales_r = combine_for_reading_4x(scales, mask_3)
+        else:
+            scales_r = self.single_part_for_writing_4x(scales * mask_3)
         y_q_r = self.gaussian_encoder.decode_and_get_y(scales_r, dtype, device)
         y_hat_curr_step = restore_y_4x(y_q_r, means, mask_3)
-        y_hat_so_far = y_hat_so_far + y_hat_curr_step
+        if int16_inference_enabled() and y_hat_so_far.dtype == torch.int16 and y_hat_so_far.is_cuda:
+            y_hat_so_far = add_tensors_int16(y_hat_so_far, y_hat_curr_step)
+        else:
+            y_hat_so_far = y_hat_so_far + y_hat_curr_step
 
-        y_hat = y_hat_so_far * quant_step
+        if int16_inference_enabled() and y_hat_so_far.dtype == torch.int16 and y_hat_so_far.is_cuda:
+            y_hat = mul_feature_scale_int16(y_hat_so_far, quant_step)
+        else:
+            y_hat = y_hat_so_far * quant_step
 
         return y_hat

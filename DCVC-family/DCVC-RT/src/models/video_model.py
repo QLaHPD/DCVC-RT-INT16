@@ -10,6 +10,11 @@ from ..layers.layers import SubpelConv2x, DepthConvBlock, \
     ResidualBlockUpsample, ResidualBlockWithStride2
 from ..layers.cuda_inference import CUSTOMIZED_CUDA_INFERENCE, round_and_to_int8, \
     bias_pixel_shuffle_8, bias_quant
+from ..layers.int16_inference import apply_module_int16, \
+    conv2d_bias_pixel_shuffle_8_module_int16, conv2d_bias_quant_module_int16, conv2d_module_int16, \
+    feature_to_float, feature_to_int16, get_prepared_feature_param_slice, \
+    int16_inference_enabled, mul_feature_scale_int16, prepare_feature_param_int16, \
+    prepare_model_int16_convs
 
 
 qp_shift = [0, 8, 4]
@@ -43,6 +48,9 @@ class FeatureExtractor(nn.Module):
 
     def forward_part1(self, x, quant):
         x1 = self.conv1(x)
+        if int16_inference_enabled() and x1.dtype == torch.int16 and x1.is_cuda:
+            ctx_t = mul_feature_scale_int16(x1, quant)
+            return x1, ctx_t
         ctx_t = x1 * quant
         return x1, ctx_t
 
@@ -64,7 +72,24 @@ class Encoder(nn.Module):
 
         self.fuse_conv1_flag = False
 
+    def fuse_conv1(self):
+        if self.fuse_conv1_flag:
+            return
+        fuse_weight1 = torch.matmul(
+            self.conv2[0].adaptor.weight[:, :g_ch_d, 0, 0],
+            self.conv1.weight[:, :, 0, 0]
+        )[:, :, None, None]
+        fuse_weight2 = self.conv2[0].adaptor.weight[:, g_ch_d:]
+        self.conv2[0].adaptor.bias.data = self.conv2[0].adaptor.bias + \
+            torch.matmul(self.conv2[0].adaptor.weight[:, :g_ch_d, 0, 0],
+                         self.conv1.bias[:, None])[:, 0]
+        self.conv2[0].adaptor.weight.data = torch.cat([fuse_weight1, fuse_weight2], dim=1)
+        self.fuse_conv1_flag = True
+
     def forward(self, x, ctx, quant_step):
+        if int16_inference_enabled() and x.is_cuda:
+            feature = F.pixel_unshuffle(feature_to_int16(x), 8)
+            return self.forward_int(feature, ctx, quant_step)
         feature = F.pixel_unshuffle(x, 8)
         if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
             return self.forward_torch(feature, ctx, quant_step)
@@ -79,21 +104,19 @@ class Encoder(nn.Module):
         return feature
 
     def forward_cuda(self, feature, ctx, quant_step):
-        if not self.fuse_conv1_flag:
-            fuse_weight1 = torch.matmul(
-                self.conv2[0].adaptor.weight[:, :g_ch_d, 0, 0],
-                self.conv1.weight[:, :, 0, 0]
-            )[:, :, None, None]
-            fuse_weight2 = self.conv2[0].adaptor.weight[:, g_ch_d:]
-            self.conv2[0].adaptor.bias.data = self.conv2[0].adaptor.bias + \
-                torch.matmul(self.conv2[0].adaptor.weight[:, :g_ch_d, 0, 0],
-                             self.conv1.bias[:, None])[:, 0]
-            self.conv2[0].adaptor.weight.data = torch.cat([fuse_weight1, fuse_weight2], dim=1)
-            self.fuse_conv1_flag = True
-
+        self.fuse_conv1()
         feature = self.conv2(torch.cat((feature, ctx), dim=1))
         feature = self.conv3(feature, quant_step=quant_step)
         feature = self.down(feature)
+        return feature
+
+    def forward_int(self, feature, ctx, quant_step):
+        if not self.fuse_conv1_flag:
+            feature = conv2d_module_int16(feature, self.conv1)
+        feature = self.conv2(torch.cat((feature, ctx), dim=1))
+        feature = self.conv3(feature)
+        feature = mul_feature_scale_int16(feature, quant_step)
+        feature = conv2d_module_int16(feature, self.down)
         return feature
 
 
@@ -109,6 +132,8 @@ class Decoder(nn.Module):
         self.conv2 = nn.Conv2d(g_ch_d, g_ch_d, 1)
 
     def forward(self, x, ctx, quant_step,):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return self.forward_int(x, ctx, quant_step)
         if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
             return self.forward_torch(x, ctx, quant_step)
 
@@ -128,6 +153,12 @@ class Decoder(nn.Module):
         feature = bias_quant(feature, self.conv2.bias, quant_step)
         return feature
 
+    def forward_int(self, x, ctx, quant_step):
+        feature = self.up(x, to_cat=ctx, cat_at_front=False)
+        feature = self.conv1(feature)
+        feature = conv2d_bias_quant_module_int16(feature, self.conv2, quant_step)
+        return feature
+
 
 class ReconGeneration(nn.Module):
     def __init__(self):
@@ -141,6 +172,8 @@ class ReconGeneration(nn.Module):
         self.head = nn.Conv2d(g_ch_recon, g_ch_src_d, 1)
 
     def forward(self, x, quant_step):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return self.forward_int(x, quant_step)
         if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
             return self.forward_torch(x, quant_step)
 
@@ -162,6 +195,11 @@ class ReconGeneration(nn.Module):
         out = F.conv2d(out, self.head.weight)
         return bias_pixel_shuffle_8(out, self.head.bias)
 
+    def forward_int(self, x, quant_step):
+        out = self.conv(x)
+        out = mul_feature_scale_int16(out, quant_step)
+        return conv2d_bias_pixel_shuffle_8_module_int16(out, self.head)
+
 
 class HyperEncoder(nn.Module):
     def __init__(self):
@@ -173,6 +211,8 @@ class HyperEncoder(nn.Module):
         )
 
     def forward(self, x):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return apply_module_int16(self.conv, x)
         return self.conv(x)
 
 
@@ -186,6 +226,8 @@ class HyperDecoder(nn.Module):
         )
 
     def forward(self, x):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return apply_module_int16(self.conv, x)
         return self.conv(x)
 
 
@@ -200,6 +242,8 @@ class PriorFusion(nn.Module):
         )
 
     def forward(self, x):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return apply_module_int16(self.conv, x)
         return self.conv(x)
 
 
@@ -213,6 +257,8 @@ class SpatialPrior(nn.Module):
         )
 
     def forward(self, x):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return apply_module_int16(self.conv, x)
         return self.conv(x)
 
 
@@ -250,6 +296,14 @@ class DMC(CompressionModel):
         self.max_dpb_size = 1
         self.curr_poc = 0
 
+    def prepare_int16_inference(self):
+        self.encoder.fuse_conv1()
+        prepare_model_int16_convs(self)
+        prepare_feature_param_int16(self, "q_encoder", self.q_encoder)
+        prepare_feature_param_int16(self, "q_decoder", self.q_decoder)
+        prepare_feature_param_int16(self, "q_feature", self.q_feature)
+        prepare_feature_param_int16(self, "q_recon", self.q_recon)
+
     def reset_ref_feature(self):
         if len(self.dpb) > 0:
             self.dpb[0].feature = None
@@ -273,7 +327,12 @@ class DMC(CompressionModel):
 
     def apply_feature_adaptor(self):
         if self.dpb[0].feature is None:
+            frame = self.dpb[0].frame
+            if int16_inference_enabled() and isinstance(frame, torch.Tensor) and frame.is_cuda:
+                return self.feature_adaptor_i(F.pixel_unshuffle(feature_to_int16(frame), 8))
             return self.feature_adaptor_i(F.pixel_unshuffle(self.dpb[0].frame, 8))
+        if int16_inference_enabled() and self.dpb[0].feature.dtype == torch.int16 and self.dpb[0].feature.is_cuda:
+            return conv2d_module_int16(self.dpb[0].feature, self.feature_adaptor_p)
         return self.feature_adaptor_p(self.dpb[0].feature)
 
     def res_prior_param_decoder(self, z_hat, ctx_t):
@@ -292,17 +351,34 @@ class DMC(CompressionModel):
 
     def prepare_feature_adaptor_i(self, last_qp):
         if self.dpb[0].frame is None:
-            q_recon = self.q_recon[last_qp:last_qp+1, :, :, :]
-            self.dpb[0].frame = self.recon_generation_net(self.dpb[0].feature, q_recon).clamp_(0, 1)
+            if int16_inference_enabled() and self.dpb[0].feature is not None and self.dpb[0].feature.is_cuda:
+                q_recon = get_prepared_feature_param_slice(
+                    self, "q_recon", self.q_recon, last_qp, last_qp + 1, self.dpb[0].feature.device
+                )
+            else:
+                q_recon = self.q_recon[last_qp:last_qp+1, :, :, :]
+            frame = self.recon_generation_net(self.dpb[0].feature, q_recon)
+            self.dpb[0].frame = frame if frame.dtype == torch.int16 else frame.clamp_(0, 1)
             self.reset_ref_feature()
 
     def compress(self, x, qp):
         # pic_width and pic_height may be different from x's size. x here is after padding
         # x_hat has the same size with x
         device = x.device
-        q_encoder = self.q_encoder[qp:qp+1, :, :, :]
-        q_decoder = self.q_decoder[qp:qp+1, :, :, :]
-        q_feature = self.q_feature[qp:qp+1, :, :, :]
+        if int16_inference_enabled() and x.is_cuda:
+            q_encoder = get_prepared_feature_param_slice(
+                self, "q_encoder", self.q_encoder, qp, qp + 1, device
+            )
+            q_decoder = get_prepared_feature_param_slice(
+                self, "q_decoder", self.q_decoder, qp, qp + 1, device
+            )
+            q_feature = get_prepared_feature_param_slice(
+                self, "q_feature", self.q_feature, qp, qp + 1, device
+            )
+        else:
+            q_encoder = self.q_encoder[qp:qp+1, :, :, :]
+            q_decoder = self.q_decoder[qp:qp+1, :, :, :]
+            q_feature = self.q_feature[qp:qp+1, :, :, :]
 
         feature = self.apply_feature_adaptor()
         ctx, ctx_t = self.feature_extractor(feature, q_feature)
@@ -334,18 +410,32 @@ class DMC(CompressionModel):
 
         bit_stream = self.entropy_coder.get_encoded_stream()
 
-        torch.cuda.synchronize(device=device)
+        # `feature` is produced and consumed by the default stream.  The next
+        # frame's feature adaptor is therefore ordered after this decoder work
+        # without a device-wide host barrier.  Entropy work is already complete
+        # here because get_encoded_stream() follows its blocking CPU transfers.
         self.add_ref_frame(feature, None)
         return {
             'bit_stream': bit_stream,
         }
 
     def decompress(self, bit_stream, sps, qp):
-        dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
-        q_decoder = self.q_decoder[qp:qp+1, :, :, :]
-        q_feature = self.q_feature[qp:qp+1, :, :, :]
-        q_recon = self.q_recon[qp:qp+1, :, :, :]
+        dtype = self.get_runtime_dtype(device)
+        if int16_inference_enabled() and device.type == "cuda":
+            q_decoder = get_prepared_feature_param_slice(
+                self, "q_decoder", self.q_decoder, qp, qp + 1, device
+            )
+            q_feature = get_prepared_feature_param_slice(
+                self, "q_feature", self.q_feature, qp, qp + 1, device
+            )
+            q_recon = get_prepared_feature_param_slice(
+                self, "q_recon", self.q_recon, qp, qp + 1, device
+            )
+        else:
+            q_decoder = self.q_decoder[qp:qp+1, :, :, :]
+            q_feature = self.q_feature[qp:qp+1, :, :, :]
+            q_recon = self.q_recon[qp:qp+1, :, :, :]
 
         self.entropy_coder.set_use_two_entropy_coders(sps['ec_part'] == 1)
         self.entropy_coder.set_stream(bit_stream)
@@ -361,16 +451,22 @@ class DMC(CompressionModel):
 
         ctx = self.feature_extractor.forward_part2(c1)
 
-        cuda_stream = self.get_cuda_stream(device=device, priority=-1)
-        with torch.cuda.stream(cuda_stream):
-            y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
-            cuda_event = torch.cuda.Event()
-            cuda_event.record()
+        if device.type == "cuda":
+            cuda_stream = self.get_cuda_stream(device=device, priority=-1)
+            with torch.cuda.stream(cuda_stream):
+                y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
+                cuda_event = torch.cuda.Event()
+                cuda_event.record()
 
-        cuda_event.wait()
+            cuda_event.wait()
+        else:
+            y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
         x_hat, feature = self.get_recon_and_feature(y_hat, ctx, q_decoder, q_recon)
 
-        self.add_ref_frame(feature, x_hat)
+        stored_frame = x_hat
+        if isinstance(x_hat, torch.Tensor) and x_hat.dtype == torch.int16:
+            x_hat = feature_to_float(x_hat).clamp_(0, 1)
+        self.add_ref_frame(feature, stored_frame)
         return {
             'x_hat': x_hat,
         }

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -21,7 +21,7 @@ __forceinline__ __host__ bool can_vectorize(void* pointer)
 }
 
 template <typename vec_t>
-__forceinline__ std::tuple<dim3, dim3, at::cuda::CUDAStream, bool, bool, int, int>
+__forceinline__ std::tuple<dim3, dim3, c10::cuda::CUDAStream, bool, bool, int, int>
 get_kernel_launch_info(const torch::Tensor& x, const int cDiv = 1, const bool allow_useVec = true)
 {
     const torch::IntArrayRef x_shape = x.sizes();
@@ -36,11 +36,11 @@ get_kernel_launch_info(const torch::Tensor& x, const int cDiv = 1, const bool al
     const bool biasSafe = HW % 4 == 0;
     const int factor = useVec ? 4 : 1;
     const dim3 gridDim((N / factor + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    return { blockDim, gridDim, at::cuda::getCurrentCUDAStream(), useVec, biasSafe, N / factor, HW };
+    return { blockDim, gridDim, c10::cuda::getCurrentCUDAStream(), useVec, biasSafe, N / factor, HW };
 }
 
 template <typename vec_t>
-__forceinline__ std::tuple<dim3, dim3, at::cuda::CUDAStream, bool, int>
+__forceinline__ std::tuple<dim3, dim3, c10::cuda::CUDAStream, bool, int>
 get_kernel_launch_info_flatten(const torch::Tensor& x)
 {
     const int N = x.numel();
@@ -49,7 +49,7 @@ get_kernel_launch_info_flatten(const torch::Tensor& x)
     const bool useVec = N % 4 == 0 && can_vectorize<vec_t>(x.data_ptr());
     const int factor = useVec ? 4 : 1;
     const dim3 gridDim((N / factor + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    return { blockDim, gridDim, at::cuda::getCurrentCUDAStream(), useVec, N / factor };
+    return { blockDim, gridDim, c10::cuda::getCurrentCUDAStream(), useVec, N / factor };
 }
 
 template <typename scalar_t, typename T, bool forceZero = false>
@@ -742,7 +742,7 @@ __forceinline__ void bias_pixel_shuffle_2_dispatcher(torch::Tensor& out, const t
     const int BLOCK_SIZE = 128;
     const dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, C / 4);
     const dim3 blockDim(BLOCK_SIZE);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     bias_pixel_shuffle_2_kernel<scalar_t><<<gridDim, blockDim, 0, stream>>>(
         out.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
         x.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
@@ -800,7 +800,7 @@ __forceinline__ void bias_pixel_shuffle_8_dispatcher(torch::Tensor& out, const t
     const int BLOCK_SIZE = 128;
     const dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, C / 64);
     const dim3 blockDim(BLOCK_SIZE);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     if (clamp) {
         bias_pixel_shuffle_8_kernel<scalar_t, true><<<gridDim, blockDim, 0, stream>>>(
             out.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
@@ -975,7 +975,7 @@ __forceinline__ void replicate_pad_dispatcher(torch::Tensor& out, const torch::T
     const int BLOCK_SIZE = 128;
     const dim3 blockDim(BLOCK_SIZE);
     const dim3 gridDim((totalOutPixel + BLOCK_SIZE - 1) / BLOCK_SIZE, B);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
 
     replicate_pad_kernel<scalar_t><<<gridDim, blockDim, 0, stream>>>(
         out.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
@@ -1130,7 +1130,7 @@ torch::Tensor bias_wsilu_depthwise_conv2d_cuda(const torch::Tensor& x, const tor
     const int THREAD_NUM_Y = 8;
     const dim3 gridDim((W + BLOCK_SIZE - 1) / BLOCK_SIZE, (H + BLOCK_SIZE - 1) / BLOCK_SIZE, B * C);
     const dim3 blockDim(THREAD_NUM_X, THREAD_NUM_Y);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     if (x.dtype() == torch::kFloat32) {
         bias_wsilu_depthwise_conv2d_kernel<float, float, BLOCK_SIZE, THREAD_NUM_X, THREAD_NUM_Y>
             <<<gridDim, blockDim, 0, stream>>>(

@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from .common_model import CompressionModel
 from ..layers.layers import DepthConvBlock, ResidualBlockUpsample, ResidualBlockWithStride2
 from ..layers.cuda_inference import CUSTOMIZED_CUDA_INFERENCE, round_and_to_int8
+from ..layers.int16_inference import FEATURE_SCALE, apply_module_int16, feature_to_float, \
+    feature_to_int16, get_prepared_feature_param_slice, int16_inference_enabled, \
+    mul_feature_scale_int16, prepare_feature_param_int16, prepare_model_int16_convs
 
 g_ch_src = 3 * 8 * 8
 g_ch_enc_dec = 368
@@ -30,6 +33,9 @@ class IntraEncoder(nn.Module):
         )
 
     def forward(self, x, quant_step):
+        if int16_inference_enabled() and x.is_cuda:
+            out = F.pixel_unshuffle(feature_to_int16(x), 8)
+            return self.forward_int(out, quant_step)
         out = F.pixel_unshuffle(x, 8)
         if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
             return self.forward_torch(out, quant_step)
@@ -44,6 +50,11 @@ class IntraEncoder(nn.Module):
     def forward_cuda(self, out, quant_step):
         out = self.enc_1(out, quant_step=quant_step)
         return self.enc_2(out)
+
+    def forward_int(self, out, quant_step):
+        out = self.enc_1(out)
+        out = mul_feature_scale_int16(out, quant_step)
+        return apply_module_int16(self.enc_2, out)
 
 
 class IntraDecoder(nn.Module):
@@ -68,6 +79,8 @@ class IntraDecoder(nn.Module):
         self.dec_2 = DepthConvBlock(g_ch_enc_dec, g_ch_src)
 
     def forward(self, x, quant_step):
+        if int16_inference_enabled() and x.is_cuda and x.dtype == torch.int16:
+            return self.forward_int(x, quant_step)
         if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
             return self.forward_torch(x, quant_step)
 
@@ -97,6 +110,13 @@ class IntraDecoder(nn.Module):
         out = self.dec_2(out)
         out = F.pixel_shuffle(out, 8)
         return out
+
+    def forward_int(self, x, quant_step):
+        out = self.dec_1(x)
+        out = mul_feature_scale_int16(out, quant_step)
+        out = self.dec_2(out)
+        out = F.pixel_shuffle(out, 8)
+        return torch.clamp(out.to(dtype=torch.int32), 0, FEATURE_SCALE).to(dtype=torch.int16)
 
 
 class DMCI(CompressionModel):
@@ -140,10 +160,23 @@ class DMCI(CompressionModel):
         self.q_scale_enc = nn.Parameter(torch.ones((self.get_qp_num(), g_ch_enc_dec, 1, 1)))
         self.q_scale_dec = nn.Parameter(torch.ones((self.get_qp_num(), g_ch_enc_dec, 1, 1)))
 
+    def prepare_int16_inference(self):
+        prepare_model_int16_convs(self)
+        prepare_feature_param_int16(self, "q_scale_enc", self.q_scale_enc)
+        prepare_feature_param_int16(self, "q_scale_dec", self.q_scale_dec)
+
     def compress(self, x, qp):
         device = x.device
-        curr_q_enc = self.q_scale_enc[qp:qp+1, :, :, :]
-        curr_q_dec = self.q_scale_dec[qp:qp+1, :, :, :]
+        if int16_inference_enabled() and x.is_cuda:
+            curr_q_enc = get_prepared_feature_param_slice(
+                self, "q_scale_enc", self.q_scale_enc, qp, qp + 1, device
+            )
+            curr_q_dec = get_prepared_feature_param_slice(
+                self, "q_scale_dec", self.q_scale_dec, qp, qp + 1, device
+            )
+        else:
+            curr_q_enc = self.q_scale_enc[qp:qp+1, :, :, :]
+            curr_q_dec = self.q_scale_dec[qp:qp+1, :, :, :]
 
         y = self.enc(x, curr_q_enc)
         y_pad = self.pad_for_y(y)
@@ -151,7 +184,7 @@ class DMCI(CompressionModel):
         z_hat, z_hat_write = round_and_to_int8(z)
 
         params = self.hyper_dec(z_hat)
-        params = self.y_prior_fusion(params)
+        params = self.apply_module(self.y_prior_fusion, params)
         _, _, yH, yW = y.shape
         params = params[:, :, :yH, :yW].contiguous()
         y_q_w_0, y_q_w_1, y_q_w_2, y_q_w_3, s_w_0, s_w_1, s_w_2, s_w_3, y_hat = \
@@ -162,7 +195,8 @@ class DMCI(CompressionModel):
 
         cuda_event = torch.cuda.Event()
         cuda_event.record()
-        x_hat = self.dec(y_hat, curr_q_dec).clamp_(0, 1)
+        x_hat = self.dec(y_hat, curr_q_dec)
+        x_hat_out = feature_to_float(x_hat).clamp_(0, 1) if x_hat.dtype == torch.int16 else x_hat.clamp_(0, 1)
 
         cuda_stream = self.get_cuda_stream(device=device, priority=-1)
         with torch.cuda.stream(cuda_stream):
@@ -177,17 +211,24 @@ class DMCI(CompressionModel):
 
         bit_stream = self.entropy_coder.get_encoded_stream()
 
-        torch.cuda.synchronize(device=device)
+        # x_hat_out stays on the default stream and its P-frame consumer is
+        # ordered on that same stream.  Avoid a device-wide host barrier after
+        # the independent entropy stream has already produced the bitstream.
         result = {
             "bit_stream": bit_stream,
-            "x_hat": x_hat,
+            "x_hat": x_hat_out,
         }
         return result
 
     def decompress(self, bit_stream, sps, qp):
-        dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
-        curr_q_dec = self.q_scale_dec[qp:qp+1, :, :, :]
+        dtype = self.get_runtime_dtype(device)
+        if int16_inference_enabled() and device.type == "cuda":
+            curr_q_dec = get_prepared_feature_param_slice(
+                self, "q_scale_dec", self.q_scale_dec, qp, qp + 1, device
+            )
+        else:
+            curr_q_dec = self.q_scale_dec[qp:qp+1, :, :, :]
 
         self.entropy_coder.set_use_two_entropy_coders(sps['ec_part'] == 1)
         self.entropy_coder.set_stream(bit_stream)
@@ -198,12 +239,16 @@ class DMCI(CompressionModel):
         z_hat = z_q
 
         params = self.hyper_dec(z_hat)
-        params = self.y_prior_fusion(params)
+        params = self.apply_module(self.y_prior_fusion, params)
         params = params[:, :, :y_height, :y_width].contiguous()
         y_hat = self.decompress_prior_4x(params, self.y_spatial_prior_reduction,
                                          self.y_spatial_prior_adaptor_1,
                                          self.y_spatial_prior_adaptor_2,
                                          self.y_spatial_prior_adaptor_3, self.y_spatial_prior)
 
-        x_hat = self.dec(y_hat, curr_q_dec).clamp_(0, 1)
+        x_hat = self.dec(y_hat, curr_q_dec)
+        if x_hat.dtype == torch.int16:
+            x_hat = feature_to_float(x_hat).clamp_(0, 1)
+        else:
+            x_hat = x_hat.clamp_(0, 1)
         return {"x_hat": x_hat}

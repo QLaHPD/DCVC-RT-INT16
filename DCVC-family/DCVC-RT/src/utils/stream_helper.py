@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import enum
+import os
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -53,6 +55,22 @@ def write_bytes(fd, values, fmt=">{:d}s"):
 def read_bytes(fd, n, fmt=">{:d}s"):
     sz = struct.calcsize("s")
     return struct.unpack(fmt.format(n), fd.read(n * sz))[0]
+
+
+def skip_bytes(fd, n):
+    if n <= 0:
+        return 0
+    if hasattr(fd, "seek"):
+        fd.seek(n, os.SEEK_CUR)
+        return n
+
+    remaining = n
+    while remaining > 0:
+        chunk = fd.read(min(remaining, 1024 * 1024))
+        if not chunk:
+            raise struct.error("unexpected end of stream while skipping bytes")
+        remaining -= len(chunk)
+    return n
 
 
 def write_ushorts(fd, values, fmt=">{:d}H"):
@@ -109,6 +127,13 @@ class NalType(enum.IntEnum):
     NAL_SPS = 0
     NAL_I = 1
     NAL_P = 2
+
+
+@dataclass
+class BitstreamInfo:
+    frame_count: int
+    width: int
+    height: int
 
 
 class SPSHelper():
@@ -215,3 +240,45 @@ def read_ip_remaining(f):
     stream_length = read_uint_adaptive(f)
     bit_stream = read_bytes(f, stream_length)
     return qp, bit_stream
+
+
+def skip_ip_remaining(f):
+    qp = read_uchars(f, 1)[0]
+    stream_length = read_uint_adaptive(f)
+    skip_bytes(f, stream_length)
+    return qp, stream_length
+
+
+def inspect_bitstream(path):
+    frame_count = 0
+    width = 0
+    height = 0
+    sps_helper = SPSHelper()
+
+    with Path(path).open("rb") as f:
+        while True:
+            try:
+                header = read_header(f)
+            except struct.error:
+                break
+
+            if header['nal_type'] == NalType.NAL_SPS:
+                sps = read_sps_remaining(f, header['sps_id'])
+                sps_helper.add_sps_by_id(sps)
+                if width <= 0 or height <= 0:
+                    width = sps['width']
+                    height = sps['height']
+                continue
+
+            if header['nal_type'] in (NalType.NAL_I, NalType.NAL_P):
+                sps = sps_helper.get_sps_by_id(header['sps_id'])
+                if sps is not None and (width <= 0 or height <= 0):
+                    width = sps['width']
+                    height = sps['height']
+                skip_ip_remaining(f)
+                frame_count += 1
+                continue
+
+            break
+
+    return BitstreamInfo(frame_count=frame_count, width=width, height=height)

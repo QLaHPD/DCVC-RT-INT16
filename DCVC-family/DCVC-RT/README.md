@@ -1,157 +1,130 @@
-# Introduction
+# DCVC-RT INT16 Managed Runtime
 
-Official Pytorch implementation for DCVC-RT: [Towards Practical **R**eal-**T**ime Neural Video Compression](https://arxiv.org/abs/2502.20762), in CVPR 2025. Project page: https://dcvccodec.github.io/.
+This subtree extends the official [DCVC-RT](UPSTREAM_README.md) implementation with deterministic INT16 execution, bit-exact CUDA performance work, a unified media CLI, and a fail-closed archival lifecycle.
 
--  The first end-to-end neural video codec achieving 100+ FPS 1080p coding and 4K real-time coding with a comparable compression ratio with ECM.
+It is intended for long-running, headless video compression where encoded video, Opus audio, and source metadata must remain independently manageable and where predictive decoding must behave consistently across supported devices.
 
-Beyond this, DCVC-RT pursues a more practical neural video codec solution and supports various practical features:
-- **Wide bitrate range in single model**: A single model enables continuous and controllable bitrate adjustments. DCVC-RT can compress at a wide bitrate range for different coding scenarios.
-- **Rate control**: By adjusting quantization parameters, DCVC-RT effectively supports dynamic and various network conditions during real communication scenario.
-- **Unified YUV and RGB coding**: While DCVC-RT is primarily optimized for the widely adopted YUV format, it can seamlessly adapt to RGB content coding.
+## Main modifications
 
-We are continuously exploring additional practical functionalities and will provide further NVC solutions in this repository.
+### Deterministic INT16 execution
 
-<img src="assets/practical_performance.png" width="750">
+Set `DCVC_USE_INT16=1` to enable the integer runtime:
 
-## Abstract
+- Features use signed INT16 with scale `512`.
+- Convolution weights use signed INT16 with scale `8192`.
+- Convolution accumulation uses INT32 with explicit wrap, rounding, and clamp behavior.
+- Sigmoid-derived nonlinear operations and entropy scale-index mapping use precomputed lookup tables.
+- Quantized weights, biases, feature parameters, entropy tables, and lookup tables can be cached beside the original checkpoints as `.int16prep.pt` files.
+- Custom CUDA kernels cover convolution, bias, residual arithmetic, reciprocal scaling, LUT application, entropy preparation, depthwise/activation fusion, and pixel-shuffle paths.
+- If the extension is missing or `DCVC_USE_INT16` is disabled, the original floating-point path remains available.
 
-We introduce a practical real-time neural video codec (NVC) designed to deliver high compression ratio, low latency and broad versatility. In practice, the coding speed of NVCs depends on 1) computational costs, and 2) non-computational operational costs, such as memory I/O and the number of function calls. While most efficient NVCs prioritize reducing computational cost, we identify operational cost as the primary bottleneck to achieving higher coding speed. Leveraging this insight, we introduce a set of efficiency-driven design improvements focused on minimizing operational costs. Specifically, we employ implicit temporal modeling to eliminate complex explicit motion modules, and use single low-resolution latent representations rather than progressive downsampling. These innovations significantly accelerate NVC without sacrificing compression quality. Additionally, we implement model integerization for consistent cross-device coding and a module-bank-based rate control scheme to improve practical adaptability. Experiments show our proposed DCVC-RT achieves an impressive average encoding/decoding speed at 125.2/112.8 fps (frames per second) for 1080p video, while saving an average of 21\% in bitrate compared to H.266/VTM.
+See [docs/INT16_DESIGN.md](docs/INT16_DESIGN.md) for the arithmetic and compatibility details.
 
-# Prerequisites
-* Python 3.12 and conda, get [Conda](https://www.anaconda.com/)
-* CUDA 12.6 (other versions may also work. Make sure the CUDA version matches with pytorch.)
-* pytorch (We have tested that pytorch-2.6 works. Other versions may also work.)
-* Environment
-    ```
-    conda create -n $YOUR_PY_ENV_NAME python=3.12
-    conda activate $YOUR_PY_ENV_NAME
+### Bit-exact kernel and pipeline optimization
 
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-    pip install -r requirements.txt
-    ```
+The CUDA extension adds tiled implicit-GEMM fast paths for common dense INT16 convolutions:
 
-# Test dataset
+- group-1, stride-1, unpadded `1x1`
+- group-1, stride-1, pad-1 `3x3`
 
-We support arbitrary original resolution. The input video resolution will be padded automatically. The reconstructed video will be cropped back to the original size. The distortion (PSNR) is calculated at original resolution.
+Unsupported shapes continue through the generic kernel. The optimized kernels preserve traversal, 32-bit wrap, rounding, and clipping behavior. Redundant device-wide synchronization after each encoded frame was removed; normal CUDA stream ordering and the blocking entropy boundary preserve dependencies.
 
-## YUV 420 content
+On the development Jetson Orin fixture, the steady codec loop changed as follows:
 
-Put *.yuv in the folder structure similar to the following structure.
+| Measurement | Reference INT16 | Optimized | Change |
+| --- | ---: | ---: | ---: |
+| Encode loop | 21.9 fps | 38.6 fps | 1.76x |
+| Decode loop | 21.9 fps | 37.6 fps | 1.72x |
 
-    /media/data/HEVC_B/
-        - BQTerrace_1920x1080_60.yuv
-        - BasketballDrive_1920x1080_50.yuv
-        - ...
-    /media/data/HEVC_D/
-    /media/data/HEVC_C/
-    ...
+These are small-resolution, device-specific engineering measurements—not reproductions of the paper's 1080p A100 results. The reference and optimized paths produced byte-identical bitstreams and decoded YUV in the local regression.
 
-The dataset structure can be seen in dataset_config_example_yuv420.json.
+### Unified media and archive workflow
 
-## RGB content
+`main.py` provides four commands:
 
-We highly suggest testing YUV420 content. To test RGB content, please refer to the DCVC-FM folder.
+```text
+encode   FFmpeg input -> DCVC bitstream plus optional Opus audio
+decode   DCVC bitstream -> decoded YUV/video workflow
+view     Interactive bitstream viewer
+cleanup  Revalidate a completed channel and remove exact inventoried sources
+```
 
-# Build the project
+The encoder supports per-channel queues, resumable progress logs, atomic output commits, concurrent audio encoding, and a terminal dashboard with worker, channel, approval, and event views.
 
-Please build the C++ code to support bitstream writing and customized CUDA kernels to fuse operations.
+Channel cleanup is deliberately fail-closed. Before a source container can be deleted, the lifecycle verifies its original identity, the latest encode status, DCVC bitstream structure and frame count, Opus stream validity, metadata JSON, retained thumbnails, and safe path boundaries. It writes an archive manifest and append-only audit record before unlinking exact paths. Shell globs and recursive deletion are never used.
+
+See [docs/MANAGED_ARCHIVE.md](docs/MANAGED_ARCHIVE.md) for operating details.
+
+## Relationship to the CVPR 2025 paper
+
+The [DCVC-RT paper](https://openaccess.thecvf.com/content/CVPR2025/html/Jia_Towards_Practical_Real-Time_Neural_Video_Compression_CVPR_2025_paper.html) introduces the neural architecture, implicit temporal modeling, low-resolution latent representation, module-bank rate control, and training-free 16-bit model integerization. This fork retains those upstream models and checkpoints.
+
+The fork does **not** retrain the network or claim a new rate-distortion result. Its integer scales follow the paper's integerization design, while the concrete PyTorch conversion/cache code, CUDA arithmetic, extension loader, fused operations, exact-output tests, FFmpeg/Opus frontend, TUI, and archival lifecycle are implementation and deployment work beyond what the paper specifies.
+
+Important compatibility distinction:
+
+- The bitstream syntax is not intentionally changed.
+- The optimized kernels are byte-identical to this fork's reference INT16 implementation in the tested environment.
+- Deterministic predictive decoding should use the INT16 runtime on both sides. The upstream floating-point runtime is not claimed to reproduce every integer intermediate state across devices.
+- A second physical GPU architecture was not available for the original regression, so cross-device execution remains a design property that should be verified on each supported architecture before archival deployment.
+
+## Installation
+
+Create and activate a Conda environment containing CUDA-enabled PyTorch and the Python dependencies from `requirements.txt`. Then build both native extensions:
 
 ```bash
-sudo apt-get install cmake g++ ninja-build
-conda activate $YOUR_PY_ENV_NAME
-cd ./src/cpp/
-pip install .
-cd ../layers/extensions/inference/
-pip install .
+conda activate <environment>
+./build_native_extensions.sh
 ```
 
-If the CUDA kernels fail to load successfully in inference, the standard output will display: ```cannot import cuda implementation for inference, fallback to pytorch.```
+The script validates that Python belongs to the active Conda environment, detects NVCC and CUDA architecture, cleanly builds the CPU entropy coder and CUDA/INT16 extension, installs them into that environment, refreshes the source-tree CUDA binary, and verifies all required integer symbols.
 
-## CPU performance scaling
+By default `MAX_JOBS=2` reduces compilation memory pressure. If no GPU is visible while compiling, specify the target architecture explicitly, for example:
 
-Note that the arithmetic coding runs on the CPU, please make sure your CPU runs at high performance while writing the actual bitstream. Otherwise, the arithmetic coding may take a long time.
-
-Check the CPU frequency by
-```
-grep -E '^model name|^cpu MHz' /proc/cpuinfo
-```
-
-Run the following command to maximum CPU frequency
-```
-echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-```
-
-Run the following command to recover the default frequency
-```
-echo ondemand | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-```
-
-# Pretrained models
-
-* Download [our pretrained models](https://1drv.ms/f/c/2866592d5c55df8c/Esu0KJ-I2kxCjEP565ARx_YB88i0UnR6XnODqFcvZs4LcA?e=by8CO8) and put them into ./checkpoints folder.
-* There are 2 models, one for image coding and the other for video coding.
-
-# Test the models
-
-Example to test pretrained model with four rate points:
 ```bash
-python test_video.py --model_path_i ./checkpoints/cvpr2025_image.pth.tar --model_path_p ./checkpoints/cvpr2025_video.pth.tar --rate_num 4 --test_config ./dataset_config_example_yuv420.json --cuda 1 -w 1 --write_stream 1 --force_zero_thres 0.12 --output_path output.json --force_intra_period -1 --reset_interval 64 --force_frame_num -1 --check_existing 0 --verbose 0
+TORCH_CUDA_ARCH_LIST="8.7+PTX" ./build_native_extensions.sh
 ```
 
-It is recommended that the ```-w``` number is equal to your GPU number.
+Checkpoints are intentionally not stored in Git. Download the official DCVC-RT checkpoints as described in [UPSTREAM_README.md](UPSTREAM_README.md) and place or link them under `checkpoints/`. Prepared `.int16prep.pt` caches are generated locally and should also remain outside Git.
 
-You can also specify different ```--rate_num``` values (2~64) to test finer bitrate adjustment.
+## Encoding example
 
-To measure coding speed, you can set ```--verbose``` value to `1` (sequence-level measuring) or `2` (frame-level measuring). This will automatically measure encoding and decoding speeds, print them in the terminal, and record the average speeds in ```avg_frame_encoding_time``` and ```avg_frame_decoding_time``` in the output JSON file.
-- Note that ```test_time``` is the total testing time for the entire sequence, which includes I/O time, encoding time, decoding time, and distortion calculation time. The overhead from I/O and distortion calculation is much larger than the encoding/decoding time itself, so we exclude these overheads to measure the precise coding time.
-- Additionally, please make sure ```time.time()``` provides sufficient precision on the tested platform. For instance, our experience is that the precision is adequate on our Ubuntu device, but insufficient on our Windows device.
-
-# Comparing with other method
-
-Bit saving over VTM-17.0 (UVG all frames with single intra-frame setting (i.e. intra-period = –1) and YUV420 colorspace.)
-
-<img src="assets/RD-Curve.png" width="750">
-
-The BD-Rate and 1080p encoding/decoding speed on NVIDIA A100 GPU
-
-<img src="assets/bd_rate_speed.png" width="750">
-
-The complexity analysis and encoding/decoding speed evaluation across various resolutions and devices.
-
-<img src="assets/complexity.png" width="750">
-
-## Image compression performance
-
-Notably, the intra-frame codec in DCVC-RT also delivers impressive performance. On Kodak, DCVC-RT-Intra achieves an 11.1% bitrate reduction compared to VTM, with a over 10× faster decoding speed than previous state-of-the-art learned image codecs. For encoding, DCVC-RT-Intra also offers a similar speed advantage. For 1080p content, DCVC-RT-Intra achieves an impressive encoding/decoding speed of 40.7 FPS / 44.2 FPS on an NVIDIA A100 GPU.
-
-<img src="assets/intra_compare.png" width="500">
-
-## On the comparison
-
-Please note that different methods may use different configurations to test different models, such as
-* Source video may be different, e.g., cropped or padded to the desired resolution.
-* Intra period may be different, e.g., 96, 32, 12, or 10.
-* Number of encoded frames may be different.
-
-So, it does not make sense to compare the numbers in different methods directly, unless making sure they are using same test conditions.
-
-Please find more details on the [test conditions](../test_conditions.md).
-
-# Acknowledgement
-The implementation of DCVC-RT is based on [CompressAI](https://github.com/InterDigitalInc/CompressAI).
-
-# Citation
-If you find this work useful for your research, please cite:
-
-```
-@inproceedings{jia2025towards,
-  title={Towards Practical Real-Time Neural Video Compression},
-  author={Jia, Zhaoyang and Li, Bin and Li, Jiahao and Xie, Wenxuan and Qi, Linfeng and Li, Houqiang and Lu, Yan},
-  booktitle={{IEEE/CVF} Conference on Computer Vision and Pattern Recognition,
-             {CVPR} 2025, Nashville, TN, USA, June 11-25, 2024},
-  year={2025}
-}
+```bash
+DCVC_USE_INT16=1 python main.py encode \
+  --base_root /data/incoming \
+  --output_root /data/encoded \
+  --channel_ids CHANNEL_A CHANNEL_B \
+  --model_path_i checkpoints/cvpr2025_image.pth.tar \
+  --model_path_p checkpoints/cvpr2025_video.pth.tar \
+  --resolution 96 --fps 24 --qp_i 35 --qp_p 14 \
+  --audio opus --opus_bitrate 6k --opus_channels mono \
+  --procs 3 --ui auto
 ```
 
-# Trademarks
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft trademarks or logos is subject to and must follow [Microsoft’s Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general). Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship. Any use of third-party trademarks or logos are subject to those third-party’s policies.
+With no cleanup option, completed channels await approval while other channels continue encoding. Add `--auto-delete` for validation-gated unattended cleanup, `--cleanup-dry-run` to exercise every check without unlinking, or `--keep-originals` to disable cleanup.
+
+The current deployment guard rejects more than three model workers because this branch was hardened for an 8 GB Jetson production system. Adjusting that policy for a larger machine should be accompanied by memory-pressure testing.
+
+## Tests
+
+The unit suite creates its own synthetic media and does not require redistributed video:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+GPU microbenchmark:
+
+```bash
+DCVC_USE_INT16=1 python benchmarks/benchmark_int16_conv.py
+```
+
+## Contributors and provenance
+
+- **Original research and upstream implementation:** Zhaoyang Jia, Bin Li, Jiahao Li, Wenxuan Xie, Linfeng Qi, Houqiang Li, Yan Lu, Microsoft Research, and the broader DCVC contributors.
+- **Fork owner and maintainer:** [Salatiel Jordão (@QLaHPD)](https://github.com/QLaHPD).
+- **Primary implementation contributor for the INT16 optimization and managed-runtime work:** **OpenAI Codex**, operating under the owner's direction and review.
+
+OpenAI's public Codex material describes Codex as a coding agent used to build, refactor, test, and maintain code; it does not define a special GitHub co-author identity. Accordingly, this repository credits Codex in documentation without inventing an account or email. The human repository owner remains responsible for review, publication, and maintenance.
+
+This fork is not affiliated with or endorsed by Microsoft or OpenAI. Upstream history and the repository's [MIT License](../../LICENSE.txt) are preserved.

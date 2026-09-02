@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import argparse
+import queue
+import threading
+from pathlib import Path
+from typing import Optional
+
+import torch
+
+from src.codec.frame_decoder import BitstreamFrameSource, DecodedFrame, load_decoder_models, resolve_decode_device
+from src.utils.common import str2bool
+
+
+class DecodeWorker:
+    def __init__(self, source: BitstreamFrameSource):
+        self.source = source
+        self.requests: queue.Queue = queue.Queue()
+        self.results: queue.Queue = queue.Queue()
+        self.thread = threading.Thread(target=self._run, name="dcvc-viewer-decode", daemon=True)
+        self.thread.start()
+
+    def request(self, request_id: int, frame_index: int):
+        self.clear_pending()
+        self.requests.put(("frame", request_id, frame_index))
+
+    def close(self):
+        self.clear_pending()
+        self.requests.put(("close", None, None))
+
+    def clear_pending(self):
+        while True:
+            try:
+                self.requests.get_nowait()
+            except queue.Empty:
+                return
+
+    def _run(self):
+        while True:
+            kind, request_id, frame_index = self.requests.get()
+            if kind == "close":
+                self.source.close()
+                return
+            try:
+                frame = self.source.seek(frame_index, output_format="rgb")
+                self.results.put(("frame", request_id, frame))
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                self.results.put(("error", request_id, str(exc)))
+
+
+class ViewerApp:
+    def __init__(self, root, source: BitstreamFrameSource, fps: float, start_frame: int,
+                 max_width: int, max_height: int):
+        import tkinter as tk
+
+        self.tk = tk
+        self.root = root
+        self.source = source
+        self.worker = DecodeWorker(source)
+        self.fps = max(0.1, fps)
+        self.max_width = max_width
+        self.max_height = max_height
+        self.current_frame = max(0, min(start_frame, source.index.frame_count - 1))
+        self.request_id = 0
+        self.playing = False
+        self.photo = None
+        self.play_after_id = None
+
+        root.title(f"DCVC-RT Viewer - {source.index.path.name}")
+        root.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.image_label = tk.Label(root, bg="black")
+        self.image_label.pack(fill=tk.BOTH, expand=True)
+
+        controls = tk.Frame(root)
+        controls.pack(fill=tk.X, padx=8, pady=8)
+
+        self.play_button = tk.Button(controls, text="Play", width=8, command=self.toggle_play)
+        self.play_button.pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Button(controls, text="Prev", width=8, command=self.previous_frame).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(controls, text="Next", width=8, command=self.next_frame).pack(side=tk.LEFT, padx=(0, 10))
+
+        self.scale = tk.Scale(
+            controls,
+            from_=0,
+            to=max(0, source.index.frame_count - 1),
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+        )
+        self.scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.scale.bind("<ButtonRelease-1>", self.on_slider_release)
+
+        self.frame_label = tk.Label(controls, width=18, anchor="e")
+        self.frame_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        meta = tk.Frame(root)
+        meta.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.status_label = tk.Label(meta, anchor="w")
+        self.status_label.pack(fill=tk.X)
+
+        self.set_status("Loading frame...")
+        self.request_frame(self.current_frame)
+        self.root.after(30, self.poll_results)
+
+    def request_frame(self, frame_index: int):
+        if self.source.index.frame_count <= 0:
+            self.set_status("No frames in bitstream")
+            return
+        frame_index = max(0, min(frame_index, self.source.index.frame_count - 1))
+        self.current_frame = frame_index
+        self.scale.set(frame_index)
+        self.update_frame_label()
+        self.request_id += 1
+        self.worker.request(self.request_id, frame_index)
+
+    def poll_results(self):
+        while True:
+            try:
+                kind, request_id, payload = self.worker.results.get_nowait()
+            except queue.Empty:
+                break
+            if request_id != self.request_id:
+                continue
+            if kind == "error":
+                self.playing = False
+                self.play_button.configure(text="Play")
+                self.set_status(payload)
+                continue
+            self.display_frame(payload)
+        self.root.after(30, self.poll_results)
+
+    def display_frame(self, frame: DecodedFrame):
+        from PIL import Image, ImageTk
+
+        image = Image.fromarray(frame.rgb)
+        ratio = min(self.max_width / frame.width, self.max_height / frame.height, 1.0)
+        if ratio < 1.0:
+            size = (max(1, int(frame.width * ratio)), max(1, int(frame.height * ratio)))
+            resample = getattr(Image, "Resampling", Image).BILINEAR
+            image = image.resize(size, resample)
+        self.photo = ImageTk.PhotoImage(image)
+        self.image_label.configure(image=self.photo)
+        self.current_frame = frame.index
+        self.scale.set(frame.index)
+        self.update_frame_label()
+        self.set_status(
+            f"{self.source.index.path.name} | {frame.width}x{frame.height} | "
+            f"{frame.frame_type}-frame | QP {frame.qp}"
+        )
+
+        if self.playing:
+            self.schedule_next_play_frame()
+
+    def toggle_play(self):
+        self.playing = not self.playing
+        self.play_button.configure(text="Pause" if self.playing else "Play")
+        if self.playing:
+            self.schedule_next_play_frame()
+        elif self.play_after_id is not None:
+            self.root.after_cancel(self.play_after_id)
+            self.play_after_id = None
+
+    def schedule_next_play_frame(self):
+        if self.play_after_id is not None:
+            self.root.after_cancel(self.play_after_id)
+        delay_ms = max(1, int(1000 / self.fps))
+        self.play_after_id = self.root.after(delay_ms, self.next_play_frame)
+
+    def next_play_frame(self):
+        self.play_after_id = None
+        if not self.playing:
+            return
+        if self.current_frame + 1 >= self.source.index.frame_count:
+            self.playing = False
+            self.play_button.configure(text="Play")
+            return
+        self.request_frame(self.current_frame + 1)
+
+    def previous_frame(self):
+        self.playing = False
+        self.play_button.configure(text="Play")
+        self.request_frame(self.current_frame - 1)
+
+    def next_frame(self):
+        self.playing = False
+        self.play_button.configure(text="Play")
+        self.request_frame(self.current_frame + 1)
+
+    def on_slider_release(self, _event):
+        self.playing = False
+        self.play_button.configure(text="Play")
+        self.request_frame(int(self.scale.get()))
+
+    def update_frame_label(self):
+        total = self.source.index.frame_count
+        self.frame_label.configure(text=f"{self.current_frame + 1}/{total}")
+
+    def set_status(self, text: str):
+        self.status_label.configure(text=text)
+
+    def close(self):
+        if self.play_after_id is not None:
+            self.root.after_cancel(self.play_after_id)
+        self.worker.close()
+        self.root.destroy()
+
+
+def configure_parser(parser: argparse.ArgumentParser):
+    parser.add_argument("bin_path", help="DCVC-RT .bin bitstream to view.")
+    parser.add_argument("--model_path_i", type=str, default="./checkpoints/cvpr2025_image.pth.tar")
+    parser.add_argument("--model_path_p", type=str, default="./checkpoints/cvpr2025_video.pth.tar")
+    parser.add_argument("--cuda", type=str2bool, default=True)
+    parser.add_argument("--cuda_idx", type=int, default=None)
+    parser.add_argument("--force_zero_thres", type=float, default=None)
+    parser.add_argument("--fps", type=float, default=30.0, help="Playback FPS.")
+    parser.add_argument("--start_frame", type=int, default=0, help="Initial frame index, zero-based.")
+    parser.add_argument("--max_width", type=int, default=1280, help="Maximum display width.")
+    parser.add_argument("--max_height", type=int, default=720, help="Maximum display height.")
+
+
+def run(args) -> int:
+    bin_path = Path(args.bin_path)
+    if not bin_path.is_file():
+        print(f"Bitstream not found: {bin_path}")
+        return 2
+
+    try:
+        import tkinter as tk
+        import PIL.ImageTk  # noqa: F401
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        print(f"Viewer requires tkinter and Pillow ImageTk support: {exc}")
+        return 2
+
+    if args.cuda and not torch.cuda.is_available():
+        print("Warning: --cuda specified but no devices found. Running on CPU.")
+
+    device = resolve_decode_device(args.cuda, args.cuda_idx)
+    models = load_decoder_models(args.model_path_i, args.model_path_p, device, args.force_zero_thres)
+    source = BitstreamFrameSource(bin_path, models)
+    if source.index.frame_count == 0:
+        print(f"No decodable frames found in {bin_path}")
+        source.close()
+        return 1
+
+    root = tk.Tk()
+    ViewerApp(root, source, args.fps, args.start_frame, args.max_width, args.max_height)
+    root.mainloop()
+    return 0

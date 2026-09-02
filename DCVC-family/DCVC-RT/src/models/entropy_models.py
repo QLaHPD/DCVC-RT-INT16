@@ -6,6 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from ..layers.cuda_inference import build_index_dec, build_index_enc, process_with_mask
+from ..layers.int16_inference import FEATURE_SCALE, int16_inference_enabled
 
 
 class EntropyCoder():
@@ -125,6 +126,24 @@ class AEHelper():
             self._cdf_length, \
             self._offset
 
+    def get_serialized_cdf_info(self):
+        return {
+            "quantized_cdf": torch.as_tensor(self._quantized_cdf, dtype=torch.int32),
+            "cdf_length": torch.as_tensor(self._cdf_length, dtype=torch.int32),
+            "offset": torch.as_tensor(self._offset, dtype=torch.int32),
+        }
+
+    def load_serialized_cdf_info(self, cdf_info):
+        self.set_cdf_info(
+            cdf_info["quantized_cdf"].to(dtype=torch.int32),
+            cdf_info["cdf_length"].to(dtype=torch.int32),
+            cdf_info["offset"].to(dtype=torch.int32),
+        )
+
+    def register_entropy_coder(self, entropy_coder):
+        self.entropy_coder = entropy_coder
+        self.cdf_group_index = self.entropy_coder.add_cdf(*self.get_cdf_info())
+
 
 class BitEstimator(AEHelper, nn.Module):
     def __init__(self, qp_num, channel):
@@ -204,6 +223,10 @@ class BitEstimator(AEHelper, nn.Module):
             self.set_cdf_info(quantized_cdf, cdf_length, offset)
             self.cdf_group_index = self.entropy_coder.add_cdf(*self.get_cdf_info())
 
+    def load_prepared(self, entropy_coder, cdf_info):
+        self.load_serialized_cdf_info(cdf_info)
+        self.register_entropy_coder(entropy_coder)
+
     def build_indexes(self, size, qp):
         B, C, H, W = size
         indexes = torch.arange(C, dtype=torch.int).view(1, -1, 1, 1) + qp * self.channel
@@ -221,7 +244,10 @@ class BitEstimator(AEHelper, nn.Module):
     def get_z(self, size, device, dtype):
         output_size = (1, self.channel, size[0], size[1])
         val = self.entropy_coder.get_decoded_tensor(device, dtype, non_blocking=True)
-        return val.reshape(output_size)
+        val = val.reshape(output_size)
+        if int16_inference_enabled() and dtype == torch.int16:
+            val = (val.to(dtype=torch.int32) * FEATURE_SCALE).clamp_(-32768, 32767).to(dtype=torch.int16)
+        return val
 
 
 class GaussianEncoder(AEHelper):
@@ -281,6 +307,11 @@ class GaussianEncoder(AEHelper):
 
         self.set_cdf_info(quantized_cdf, pmf_length+2, -pmf_center)
         self.cdf_group_index = self.entropy_coder.add_cdf(*self.get_cdf_info())
+
+    def load_prepared(self, entropy_coder, cdf_info, force_zero_thres=None):
+        self.force_zero_thres = force_zero_thres
+        self.load_serialized_cdf_info(cdf_info)
+        self.register_entropy_coder(entropy_coder)
 
     def process_with_mask(self, y, scales, means, mask):
         return process_with_mask(y, scales, means, mask, self.force_zero_thres)
