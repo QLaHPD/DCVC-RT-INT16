@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from src.cli.dashboard import format_bytes, render_dashboard_lines
+from src.cli.progress import AverageCompletionTime
 
 
 class DashboardRenderingTests(unittest.TestCase):
@@ -63,6 +64,29 @@ class DashboardRenderingTests(unittest.TestCase):
     def test_byte_format_is_binary_and_human_readable(self):
         self.assertEqual(format_bytes(0), "0B")
         self.assertEqual(format_bytes(1024), "1.0KiB")
+
+    def test_average_video_time_estimates_parallel_remaining_time(self):
+        estimate = AverageCompletionTime(worker_count=5)
+        estimate.record(100)
+        estimate.record(200)
+        self.assertEqual(estimate.average_seconds, 150)
+        self.assertEqual(estimate.eta_seconds(total=20, done=10), 300)
+
+        output = "\n".join(render_dashboard_lines(
+            view="workers",
+            total=20,
+            done=10,
+            elapsed=400,
+            workers={},
+            channels=[],
+            events=[],
+            width=120,
+            height=10,
+            average_seconds=150,
+            eta_seconds=300,
+        ))
+        self.assertIn("avg/video=00:02:30", output)
+        self.assertIn("eta=00:05:00", output)
 
 
 if __name__ == "__main__":

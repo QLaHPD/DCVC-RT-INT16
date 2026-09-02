@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -188,12 +189,47 @@ def build_decode_output_index(output_dir: Path) -> DecodeOutputIndex:
     )
 
 
+class AverageCompletionTime:
+    """Simple per-video average and parallel-worker ETA estimator."""
+
+    def __init__(self, worker_count: int):
+        self.worker_count = max(1, worker_count)
+        self.completed_seconds = 0.0
+        self.samples = 0
+
+    def record(self, elapsed_seconds: Optional[float]):
+        if elapsed_seconds is None:
+            return
+        try:
+            elapsed_seconds = float(elapsed_seconds)
+        except (TypeError, ValueError):
+            return
+        if elapsed_seconds <= 0 or not math.isfinite(elapsed_seconds):
+            return
+        self.completed_seconds += elapsed_seconds
+        self.samples += 1
+
+    @property
+    def average_seconds(self) -> Optional[float]:
+        if self.samples == 0:
+            return None
+        return self.completed_seconds / self.samples
+
+    def eta_seconds(self, total: int, done: int) -> Optional[float]:
+        average = self.average_seconds
+        if average is None:
+            return None
+        remaining = max(0, total - done)
+        return average * remaining / self.worker_count
+
+
 class MultiWorkerProgress:
     def __init__(self, total: int, worker_count: int, prefix: str):
         self.total = total
         self.done = 0
         self.prefix = prefix
         self.t0 = time.time()
+        self.completion_time = AverageCompletionTime(worker_count)
         self.global_bar = tqdm(
             total=total,
             position=0,
@@ -216,8 +252,16 @@ class MultiWorkerProgress:
     def _refresh_global(self):
         elapsed = time.time() - self.t0
         pct = (100.0 * self.done / self.total) if self.total else 100.0
+        average = self.completion_time.average_seconds
+        eta = self.completion_time.eta_seconds(self.total, self.done)
+        estimate = (
+            f" avg/video={fmt_hhmmss(average)} eta={fmt_hhmmss(eta)}"
+            if average is not None and eta is not None
+            else " avg/video=--:--:-- eta=--:--:--"
+        )
         self.global_bar.set_description_str(
-            f"{self.prefix}: {pct:05.2f}% {self.done}/{self.total} {fmt_hhmmss(elapsed)}"
+            f"{self.prefix}: {pct:05.2f}% {self.done}/{self.total} "
+            f"elapsed={fmt_hhmmss(elapsed)}{estimate}"
         )
         self.global_bar.refresh()
 
@@ -225,8 +269,9 @@ class MultiWorkerProgress:
         self.done = done
         self._refresh_global()
 
-    def increment_done(self, step: int = 1):
+    def increment_done(self, step: int = 1, elapsed_seconds: Optional[float] = None):
         self.done += step
+        self.completion_time.record(elapsed_seconds)
         self._refresh_global()
 
     def set_worker_text(self, wid: int, text: str):

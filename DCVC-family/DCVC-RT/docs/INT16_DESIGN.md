@@ -56,4 +56,6 @@ Predictive neural decoding depends on reconstructed reference features. Therefor
 
 Section 4.5 of the CVPR 2025 paper describes training-free 16-bit integerization, feature scale 512, INT32 convolution accumulation, and lookup-table nonlinear functions. This runtime implements those principles around the published checkpoints.
 
-The paper does not prescribe this repository's Python cache format, CUDA dispatch details, extension discovery, fused deployment kernels, FFmpeg pipeline, or archive lifecycle. Those are fork-specific engineering decisions and are not presented as paper results.
+The paper does not prescribe this repository's Python cache format, CUDA dispatch details, extension discovery, fused deployment kernels, multi-GPU file scheduler, FFmpeg pipeline, or archive lifecycle. Those are fork-specific engineering decisions and are not presented as paper results.
+
+Multi-GPU execution assigns complete videos to independent processes. It does not shard a predictive sequence across devices, so it does not change frame ordering or codec arithmetic. Prepared-cache writes use an atomic replacement to make concurrent first launch safe.

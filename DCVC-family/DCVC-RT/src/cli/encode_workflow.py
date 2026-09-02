@@ -23,6 +23,7 @@ import torch
 
 from src.cli.channel_lifecycle import write_channel_inventory
 from src.cli.dashboard import EncodeDashboard
+from src.cli.device_plan import build_worker_device_plan
 from src.cli.lifecycle_runtime import ChannelLifecycleController, ChannelRuntimeState
 from src.cli.progress import append_progress_log, build_encode_output_index, ensure_dir
 from src.layers.cuda_inference import replicate_pad
@@ -130,13 +131,10 @@ def kill_all_children():
         kill_popen(proc)
 
 
-def cleanup_ram_tmp_glob():
+def cleanup_registered_ram_tmp():
     for path in TMP_RAM_PATHS:
         safe_unlink(path)
-    shm = Path("/dev/shm")
-    if shm.exists():
-        for tmp_file in shm.glob(".tmp_*_*.*"):
-            safe_unlink(tmp_file)
+    TMP_RAM_PATHS.clear()
 
 
 def release_cuda():
@@ -700,7 +698,7 @@ def _worker_sig_handler(sig, frame):
     global STOP_FLAG
     STOP_FLAG = True
     kill_all_children()
-    cleanup_ram_tmp_glob()
+    cleanup_registered_ram_tmp()
     release_cuda()
     raise SystemExit(130)
 
@@ -723,7 +721,12 @@ def worker_entry(wid: int, task_q, progress_q, stop_event, output_root: str, mod
         device = torch.device("cpu")
 
     encoder = NeuralEncoder(device, model_i, model_p, EncoderCfg(**enc_cfg_dict))
-    progress_q.put({"type": "worker_hello", "wid": wid, "pid": os.getpid()})
+    progress_q.put({
+        "type": "worker_hello",
+        "wid": wid,
+        "pid": os.getpid(),
+        "device": str(device),
+    })
 
     while not stop_event.is_set():
         try:
@@ -747,7 +750,7 @@ def worker_entry(wid: int, task_q, progress_q, stop_event, output_root: str, mod
         )
 
     kill_all_children()
-    cleanup_ram_tmp_glob()
+    cleanup_registered_ram_tmp()
     release_cuda()
 
 
@@ -759,9 +762,26 @@ def configure_parser(parser: argparse.ArgumentParser):
     io_group.add_argument("--twitch_channels", nargs="+", default=None, help="Space-separated list of Twitch channel folder names.")
 
     hw_group = parser.add_argument_group("Hardware and Concurrency")
-    hw_group.add_argument("--procs", type=int, default=1, help="Number of concurrent worker processes to run.")
+    hw_group.add_argument(
+        "--procs",
+        type=int,
+        default=None,
+        help=(
+            "Number of independent video workers. By default, CUDA uses one worker per "
+            "selected/visible GPU and CPU mode uses one worker."
+        ),
+    )
     hw_group.add_argument("--cuda", type=lambda s: s.lower() in {"1", "true", "yes"}, default=True, help="Enable or disable CUDA acceleration.")
-    hw_group.add_argument("--cuda_idx", nargs="*", type=int, default=None, help="CUDA device indices to round-robin assign across workers.")
+    hw_group.add_argument(
+        "--cuda_idx",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Logical CUDA device indices to use. Defaults to every visible GPU; workers are "
+            "assigned round-robin when --procs exceeds the selected GPU count."
+        ),
+    )
 
     vid_group = parser.add_argument_group("Neural Video Encoder")
     vid_group.add_argument("--model_path_i", default="./checkpoints/cvpr2025_image.pth.tar", help="Path to the neural image model checkpoint.")
@@ -825,7 +845,12 @@ def _format_worker_text(state: Dict) -> str:
     vid = state.get("vid", "-")
     if len(vid) > 30:
         vid = vid[:27] + "..."
-    return f"{vid} {state.get('frames', 0)}f {state.get('fps', 0.0):.1f}fps Aud:{state.get('audio', 'off')}"
+    device = state.get("device", "")
+    device_text = f"{device} " if device else ""
+    return (
+        f"{device_text}{vid} {state.get('frames', 0)}f "
+        f"{state.get('fps', 0.0):.1f}fps Aud:{state.get('audio', 'off')}"
+    )
 
 
 def _close_queue(mp_queue):
@@ -856,11 +881,20 @@ def _terminate_workers(workers, grace_seconds: float = 3.0):
 
 
 def run(args) -> int:
-    if args.procs < 1 or args.procs > 3:
-        print("Error: --procs must be between 1 and 3 to respect the memory-safety limit.")
-        return 2
     if args.auto_delete and args.keep_originals:
         print("Error: --auto-delete and --keep-originals are mutually exclusive.")
+        return 2
+
+    try:
+        device_plan = build_worker_device_plan(
+            use_cuda=args.cuda,
+            requested_workers=args.procs,
+            requested_cuda_indices=args.cuda_idx,
+            cuda_available=torch.cuda.is_available(),
+            cuda_device_count=torch.cuda.device_count(),
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
         return 2
 
     ram_dir = best_ram_dir(args.ram_tmp_dir)
@@ -914,14 +948,8 @@ def run(args) -> int:
         print("Nothing to do — no videos found.")
         return 0
 
-    if args.cuda and not torch.cuda.is_available():
+    if args.cuda and not device_plan.using_cuda:
         print("Warning: --cuda specified but no devices found. Running on CPU.")
-
-    cuda_plan: List[Optional[int]]
-    if args.cuda and args.cuda_idx:
-        cuda_plan = [args.cuda_idx[i % len(args.cuda_idx)] for i in range(args.procs)]
-    else:
-        cuda_plan = [0 if args.cuda and torch.cuda.is_available() else None] * args.procs
 
     enc_cfg_dict = dict(
         qp_i=args.qp_i,
@@ -984,7 +1012,18 @@ def run(args) -> int:
     stop_event = ctx.Event()
 
     workers = []
-    worker_count = args.procs if all_tasks else 0
+    worker_count = min(device_plan.worker_count, len(all_tasks)) if all_tasks else 0
+    cuda_plan = device_plan.cuda_indices[:worker_count]
+    if device_plan.using_cuda:
+        workers_description = ", ".join(
+            f"worker {wid}->cuda:{cuda_plan[wid]}" for wid in range(worker_count)
+        )
+    elif worker_count:
+        noun = "worker" if worker_count == 1 else "workers"
+        workers_description = f"{worker_count} CPU {noun}"
+    else:
+        workers_description = "no workers needed"
+    print(f"Worker plan: {workers_description}")
     for wid in range(worker_count):
         proc = ctx.Process(
             target=worker_entry,
@@ -999,7 +1038,7 @@ def run(args) -> int:
                 enc_cfg_dict,
                 args.audio,
                 opus_params,
-                args.cuda,
+                device_plan.using_cuda,
                 cuda_plan[wid] if wid < len(cuda_plan) else None,
                 args.disk_finalize,
             ),
@@ -1040,10 +1079,20 @@ def run(args) -> int:
                 wid = msg.get("wid", 0)
                 channel_id = msg.get("channel_id", "")
                 video_id = msg.get("vid", "")
-                if typ == "worker_task_start":
+                if typ == "worker_hello":
+                    progress.set_worker_text(
+                        wid,
+                        f"{msg.get('device', 'unknown')} ready (pid {msg.get('pid', '?')})",
+                    )
+                elif typ == "worker_task_start":
                     lifecycle.mark_started(channel_id, video_id)
                     active[wid] = {
                         "vid": video_id,
+                        "device": (
+                            f"cuda:{cuda_plan[wid]}"
+                            if wid < len(cuda_plan) and cuda_plan[wid] is not None
+                            else "cpu"
+                        ),
                         "frames": 0,
                         "fps": 0.0,
                         "audio": "starting",
@@ -1052,6 +1101,11 @@ def run(args) -> int:
                 elif typ == "worker_start":
                     active[wid] = {
                         "vid": video_id,
+                        "device": (
+                            f"cuda:{cuda_plan[wid]}"
+                            if wid < len(cuda_plan) and cuda_plan[wid] is not None
+                            else "cpu"
+                        ),
                         "frames": 0,
                         "fps": 0.0,
                         "audio": msg.get("audio", "off"),
@@ -1072,7 +1126,9 @@ def run(args) -> int:
                     terminal_tasks.add(task_key)
                     active.pop(wid, None)
                     progress.clear_worker(wid)
-                    progress.increment_done()
+                    progress.increment_done(
+                        elapsed_seconds=msg.get("elapsed") if typ == "worker_done" else None
+                    )
                     had_task_failure = had_task_failure or typ == "worker_fail"
                     lifecycle.mark_terminal(
                         channel_id,
@@ -1138,7 +1194,7 @@ def run(args) -> int:
         _close_queue(progress_q)
         lifecycle.close(wait=not interrupted)
         kill_all_children()
-        cleanup_ram_tmp_glob()
+        cleanup_registered_ram_tmp()
 
     pending_approvals = lifecycle.awaiting_approvals()
     if pending_approvals:

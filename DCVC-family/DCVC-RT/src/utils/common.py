@@ -3,6 +3,7 @@
 
 import json
 import os
+import threading
 from unittest.mock import patch
 from pathlib import Path
 
@@ -62,12 +63,27 @@ def load_int16_prep_state(ckpt_path):
     prep_path = get_int16_prep_path(ckpt_path)
     if not prep_path.exists():
         return None
-    return torch.load(prep_path, map_location=torch.device('cpu'))
+    return torch.load(prep_path, map_location=torch.device('cpu'), weights_only=True)
 
 
 def save_int16_prep_state(ckpt_path, prep_state):
     prep_path = get_int16_prep_path(ckpt_path)
-    torch.save(prep_state, prep_path)
+    # Multiple GPU workers may prepare the same cache on first launch.  Publish
+    # only a complete file so peers can never observe a partial torch.save().
+    tmp_path = prep_path.with_name(
+        f".{prep_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    try:
+        with tmp_path.open("xb") as tmp_file:
+            torch.save(prep_state, tmp_file)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, prep_path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def load_model_for_inference(model, ckpt_path, device, force_zero_thres=None):

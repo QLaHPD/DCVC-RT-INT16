@@ -49,7 +49,25 @@ view     Interactive bitstream viewer
 cleanup  Revalidate a completed channel and remove exact inventoried sources
 ```
 
-The encoder supports per-channel queues, resumable progress logs, atomic output commits, concurrent audio encoding, and a terminal dashboard with worker, channel, approval, and event views.
+The encoder supports per-channel queues, resumable progress logs, atomic output commits, concurrent audio encoding, and a terminal dashboard with worker, channel, approval, and event views. Its overall ETA uses the average wall time of successfully completed videos divided across the active worker count; it appears after the first video finishes and intentionally remains a simple estimate.
+
+### Multi-GPU execution
+
+Encoding and decoding use file-level data parallelism. Each worker owns a complete model instance, selects one logical CUDA device before loading that model, and processes a whole video on that device. Videos never migrate between GPUs, and the codec arithmetic and bitstream syntax are unchanged.
+
+When `--procs` (encode) or `--worker` (decode) is omitted, the CLI starts one worker per visible GPU. Use `--cuda_idx` to select a subset; the indices are the logical PyTorch indices after `CUDA_VISIBLE_DEVICES` is applied. For example, this uses five GPUs:
+
+```bash
+DCVC_USE_INT16=1 python main.py encode \
+  --base_root /data/incoming \
+  --output_root /data/encoded \
+  --channel_ids CHANNEL_A CHANNEL_B \
+  --cuda_idx 0 1 2 3 4
+```
+
+An explicit worker count is assigned round-robin across the selected devices. More than one worker per GPU is allowed but is not recommended unless model-memory headroom has been measured. If fewer videos remain than planned workers, only the required workers are launched. The selected worker-to-GPU mapping is printed and shown in the dashboard.
+
+Prepared INT16 checkpoint caches are published atomically, so simultaneous first-launch workers cannot observe a partially written cache. Worker cleanup is also limited to temporary files registered by that worker.
 
 Channel cleanup is deliberately fail-closed. Before a source container can be deleted, the lifecycle verifies its original identity, the latest encode status, DCVC bitstream structure and frame count, Opus stream validity, metadata JSON, retained thumbnails, and safe path boundaries. It writes an archive manifest and append-only audit record before unlinking exact paths. Shell globs and recursive deletion are never used.
 
@@ -77,7 +95,7 @@ conda activate <environment>
 ./build_native_extensions.sh
 ```
 
-The script validates that Python belongs to the active Conda environment, detects NVCC and CUDA architecture, cleanly builds the CPU entropy coder and CUDA/INT16 extension, installs them into that environment, refreshes the source-tree CUDA binary, and verifies all required integer symbols.
+The script validates that Python belongs to the active Conda environment, detects NVCC and every visible CUDA architecture, cleanly builds the CPU entropy coder and CUDA/INT16 extension, installs them into that environment, refreshes the source-tree CUDA binary, and verifies all required integer symbols. It builds native code for the current host, so run it again after copying the repository to an x86-64 machine; do not copy the Jetson/AArch64 `.so` files.
 
 By default `MAX_JOBS=2` reduces compilation memory pressure. If no GPU is visible while compiling, specify the target architecture explicitly, for example:
 
@@ -98,12 +116,12 @@ DCVC_USE_INT16=1 python main.py encode \
   --model_path_p checkpoints/cvpr2025_video.pth.tar \
   --resolution 96 --fps 24 --qp_i 35 --qp_p 14 \
   --audio opus --opus_bitrate 6k --opus_channels mono \
-  --procs 3 --ui auto
+  --cuda_idx 0 1 2 3 4 --ui auto
 ```
 
 With no cleanup option, completed channels await approval while other channels continue encoding. Add `--auto-delete` for validation-gated unattended cleanup, `--cleanup-dry-run` to exercise every check without unlinking, or `--keep-originals` to disable cleanup.
 
-The current deployment guard rejects more than three model workers because this branch was hardened for an 8 GB Jetson production system. Adjusting that policy for a larger machine should be accompanied by memory-pressure testing.
+On a single-GPU Jetson, the default remains one worker. On a multi-GPU host, the default is one worker per visible GPU. Use `--procs` to override encoding concurrency or `--worker` to override decoding concurrency.
 
 ## Tests
 

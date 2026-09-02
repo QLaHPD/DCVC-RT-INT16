@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from src.cli.progress import MultiWorkerProgress, fmt_hhmmss
+from src.cli.progress import AverageCompletionTime, MultiWorkerProgress, fmt_hhmmss
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,8 @@ def render_dashboard_lines(
     selected: int = 0,
     confirming: Optional[str] = None,
     free_bytes: Optional[int] = None,
+    average_seconds: Optional[float] = None,
+    eta_seconds: Optional[float] = None,
 ) -> List[str]:
     width = max(20, width)
     height = max(5, height)
@@ -62,9 +64,15 @@ def render_dashboard_lines(
     pending_approvals = status_counts.get("awaiting-approval", 0)
     failures = sum(channel.get("failures", 0) for channel in channels)
     storage = f" free={format_bytes(free_bytes)}" if free_bytes is not None else ""
+    average_text = fmt_hhmmss(average_seconds) if average_seconds is not None else "--:--:--"
+    eta_text = fmt_hhmmss(eta_seconds) if eta_seconds is not None else "--:--:--"
     lines = [
         _clip(
             f"DCVC managed encode  {percent:5.1f}% {done}/{total}  elapsed={fmt_hhmmss(elapsed)} "
+            f"avg/video={average_text} eta={eta_text}",
+            width,
+        ),
+        _clip(
             f"active={active} failures={failures} approvals={pending_approvals}{storage}",
             width,
         ),
@@ -127,6 +135,7 @@ class EncodeDashboard:
         self.total = total
         self.done = 0
         self.t0 = time.time()
+        self.completion_time = AverageCompletionTime(worker_count)
         self.storage_path = Path(storage_path)
         self.workers = {wid: f"[{wid}] idle" for wid in range(worker_count)}
         self.channels: List[Dict] = []
@@ -182,10 +191,11 @@ class EncodeDashboard:
             self._plain.set_done(done)
         self._draw()
 
-    def increment_done(self, step: int = 1):
+    def increment_done(self, step: int = 1, elapsed_seconds: Optional[float] = None):
         self.done += step
+        self.completion_time.record(elapsed_seconds)
         if self._plain is not None:
-            self._plain.increment_done(step)
+            self._plain.increment_done(step, elapsed_seconds=elapsed_seconds)
         self._draw()
 
     def set_worker_text(self, wid: int, text: str):
@@ -294,6 +304,8 @@ class EncodeDashboard:
                 selected=self.selected,
                 confirming=self.confirming,
                 free_bytes=free_bytes,
+                average_seconds=self.completion_time.average_seconds,
+                eta_seconds=self.completion_time.eta_seconds(self.total, self.done),
             )
             self._screen.erase()
             for row, line in enumerate(lines):

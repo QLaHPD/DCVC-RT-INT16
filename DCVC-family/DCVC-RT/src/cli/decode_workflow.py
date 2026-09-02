@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 import torch
 
 from src.codec.frame_decoder import BitstreamFrameSource, DecoderModels, load_decoder_models, resolve_decode_device
+from src.cli.device_plan import build_worker_device_plan
 from src.cli.progress import (
     MultiWorkerProgress,
     append_progress_log,
@@ -188,6 +189,7 @@ def run_decoding(task: DecodeTask, output_folder: str, progress_q, wid: int, mod
         "vid": task.base_name,
         "frames": frame_idx,
         "frame_total": frame_total,
+        "elapsed": time.time() - t0,
     })
 
 
@@ -205,6 +207,12 @@ def worker_entry(wid: int, task_q, progress_q, stop_event, args_dict: Dict, use_
         device,
         args_dict["force_zero_thres"],
     )
+    progress_q.put({
+        "type": "worker_hello",
+        "wid": wid,
+        "pid": os.getpid(),
+        "device": str(device),
+    })
 
     while not stop_event.is_set():
         try:
@@ -237,9 +245,23 @@ def configure_parser(parser: argparse.ArgumentParser):
     parser.add_argument("--input_folder", type=str, required=True, help="Folder with .bin files.")
     parser.add_argument("--output_folder", type=str, required=True, help="Folder for decoded .yuv files.")
     parser.add_argument("--original_folder", type=str, default=None, help="[Optional] Folder with original videos for bitrate/frame count.")
-    parser.add_argument("--worker", "-w", type=int, default=1)
+    parser.add_argument(
+        "--worker",
+        "-w",
+        type=int,
+        default=None,
+        help=(
+            "Number of independent decode workers. By default, CUDA uses one worker per "
+            "selected/visible GPU and CPU mode uses one worker."
+        ),
+    )
     parser.add_argument("--cuda", type=str2bool, default=True)
-    parser.add_argument("--cuda_idx", type=int, nargs="+")
+    parser.add_argument(
+        "--cuda_idx",
+        type=int,
+        nargs="+",
+        help="Logical CUDA device indices to use; defaults to every visible GPU.",
+    )
     parser.add_argument("--force_zero_thres", type=float, default=None)
 
 
@@ -249,18 +271,32 @@ def _format_worker_text(state: Dict) -> str:
         vid = vid[:27] + "..."
     total = state.get("frame_total", 0) or 0
     frames = state.get("frames", 0)
+    device = state.get("device", "")
+    device_text = f"{device} " if device else ""
     if total > 0:
-        return f"{vid} {frames}/{total}f {state.get('fps', 0.0):.1f}fps"
-    return f"{vid} {frames}f {state.get('fps', 0.0):.1f}fps"
+        return f"{device_text}{vid} {frames}/{total}f {state.get('fps', 0.0):.1f}fps"
+    return f"{device_text}{vid} {frames}f {state.get('fps', 0.0):.1f}fps"
 
 
 def run(args) -> int:
+    try:
+        device_plan = build_worker_device_plan(
+            use_cuda=args.cuda,
+            requested_workers=args.worker,
+            requested_cuda_indices=args.cuda_idx,
+            cuda_available=torch.cuda.is_available(),
+            cuda_device_count=torch.cuda.device_count(),
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 2
+
     pending_tasks, total_found, already_done = build_decode_tasks(args)
     if total_found == 0:
         print("Nothing to do — no .bin files found.")
         return 0
 
-    if args.cuda and not torch.cuda.is_available():
+    if args.cuda and not device_plan.using_cuda:
         print("Warning: --cuda specified but no devices found. Running on CPU.")
 
     if not pending_tasks:
@@ -270,10 +306,16 @@ def run(args) -> int:
         print("Nothing to do — all bitstreams are already decoded.")
         return 0
 
-    if args.cuda and args.cuda_idx:
-        cuda_plan = [args.cuda_idx[i % len(args.cuda_idx)] for i in range(args.worker)]
+    worker_count = min(device_plan.worker_count, len(pending_tasks))
+    cuda_plan = device_plan.cuda_indices[:worker_count]
+    if device_plan.using_cuda:
+        description = ", ".join(
+            f"worker {wid}->cuda:{cuda_plan[wid]}" for wid in range(worker_count)
+        )
     else:
-        cuda_plan = [0 if args.cuda and torch.cuda.is_available() else None] * args.worker
+        noun = "worker" if worker_count == 1 else "workers"
+        description = f"{worker_count} CPU {noun}"
+    print(f"Worker plan: {description}")
 
     ctx = get_context("spawn")
     task_q = ctx.Queue()
@@ -282,10 +324,18 @@ def run(args) -> int:
     args_dict = vars(args).copy()
 
     workers = []
-    for wid in range(args.worker):
+    for wid in range(worker_count):
         proc = ctx.Process(
             target=worker_entry,
-            args=(wid, task_q, progress_q, stop_event, args_dict, args.cuda, cuda_plan[wid]),
+            args=(
+                wid,
+                task_q,
+                progress_q,
+                stop_event,
+                args_dict,
+                device_plan.using_cuda,
+                cuda_plan[wid],
+            ),
             daemon=True,
         )
         proc.start()
@@ -311,9 +361,19 @@ def run(args) -> int:
             if msg:
                 typ = msg.get("type")
                 wid = msg.get("wid", 0)
-                if typ == "worker_start":
+                if typ == "worker_hello":
+                    progress.set_worker_text(
+                        wid,
+                        f"{msg.get('device', 'unknown')} ready (pid {msg.get('pid', '?')})",
+                    )
+                elif typ == "worker_start":
                     active[wid] = {
                         "vid": msg["vid"],
+                        "device": (
+                            f"cuda:{cuda_plan[wid]}"
+                            if cuda_plan[wid] is not None
+                            else "cpu"
+                        ),
                         "frames": 0,
                         "frame_total": msg.get("frame_total", 0),
                         "fps": 0.0,
@@ -330,7 +390,9 @@ def run(args) -> int:
                 elif typ in {"worker_done", "worker_fail"}:
                     active.pop(wid, None)
                     progress.clear_worker(wid)
-                    progress.increment_done()
+                    progress.increment_done(
+                        elapsed_seconds=msg.get("elapsed") if typ == "worker_done" else None
+                    )
 
             alive = any(proc.is_alive() for proc in workers)
     finally:

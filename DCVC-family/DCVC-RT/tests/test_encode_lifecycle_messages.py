@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import queue
-import argparse
 import json
 import subprocess
 import tempfile
@@ -13,9 +12,7 @@ from src.cli.encode_workflow import (
     EncoderCfg,
     EncodeTask,
     append_progress_log,
-    configure_parser,
     process_one_file,
-    run,
     write_bytes_final,
 )
 from src.utils.stream_helper import write_ip, write_sps
@@ -65,17 +62,6 @@ class FakeNeuralEncoder:
 
 
 class EncodeLifecycleMessageTests(unittest.TestCase):
-    def test_more_than_three_workers_is_rejected_before_startup(self):
-        parser = argparse.ArgumentParser()
-        configure_parser(parser)
-        args = parser.parse_args([
-            "--base_root", "/does/not/matter",
-            "--output_root", "/does/not/matter",
-            "--channel_ids", "TEST_CHANNEL",
-            "--procs", "4",
-        ])
-        self.assertEqual(run(args), 2)
-
     def test_real_ffmpeg_audio_and_fake_video_reach_cleanup_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -8,6 +8,7 @@ Highlights:
 
 - INT16 feature and weight execution designed for deterministic cross-device coding
 - Optimized bit-exact CUDA convolution kernels
+- File-level multi-GPU encoding and decoding with one independent worker per GPU
 - Unified encode, decode, viewer, and validated-cleanup CLI
 - Multi-channel scheduling with a tmux-friendly terminal dashboard
 - Non-blocking cleanup approvals and optional `--auto-delete`
