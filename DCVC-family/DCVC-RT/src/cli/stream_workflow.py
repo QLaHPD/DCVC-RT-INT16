@@ -15,7 +15,7 @@ import urllib.request
 from dataclasses import dataclass
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -43,6 +43,12 @@ class RemoteMedia:
     has_audio: bool
     video_format_selector: str
     audio_format_selector: str
+
+
+StreamInput = Union[str, StreamTask]
+
+YOUTUBE_CHANNEL_ID_PATTERN = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+YOUTUBE_VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 def _safe_component(value: object, fallback: str, max_length: int = 160) -> str:
@@ -188,7 +194,8 @@ def list_stream_tasks(
                 entry.get("extractor_key") or entry.get("extractor"),
                 "generic",
             ).lower()
-            task_id = f"{extractor}:{video_id}"
+            task_extractor = "youtube" if "youtube" in extractor else extractor
+            task_id = f"{task_extractor}:{video_id}"
             if task_id in seen:
                 continue
             seen.add(task_id)
@@ -211,6 +218,102 @@ def list_stream_tasks(
             warnings.append(f"yt-dlp found no usable videos at {source_url}")
         if max_videos and len(tasks) >= max_videos:
             break
+
+    return tasks, warnings
+
+
+def _youtube_id_file_tasks(argument: str) -> List[StreamTask]:
+    path = Path(argument).expanduser()
+    channel_id = path.stem
+    if path.suffix.lower() != ".txt" or not YOUTUBE_CHANNEL_ID_PATTERN.fullmatch(channel_id):
+        raise ValueError(
+            f"YouTube ID-list filename must be a channel ID followed by .txt: {argument}"
+        )
+    if not path.is_file():
+        raise ValueError(f"YouTube ID-list file not found: {path}")
+
+    tasks = []
+    try:
+        with path.open("r", encoding="utf-8-sig") as source:
+            for line_number, line in enumerate(source, start=1):
+                video_id = line.strip()
+                if not video_id:
+                    continue
+                if not YOUTUBE_VIDEO_ID_PATTERN.fullmatch(video_id):
+                    raise ValueError(
+                        f"invalid YouTube video ID in {path} at line {line_number}: "
+                        f"expected exactly 11 URL-safe characters"
+                    )
+                tasks.append(StreamTask(
+                    task_id=f"youtube:{video_id}",
+                    video_id=video_id,
+                    webpage_url=f"https://www.youtube.com/watch?v={video_id}",
+                    channel_id=channel_id,
+                    extractor="youtube",
+                ))
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"YouTube ID-list file is not valid UTF-8: {path}") from exc
+    if not tasks:
+        raise ValueError(f"YouTube ID-list file contains no video IDs: {path}")
+    return tasks
+
+
+def build_stream_inputs(
+    source_urls: Sequence[str],
+    youtube_channels: Sequence[str],
+    twitch_channels: Sequence[str],
+) -> List[StreamInput]:
+    inputs: List[StreamInput] = list(source_urls)
+    for argument in youtube_channels:
+        if argument.lower().endswith(".txt"):
+            inputs.extend(_youtube_id_file_tasks(argument))
+            continue
+        if not YOUTUBE_CHANNEL_ID_PATTERN.fullmatch(argument):
+            raise ValueError(
+                "--youtube_channels entries must be a YouTube channel ID "
+                f"(UC plus 22 URL-safe characters) or channel_ID.txt: {argument}"
+            )
+        inputs.append(f"https://www.youtube.com/channel/{argument}/videos")
+    inputs.extend(
+        f"https://www.twitch.tv/{channel}/videos?filter=archives&sort=time"
+        for channel in twitch_channels
+    )
+    return inputs
+
+
+def collect_stream_tasks(
+    executable: str,
+    inputs: Sequence[StreamInput],
+    cookies_path: Optional[str] = None,
+    max_videos: Optional[int] = None,
+    youtube_player_client: str = "web_safari",
+) -> Tuple[List[StreamTask], List[str]]:
+    tasks: List[StreamTask] = []
+    warnings: List[str] = []
+    seen = set()
+
+    for stream_input in inputs:
+        if max_videos and len(tasks) >= max_videos:
+            break
+        if isinstance(stream_input, StreamTask):
+            candidates = [stream_input]
+        else:
+            remaining = max_videos - len(tasks) if max_videos else None
+            candidates, input_warnings = list_stream_tasks(
+                executable,
+                [stream_input],
+                cookies_path=cookies_path,
+                max_videos=remaining,
+                youtube_player_client=youtube_player_client,
+            )
+            warnings.extend(input_warnings)
+        for task in candidates:
+            if task.task_id in seen:
+                continue
+            seen.add(task.task_id)
+            tasks.append(task)
+            if max_videos and len(tasks) >= max_videos:
+                break
 
     return tasks, warnings
 
@@ -843,7 +946,10 @@ def configure_parser(parser: argparse.ArgumentParser):
         "--youtube_channels",
         nargs="+",
         default=None,
-        help="YouTube channel IDs (UC...) whose Videos tabs should be streamed.",
+        help=(
+            "YouTube channel IDs (UC...) and/or channel_ID.txt files containing "
+            "one video ID per line."
+        ),
     )
     source_group.add_argument(
         "--twitch_channels",
@@ -928,19 +1034,6 @@ def configure_parser(parser: argparse.ArgumentParser):
     pipeline_group.add_argument("--ui", choices=["auto", "tui", "plain"], default="auto")
 
 
-def _source_urls(args) -> List[str]:
-    urls = list(args.source_urls or [])
-    urls.extend(
-        f"https://www.youtube.com/channel/{channel_id}/videos"
-        for channel_id in (args.youtube_channels or [])
-    )
-    urls.extend(
-        f"https://www.twitch.tv/{channel}/videos?filter=archives&sort=time"
-        for channel in (args.twitch_channels or [])
-    )
-    return urls
-
-
 def _channel_snapshots(channel_state: Dict[str, Dict]) -> List[Dict]:
     snapshots = []
     for channel_id, state in sorted(channel_state.items()):
@@ -969,8 +1062,16 @@ def _channel_snapshots(channel_state: Dict[str, Dict]) -> List[Dict]:
 
 
 def run(args) -> int:
-    source_urls = _source_urls(args)
-    if not source_urls:
+    try:
+        stream_inputs = build_stream_inputs(
+            args.source_urls or [],
+            args.youtube_channels or [],
+            args.twitch_channels or [],
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 2
+    if not stream_inputs:
         print("Error: provide --source_urls, --youtube_channels, and/or --twitch_channels.")
         return 2
     if args.max_videos is not None and args.max_videos < 1:
@@ -1004,9 +1105,9 @@ def run(args) -> int:
         return 2
     print(f"yt-dlp: {ytdlp_executable} ({version})")
 
-    tasks, listing_warnings = list_stream_tasks(
+    tasks, listing_warnings = collect_stream_tasks(
         ytdlp_executable,
-        source_urls,
+        stream_inputs,
         cookies_path=args.cookies,
         max_videos=args.max_videos,
         youtube_player_client=args.youtube_player_client,

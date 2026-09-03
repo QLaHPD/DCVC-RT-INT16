@@ -136,7 +136,7 @@ On a single-GPU Jetson, the default remains one worker. On a multi-GPU host, the
 
 ```bash
 DCVC_USE_INT16=1 python main.py stream \
-  --youtube_channels UCxxxxxxxxxxxxxxxxxxxxxx \
+  --youtube_channels UCxxxxxxxxxxxxxxxxxxxxxx ./UCyyyyyyyyyyyyyyyyyyyyyy.txt \
   --output_root /data/encoded \
   --model_path_i checkpoints/cvpr2025_image.pth.tar \
   --model_path_p checkpoints/cvpr2025_video.pth.tar \

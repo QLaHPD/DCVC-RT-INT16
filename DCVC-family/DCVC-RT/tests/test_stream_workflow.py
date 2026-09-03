@@ -15,6 +15,8 @@ from src.cli.stream_workflow import (
     RemoteMedia,
     StreamTask,
     build_ytdlp_stream_command,
+    build_stream_inputs,
+    collect_stream_tasks,
     find_ytdlp_executable,
     list_stream_tasks,
     process_stream_task,
@@ -71,6 +73,91 @@ class FakeNeuralEncoder:
 
 
 class StreamWorkflowTests(unittest.TestCase):
+    def test_mixed_channel_ids_and_id_files_preserve_order_and_deduplicate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_channel = "UC" + "A" * 22
+            direct_channel = "UC" + "B" * 22
+            second_channel = "UC" + "C" * 22
+            first_file = root / f"{first_channel}.txt"
+            second_file = root / f"{second_channel}.txt"
+            first_file.write_text("videoid0001\nvideoid0002\n\n", encoding="utf-8")
+            second_file.write_text("videoid0002\r\nvideoid0003\r\n", encoding="utf-8")
+
+            inputs = build_stream_inputs(
+                [],
+                [str(first_file), direct_channel, str(second_file)],
+                [],
+            )
+            self.assertIsInstance(inputs[0], StreamTask)
+            self.assertEqual(inputs[0].channel_id, first_channel)
+            self.assertEqual(
+                inputs[2],
+                f"https://www.youtube.com/channel/{direct_channel}/videos",
+            )
+
+            with patch("src.cli.stream_workflow.list_stream_tasks") as listing:
+                listing.return_value = ([
+                    StreamTask(
+                        "youtube:videoid0002",
+                        "videoid0002",
+                        "https://www.youtube.com/watch?v=videoid0002",
+                        direct_channel,
+                        "youtube",
+                    ),
+                    StreamTask(
+                        "youtube:videoid0004",
+                        "videoid0004",
+                        "https://www.youtube.com/watch?v=videoid0004",
+                        direct_channel,
+                        "youtube",
+                    ),
+                ], [])
+                tasks, warnings = collect_stream_tasks("/external/yt-dlp", inputs)
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(
+                [task.video_id for task in tasks],
+                ["videoid0001", "videoid0002", "videoid0004", "videoid0003"],
+            )
+
+    def test_youtube_id_file_validates_filename_and_line_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid_name = root / "my-list.txt"
+            invalid_name.write_text("videoid0001\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "filename"):
+                build_stream_inputs([], [str(invalid_name)], [])
+
+            with self.assertRaisesRegex(ValueError, "UC plus 22"):
+                build_stream_inputs([], ["not-a-channel-id"], [])
+
+            channel_id = "UC" + "A" * 22
+            invalid_line = root / f"{channel_id}.txt"
+            invalid_line.write_text("https://youtu.be/videoid0001\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "line 1"):
+                build_stream_inputs([], [str(invalid_line)], [])
+
+    def test_collect_stream_tasks_applies_global_max_to_mixed_inputs(self):
+        channel_id = "UC" + "A" * 22
+        inputs = [
+            StreamTask(
+                f"youtube:videoid000{index}",
+                f"videoid000{index}",
+                f"https://www.youtube.com/watch?v=videoid000{index}",
+                channel_id,
+                "youtube",
+            )
+            for index in range(1, 4)
+        ]
+        tasks, warnings = collect_stream_tasks(
+            "/external/yt-dlp",
+            inputs,
+            max_videos=2,
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual([task.video_id for task in tasks], ["videoid0001", "videoid0002"])
+
     def test_finds_ytdlp_beside_conda_executable_without_path_install(self):
         with tempfile.TemporaryDirectory() as directory:
             bin_directory = Path(directory) / "bin"

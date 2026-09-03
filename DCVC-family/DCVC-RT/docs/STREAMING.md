@@ -39,9 +39,14 @@ YouTube channels:
 
 ```bash
 DCVC_USE_INT16=1 python main.py stream \
-  --youtube_channels UCxxxxxxxxxxxxxxxxxxxxxx UCyyyyyyyyyyyyyyyyyyyyyy \
+  --youtube_channels \
+    UCxxxxxxxxxxxxxxxxxxxxxx \
+    ./UCyyyyyyyyyyyyyyyyyyyyyy.txt \
+    ./UCzzzzzzzzzzzzzzzzzzzzzz.txt \
   --output_root /data/encoded
 ```
+
+Each `--youtube_channels` value may be either a direct channel ID or a text-file path, in any combination. A text file must be named `<channel-ID>.txt`, where the channel ID is `UC` followed by 22 URL-safe characters. It contains one 11-character YouTube video ID per line; blank lines are ignored. URLs and additional columns are rejected so malformed lists fail before encoder workers start. Duplicate video IDs across files, direct channels, playlists, and other source inputs are queued once, with the first occurrence determining queue order.
 
 Twitch archives:
 
