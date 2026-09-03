@@ -11,6 +11,8 @@ from src.cli.cleanup_workflow import configure_parser as configure_cleanup_parse
 from src.cli.cleanup_workflow import run as run_cleanup
 from src.cli.encode_workflow import configure_parser as configure_encode_parser
 from src.cli.encode_workflow import run as run_encode
+from src.cli.stream_workflow import configure_parser as configure_stream_parser
+from src.cli.stream_workflow import run as run_stream
 from src.cli.viewer import configure_parser as configure_view_parser
 from src.cli.viewer import run as run_view
 
@@ -29,6 +31,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     configure_encode_parser(encode_parser)
     encode_parser.set_defaults(handler=run_encode)
+
+    stream_parser = subparsers.add_parser(
+        "stream",
+        help="Resolve remote media with yt-dlp and encode it without storing source containers",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    configure_stream_parser(stream_parser)
+    stream_parser.set_defaults(handler=run_stream)
 
     decode_parser = subparsers.add_parser(
         "decode",

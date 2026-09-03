@@ -22,3 +22,4 @@ __pycache__/
 .archive-manifest.json
 .cleanup-audit.jsonl
 .progress.jsonl
+*cookies*.txt

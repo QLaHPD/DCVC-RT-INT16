@@ -40,10 +40,11 @@ These are small-resolution, device-specific engineering measurements—not repro
 
 ### Unified media and archive workflow
 
-`main.py` provides four commands:
+`main.py` provides five commands:
 
 ```text
 encode   FFmpeg input -> DCVC bitstream plus optional Opus audio
+stream   yt-dlp remote input -> DCVC bitstream plus optional Opus, without a source file
 decode   DCVC bitstream -> decoded YUV/video workflow
 view     Interactive bitstream viewer
 cleanup  Revalidate a completed channel and remove exact inventoried sources
@@ -68,6 +69,14 @@ DCVC_USE_INT16=1 python main.py encode \
 An explicit worker count is assigned round-robin across the selected devices. More than one worker per GPU is allowed but is not recommended unless model-memory headroom has been measured. If fewer videos remain than planned workers, only the required workers are launched. The selected worker-to-GPU mapping is printed and shown in the dashboard.
 
 Prepared INT16 checkpoint caches are published atomically, so simultaneous first-launch workers cannot observe a partially written cache. Worker cleanup is also limited to temporary files registered by that worker.
+
+### Direct yt-dlp streaming
+
+The `stream` command accepts individual videos, playlists, YouTube channel IDs, Twitch channel names, and other URLs supported by yt-dlp. Listing and metadata resolution use `--skip-download`; for encoding, yt-dlp writes one selected media stream to standard output and FFmpeg reads it from a pipe. Decoded YUV travels through the bounded in-memory frame queue to the neural encoder. No original source container is written.
+
+The archive outputs are still stored normally: `.bin`, optional `.opus`, `.info.json`, and an optional thumbnail. Interrupted or failed final outputs remain protected by the same atomic-write behavior as local encoding. Completed remote items are recognized from their final artifacts and skipped on a later run.
+
+yt-dlp remains an external runtime tool and is not copied into the Conda environment. The command searches `PATH` and the directory containing `CONDA_EXE`, or it can be selected explicitly with `--yt-dlp`. Current YouTube extraction defaults to yt-dlp's `web_safari` player client and permits its recommended EJS challenge component; both the rationale and override are documented in [docs/STREAMING.md](docs/STREAMING.md).
 
 Channel cleanup is deliberately fail-closed. Before a source container can be deleted, the lifecycle verifies its original identity, the latest encode status, DCVC bitstream structure and frame count, Opus stream validity, metadata JSON, retained thumbnails, and safe path boundaries. It writes an archive manifest and append-only audit record before unlinking exact paths. Shell globs and recursive deletion are never used.
 
@@ -122,6 +131,21 @@ DCVC_USE_INT16=1 python main.py encode \
 With no cleanup option, completed channels await approval while other channels continue encoding. Add `--auto-delete` for validation-gated unattended cleanup, `--cleanup-dry-run` to exercise every check without unlinking, or `--keep-originals` to disable cleanup.
 
 On a single-GPU Jetson, the default remains one worker. On a multi-GPU host, the default is one worker per visible GPU. Use `--procs` to override encoding concurrency or `--worker` to override decoding concurrency.
+
+## Streaming example
+
+```bash
+DCVC_USE_INT16=1 python main.py stream \
+  --youtube_channels UCxxxxxxxxxxxxxxxxxxxxxx \
+  --output_root /data/encoded \
+  --model_path_i checkpoints/cvpr2025_image.pth.tar \
+  --model_path_p checkpoints/cvpr2025_video.pth.tar \
+  --resolution 96 --fps 24 --qp_i 35 --qp_p 14 \
+  --audio opus --opus_bitrate 6k --opus_channels mono \
+  --cuda_idx 0 1 2 3 4 --ui auto
+```
+
+For an initial end-to-end check, add `--max-videos 1`. Private or age-restricted sources can use `--cookies /path/to/cookies.txt`; the cookies file is read by the external yt-dlp process and is never copied into the output.
 
 ## Tests
 
