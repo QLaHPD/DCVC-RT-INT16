@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from src.cli.dashboard import format_bytes, render_dashboard_lines
-from src.cli.progress import AverageCompletionTime
+from src.cli.progress import AverageCompletionTime, RollingFrameRate
 
 
 class DashboardRenderingTests(unittest.TestCase):
@@ -87,6 +87,19 @@ class DashboardRenderingTests(unittest.TestCase):
         ))
         self.assertIn("avg/video=00:02:30", output)
         self.assertIn("eta=00:05:00", output)
+
+    def test_frame_rate_uses_only_the_trailing_three_seconds(self):
+        rate = RollingFrameRate(window_seconds=3.0, start_time=0.0)
+        for frame_index in range(1, 101):
+            rate.record_frame(frame_index / 100.0)
+
+        current = rate.record_frame(4.5)
+        self.assertAlmostEqual(current, 1.0 / 3.0)
+
+    def test_frame_rate_uses_elapsed_interval_during_startup(self):
+        rate = RollingFrameRate(window_seconds=3.0, start_time=10.0)
+        self.assertEqual(rate.record_frame(10.5), 2.0)
+        self.assertEqual(rate.record_frame(11.0), 2.0)
 
 
 if __name__ == "__main__":

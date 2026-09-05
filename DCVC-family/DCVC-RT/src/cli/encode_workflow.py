@@ -25,7 +25,12 @@ from src.cli.channel_lifecycle import write_channel_inventory
 from src.cli.dashboard import EncodeDashboard
 from src.cli.device_plan import build_worker_device_plan
 from src.cli.lifecycle_runtime import ChannelLifecycleController, ChannelRuntimeState
-from src.cli.progress import append_progress_log, build_encode_output_index, ensure_dir
+from src.cli.progress import (
+    RollingFrameRate,
+    append_progress_log,
+    build_encode_output_index,
+    ensure_dir,
+)
 from src.layers.cuda_inference import replicate_pad
 from src.models.image_model import DMCI
 from src.models.video_model import DMC
@@ -445,8 +450,9 @@ class NeuralEncoder:
             "pad_r": padding_r,
         })
 
-        t0 = time.time()
+        t0 = time.monotonic()
         t_last = t0
+        rolling_fps = RollingFrameRate(window_seconds=3.0, start_time=t0)
         frame_queue, prefetch_stop, reader_thread = self._start_ffmpeg_prefetch(ffmpeg_proc, width, height)
 
         try:
@@ -507,11 +513,11 @@ class NeuralEncoder:
                 write_ip(output_buff, is_i, sps_id, curr_qp, encoded["bit_stream"])
 
                 frame_idx += 1
-                now = time.time()
+                now = time.monotonic()
+                current_fps = rolling_fps.record_frame(now)
                 if on_progress and (now - t_last) >= 0.1:
                     elapsed = now - t0
-                    fps = frame_idx / max(1e-6, elapsed)
-                    on_progress(frame_idx, fps, elapsed)
+                    on_progress(frame_idx, current_fps, elapsed)
                     t_last = now
         finally:
             prefetch_stop.set()

@@ -5,10 +5,11 @@ import math
 import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Deque, Dict, Optional, Set
 
 from tqdm import tqdm
 
@@ -221,6 +222,32 @@ class AverageCompletionTime:
             return None
         remaining = max(0, total - done)
         return average * remaining / self.worker_count
+
+
+class RollingFrameRate:
+    """Frame completion rate over a bounded trailing time window."""
+
+    def __init__(self, window_seconds: float = 3.0, start_time: Optional[float] = None):
+        if window_seconds <= 0 or not math.isfinite(window_seconds):
+            raise ValueError("rolling FPS window must be a positive finite number")
+        self.window_seconds = float(window_seconds)
+        self.start_time = time.monotonic() if start_time is None else float(start_time)
+        self.frame_times: Deque[float] = deque()
+
+    def record_frame(self, timestamp: Optional[float] = None) -> float:
+        now = time.monotonic() if timestamp is None else float(timestamp)
+        if now < self.start_time:
+            raise ValueError("frame timestamp cannot precede the rate start time")
+        if self.frame_times and now < self.frame_times[-1]:
+            raise ValueError("frame timestamps must be monotonic")
+
+        self.frame_times.append(now)
+        cutoff = now - self.window_seconds
+        while self.frame_times and self.frame_times[0] < cutoff:
+            self.frame_times.popleft()
+
+        observed_seconds = min(self.window_seconds, now - self.start_time)
+        return len(self.frame_times) / max(1e-6, observed_seconds)
 
 
 class MultiWorkerProgress:

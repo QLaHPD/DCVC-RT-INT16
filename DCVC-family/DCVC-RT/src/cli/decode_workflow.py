@@ -18,6 +18,7 @@ from src.codec.frame_decoder import BitstreamFrameSource, DecoderModels, load_de
 from src.cli.device_plan import build_worker_device_plan
 from src.cli.progress import (
     MultiWorkerProgress,
+    RollingFrameRate,
     append_progress_log,
     build_decode_output_index,
     ensure_dir,
@@ -152,25 +153,25 @@ def run_decoding(task: DecodeTask, output_folder: str, progress_q, wid: int, mod
     recon_writer = YUV420Writer(str(output_path), pic_width, pic_height)
 
     frame_idx = 0
-    t0 = time.time()
+    t0 = time.monotonic()
     t_last = t0
+    rolling_fps = RollingFrameRate(window_seconds=3.0, start_time=t0)
 
     try:
         for frame in source.iter_frames(output_format="yuv420", should_stop=lambda: STOP_FLAG):
             recon_writer.write_one_frame(frame.y, frame.uv)
 
             frame_idx += 1
-            now = time.time()
+            now = time.monotonic()
+            current_fps = rolling_fps.record_frame(now)
             if (now - t_last) >= 0.1:
-                elapsed = now - t0
-                fps = frame_idx / max(1e-6, elapsed)
                 progress_q.put({
                     "type": "worker_prog",
                     "wid": wid,
                     "vid": task.base_name,
                     "frames": frame_idx,
                     "frame_total": frame_total,
-                    "fps": fps,
+                    "fps": current_fps,
                 })
                 t_last = now
     finally:
@@ -189,7 +190,7 @@ def run_decoding(task: DecodeTask, output_folder: str, progress_q, wid: int, mod
         "vid": task.base_name,
         "frames": frame_idx,
         "frame_total": frame_total,
-        "elapsed": time.time() - t0,
+        "elapsed": time.monotonic() - t0,
     })
 
 
