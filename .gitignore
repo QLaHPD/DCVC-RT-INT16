@@ -23,3 +23,12 @@ __pycache__/
 .cleanup-audit.jsonl
 .progress.jsonl
 *cookies*.txt
+
+# Keep model weights and generated benchmark artifacts local.
+*.pth
+*.ckpt
+*.safetensors
+DCVC-family/DCVC-RT/benchmarks/optimization_*/
+DCVC-family/DCVC-RT/benchmarks/fixtures/
+DCVC-family/DCVC-RT/benchmarks/results/
+DCVC-family/DCVC-RT/benchmarks/pipeline_recheck*/

@@ -22,6 +22,7 @@ build_index_enc_int16_cuda = None
 add_and_multiply_int16_cuda = None
 bias_quant_int16_cuda = None
 bias_pixel_shuffle_8_int16_cuda = None
+round_and_to_int8_int16_cuda = None
 try:
     _ext = load_inference_extensions(
         required=(
@@ -63,6 +64,7 @@ try:
     add_and_multiply_int16_cuda = getattr(_ext, "add_and_multiply_int16_cuda", None)
     bias_quant_int16_cuda = getattr(_ext, "bias_quant_int16_cuda", None)
     bias_pixel_shuffle_8_int16_cuda = getattr(_ext, "bias_pixel_shuffle_8_int16_cuda", None)
+    round_and_to_int8_int16_cuda = getattr(_ext, "round_and_to_int8_int16_cuda", None)
     CUSTOMIZED_CUDA_INFERENCE = True
 except Exception:  # pylint: disable=W0718
     pass
@@ -74,6 +76,8 @@ if not CUSTOMIZED_CUDA_INFERENCE and 'SUPPRESS_CUSTOM_KERNEL_WARNING' not in os.
 
 def round_and_to_int8(z):
     if int16_inference_enabled() and z.dtype == torch.int16 and z.is_cuda:
+        if round_and_to_int8_int16_cuda is not None:
+            return round_and_to_int8_int16_cuda(z.contiguous())
         z_q, z_int8 = round_feature_to_symbols(z)
         z_hat = symbol_to_feature(z_q)
         return z_hat, z_int8

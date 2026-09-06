@@ -35,6 +35,8 @@ __forceinline__ __device__ int16_t clip_to_int16(const int32_t value)
     return static_cast<int16_t>(clipped);
 }
 
+#include "int16_mma.cuh"
+
 __forceinline__ __device__ int64_t broadcast_offset_4d(const int64_t linear_index,
                                                        const int B, const int C, const int H, const int W,
                                                        const int sB, const int sC, const int sH, const int sW)
@@ -891,6 +893,26 @@ torch::Tensor conv2d_int16_cuda(const torch::Tensor& x, const torch::Tensor& wei
     const bool is_stride2_3x3 = groups == 1 && weight_contiguous.size(2) == 3 && weight_contiguous.size(3) == 3 &&
                                 stride_h == 2 && stride_w == 2 && pad_h == 1 && pad_w == 1;
 
+    if ((is_tiled_1x1 || is_tiled_3x3) && int16_mma_supported(x.get_device())) {
+        const auto bias_contiguous = bias.has_value() ? bias.value().contiguous() : torch::Tensor();
+        const int16_t* bias_ptr = bias.has_value() ? bias_contiguous.data_ptr<int16_t>() : nullptr;
+        const dim3 grid(ceil_div_int64(out_h * out_w, 32), ceil_div_int64(out.size(1), 64), out.size(0));
+        const int K = x_contiguous.size(1) * (is_tiled_3x3 ? 9 : 1);
+#define DCVC_LAUNCH_MMA(BIAS, CONV3) \
+        conv2d_int16_mma_kernel<BIAS, CONV3><<<grid, 128, 0, stream>>>( \
+            out.data_ptr<int16_t>(), x_contiguous.data_ptr<int16_t>(), weight_contiguous.data_ptr<int16_t>(), \
+            bias_ptr, out.size(1), out_h*out_w, K, out_h, out_w)
+        if (is_tiled_3x3) {
+            if (bias.has_value()) { DCVC_LAUNCH_MMA(true, true); }
+            else { DCVC_LAUNCH_MMA(false, true); }
+        } else {
+            if (bias.has_value()) { DCVC_LAUNCH_MMA(true, false); }
+            else { DCVC_LAUNCH_MMA(false, false); }
+        }
+#undef DCVC_LAUNCH_MMA
+        return out;
+    }
+
     if (bias.has_value()) {
         const auto bias_contiguous = bias.value().contiguous();
         if (is_tiled_1x1) {
@@ -1387,4 +1409,30 @@ torch::Tensor bias_pixel_shuffle_8_int16_cuda(const torch::Tensor& x, const torc
         out.numel(), out.size(0), out.size(1), out.size(2), out.size(3),
         x_contiguous.size(2), x_contiguous.size(3));
     return out;
+}
+
+namespace {
+__global__ void round_and_to_int8_int16_kernel(int16_t* feature, int8_t* symbols,
+                                               const int16_t* x, int64_t N)
+{
+    const int64_t i = static_cast<int64_t>(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    const int32_t q = max(-128, min(127, round_divide_int(static_cast<int32_t>(x[i]), FEATURE_SCALE)));
+    symbols[i] = static_cast<int8_t>(q);
+    feature[i] = clip_to_int16(q*FEATURE_SCALE);
+}
+}  // namespace
+
+std::tuple<torch::Tensor, torch::Tensor> round_and_to_int8_int16_cuda(const torch::Tensor& x)
+{
+    check_cuda_int16(x, "x");
+    const auto input = x.contiguous();
+    auto feature = torch::empty_like(input);
+    auto symbols = torch::empty(input.sizes(), input.options().dtype(torch::kInt8));
+    if (input.numel() > 0) {
+        round_and_to_int8_int16_kernel<<<ceil_div_int64(input.numel(), THREADS), THREADS, 0,
+                                       c10::cuda::getCurrentCUDAStream()>>>(
+            feature.data_ptr<int16_t>(), symbols.data_ptr<int8_t>(), input.data_ptr<int16_t>(), input.numel());
+    }
+    return {feature, symbols};
 }

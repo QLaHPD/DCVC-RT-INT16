@@ -46,6 +46,8 @@ torch::Tensor round_and_to_int8_cuda(torch::Tensor& z);
 torch::Tensor clamp_reciprocal_with_quant_cuda(const torch::Tensor& q_dec, torch::Tensor& y,
                                                const float min_val);
 void add_and_multiply_cuda(torch::Tensor& x0, const torch::Tensor& x1, const torch::Tensor q);
+std::tuple<torch::Tensor, torch::Tensor> round_and_to_int8_int16_cuda(const torch::Tensor& x);
+
 torch::Tensor conv2d_int16_cuda(const torch::Tensor& x, const torch::Tensor& weight,
                                 const torch::optional<torch::Tensor>& bias,
                                 const int stride_h, const int stride_w,

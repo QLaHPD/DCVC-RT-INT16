@@ -27,6 +27,7 @@ setup(
         CUDAExtension(
             name='inference_extensions_cuda',
             sources=glob.glob('*.cpp') + glob.glob('*.cu'),
+            depends=['int16_mma.cuh'],
             extra_compile_args={
                 "cxx": cxx_flags,
                 "nvcc": nvcc_flags,
