@@ -23,6 +23,7 @@ import torch
 
 from src.cli.channel_lifecycle import write_channel_inventory
 from src.cli.dashboard import EncodeDashboard
+from src.cli.jetson_decode import DecodeError, start_jetson_pipe, validate_decode
 from src.cli.device_plan import build_worker_device_plan
 from src.cli.lifecycle_runtime import ChannelLifecycleController, ChannelRuntimeState
 from src.cli.progress import (
@@ -264,7 +265,7 @@ def build_ffmpeg_chain_local(path: str, width: int, height: int, cfg: EncoderCfg
     return [
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-nostats",
         "-fflags", "+genpts", "-reinit_filter", "0",
-        "-hwaccel", cfg.ff_hwaccel,
+        "-hwaccel", "none" if cfg.ff_hwaccel == "jetson" else cfg.ff_hwaccel,
         "-i", path,
         "-vf", vf,
         "-pix_fmt", "yuv420p",
@@ -382,13 +383,15 @@ class NeuralEncoder:
         uv_size = (width // 2) * (height // 2)
 
         y = ffmpeg_proc.stdout.read(y_size)
-        if not y or len(y) < y_size:
+        if not y:
             return None
+        if len(y) < y_size:
+            raise DecodeError("truncated Y plane")
 
         u = ffmpeg_proc.stdout.read(uv_size)
         v = ffmpeg_proc.stdout.read(uv_size)
         if (not u or len(u) < uv_size) or (not v or len(v) < uv_size):
-            return None
+            raise DecodeError("truncated chroma plane")
 
         return RawYuv420Frame(y=y, u=u, v=v)
 
@@ -529,6 +532,8 @@ class NeuralEncoder:
         if STOP_FLAG:
             raise EncodeInterrupted("encode interrupted")
 
+        validate_decode(ffmpeg_proc, frame_idx)
+
         append_progress_log(log_dir, {
             "video_id": video_id,
             "stage": "stats",
@@ -625,7 +630,6 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
             src_w, src_h = 854, 480
         new_w, new_h = compute_target_dims(src_w, src_h, enc_cfg.resolution, enc_cfg.pad_multiple)
         ff_cmd = build_ffmpeg_chain_local(str(video_path), new_w, new_h, enc_cfg)
-        ff_proc = popen_command(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
         bin_path = channel_out / f"{base}_{new_w}x{new_h}_qI{enc_cfg.qp_i}_qP{enc_cfg.qp_p}.bin"
         append_progress_log(channel_out, {
@@ -643,23 +647,33 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
         def on_progress(frames, fps, elapsed):
             emit("worker_prog", frames=int(frames), fps=float(fps), elapsed=float(elapsed))
 
-        encoder.encode_from_ffmpeg_rawpipe(
-            ff_proc,
-            new_w,
-            new_h,
-            bin_path,
-            log_dir=channel_out,
-            video_id=base,
-            on_progress=on_progress,
-            finalize_mode=finalize_mode,
-        )
-        if ff_proc:
+        modes = ["jetson", "none"] if enc_cfg.ff_hwaccel == "jetson" else [enc_cfg.ff_hwaccel]
+        for mode in modes:
             try:
-                if ff_proc.stdout:
-                    ff_proc.stdout.close()
-                ff_proc.wait(timeout=2)
-            except Exception:
-                pass
+                ff_proc = (start_jetson_pipe(str(video_path), ff_cmd, popen_command)
+                           if mode == "jetson" else
+                           popen_command(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
+                append_progress_log(channel_out, {"video_id": base, "event": "decoder", "backend": mode})
+                encoder.encode_from_ffmpeg_rawpipe(
+                    ff_proc, new_w, new_h, bin_path, log_dir=channel_out,
+                    video_id=base, on_progress=on_progress, finalize_mode=finalize_mode,
+                )
+                break
+            except DecodeError as exc:
+                if mode != "jetson" or STOP_FLAG:
+                    raise
+                append_progress_log(channel_out, {
+                    "video_id": base, "event": "decoder_fallback", "error": str(exc),
+                    "backend": "none",
+                })
+            finally:
+                if ff_proc is not None:
+                    if hasattr(ff_proc, "close"):
+                        ff_proc.close()
+                    else:
+                        kill_popen(ff_proc)
+                        ff_proc.stdout.close()
+                    ff_proc = None
 
         append_progress_log(channel_out, {"video_id": base, "status": "video-done", "out_bin": str(bin_path)})
 
@@ -811,7 +825,7 @@ def configure_parser(parser: argparse.ArgumentParser):
     pipe_group = parser.add_argument_group("Pipeline and FFMPEG Settings")
     pipe_group.add_argument("--fps", type=float, default=30, help="Target framerate for the video.")
     pipe_group.add_argument("--ff_color_matrix", choices=["bt709", "bt601", "bt2020"], default="bt709", help="Color matrix used by FFmpeg during YUV conversion.")
-    pipe_group.add_argument("--ff_hwaccel", choices=["none", "auto"], default="none", help="Hardware acceleration API to use during FFmpeg decoding.")
+    pipe_group.add_argument("--ff_hwaccel", choices=["none", "auto", "jetson"], default="none", help="Decoder: none/auto (FFmpeg), or jetson (GStreamer NVDEC for supported H.264 MP4/MOV; software fallback).")
     pipe_group.add_argument("--ffmpeg_prefetch", type=int, default=8, help="How many decoded raw frames FFmpeg may buffer ahead of the GPU loop.")
     pipe_group.add_argument("--extensions", nargs="+", default=[".mp4", ".mkv", ".avi", ".mov", ".webm"], help="File extensions to process.")
     pipe_group.add_argument("--recursive", type=lambda s: s.lower() in {"1", "true", "yes"}, default=False, help="Whether to search recursively within the channel folders.")
