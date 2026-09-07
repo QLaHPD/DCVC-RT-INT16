@@ -71,14 +71,26 @@ def _worker_sig_handler(sig, frame):
 
 
 def build_decode_tasks(args) -> tuple[List[DecodeTask], int, int]:
-    input_dir = Path(args.input_folder)
     output_dir = Path(args.output_folder)
     ensure_dir(output_dir)
-    if not input_dir.exists() or not input_dir.is_dir():
-        print(f"Warning: Input folder '{args.input_folder}' not found.")
-        return [], 0, 0
-
-    bin_paths = sorted(path for path in input_dir.iterdir() if path.is_file() and path.suffix.lower() == ".bin")
+    if args.input_file:
+        input_file = Path(args.input_file)
+        if not input_file.is_file():
+            print(f"Warning: Input file '{args.input_file}' not found.")
+            return [], 0, 0
+        if input_file.suffix.lower() != ".bin":
+            print(f"Warning: Input file '{args.input_file}' is not a .bin bitstream.")
+            return [], 0, 0
+        bin_paths = [input_file]
+    else:
+        input_dir = Path(args.input_folder)
+        if not input_dir.exists() or not input_dir.is_dir():
+            print(f"Warning: Input folder '{args.input_folder}' not found.")
+            return [], 0, 0
+        bin_paths = sorted(
+            path for path in input_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".bin"
+        )
     output_index = build_decode_output_index(output_dir)
 
     original_videos: Dict[str, str] = {}
@@ -243,7 +255,9 @@ def worker_entry(wid: int, task_q, progress_q, stop_event, args_dict: Dict, use_
 def configure_parser(parser: argparse.ArgumentParser):
     parser.add_argument("--model_path_i", type=str, default="./checkpoints/cvpr2025_image.pth.tar")
     parser.add_argument("--model_path_p", type=str, default="./checkpoints/cvpr2025_video.pth.tar")
-    parser.add_argument("--input_folder", type=str, required=True, help="Folder with .bin files.")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--input_folder", type=str, help="Folder with .bin files.")
+    input_group.add_argument("--input_file", type=str, help="One specific .bin bitstream to decode.")
     parser.add_argument("--output_folder", type=str, required=True, help="Folder for decoded .yuv files.")
     parser.add_argument("--original_folder", type=str, default=None, help="[Optional] Folder with original videos for bitrate/frame count.")
     parser.add_argument(
