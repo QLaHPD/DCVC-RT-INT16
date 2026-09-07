@@ -9,6 +9,7 @@ from pathlib import Path
 
 from src.cli.channel_lifecycle import validate_channel, write_channel_inventory
 from src.cli.encode_workflow import (
+    build_ffmpeg_chain_local,
     EncoderCfg,
     EncodeTask,
     append_progress_log,
@@ -62,6 +63,23 @@ class FakeNeuralEncoder:
 
 
 class EncodeLifecycleMessageTests(unittest.TestCase):
+    def test_ffmpeg_omits_scale_when_source_and_output_dimensions_match(self):
+        config = EncoderCfg(resolution=96, fps=24)
+        command = build_ffmpeg_chain_local(
+            "input.mkv", 176, 96, config, source_width=176, source_height=96
+        )
+        video_filter = command[command.index("-vf") + 1]
+        self.assertNotIn("scale=", video_filter)
+        self.assertEqual(video_filter, "format=yuv420p,setsar=1/1,fps=24:round=down")
+
+    def test_ffmpeg_scales_when_dimensions_differ(self):
+        config = EncoderCfg(resolution=96, fps=24)
+        command = build_ffmpeg_chain_local(
+            "input.mkv", 176, 96, config, source_width=1920, source_height=1080
+        )
+        video_filter = command[command.index("-vf") + 1]
+        self.assertIn("scale=176:96:", video_filter)
+
     def test_real_ffmpeg_audio_and_fake_video_reach_cleanup_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -109,6 +127,8 @@ class EncodeLifecycleMessageTests(unittest.TestCase):
                 records.append(messages.get_nowait())
             self.assertEqual(records[0]["type"], "worker_task_start")
             self.assertTrue(all(record["channel_id"] == "TEST_CHANNEL" for record in records))
+            worker_start = next(record for record in records if record["type"] == "worker_start")
+            self.assertEqual(worker_start["resolution"], "176, 96 -> 176, 96")
             self.assertEqual(records[-1]["type"], "worker_done")
 
             state_path = write_channel_inventory(

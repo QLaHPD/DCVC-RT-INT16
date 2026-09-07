@@ -314,6 +314,8 @@ class StreamWorkflowTests(unittest.TestCase):
             while not messages.empty():
                 records.append(messages.get_nowait())
             self.assertEqual(records[0]["type"], "worker_task_start")
+            worker_start = next(record for record in records if record["type"] == "worker_start")
+            self.assertEqual(worker_start["resolution"], "176, 96 -> 176, 96")
             self.assertEqual(records[-1]["type"], "worker_done")
 
     def test_failed_downloader_does_not_publish_partial_bitstream(self):

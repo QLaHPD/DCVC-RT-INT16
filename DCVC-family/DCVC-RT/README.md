@@ -76,6 +76,8 @@ The `stream` command accepts individual videos, playlists, YouTube channel IDs, 
 
 The archive outputs are still stored normally: `.bin`, optional `.opus`, `.info.json`, and an optional thumbnail. Interrupted or failed final outputs remain protected by the same atomic-write behavior as local encoding. Completed remote items are recognized from their final artifacts and skipped on a later run.
 
+Local and streamed encoding report each video's dimensions as `source width, source height -> output width, output height`. When the computed output dimensions already equal the source dimensions, FFmpeg omits the scale filter.
+
 yt-dlp remains an external runtime tool and is not copied into the Conda environment. The command searches `PATH` and the directory containing `CONDA_EXE`, or it can be selected explicitly with `--yt-dlp`. Current YouTube extraction defaults to yt-dlp's `web_safari` player client and permits its recommended EJS challenge component; both the rationale and override are documented in [docs/STREAMING.md](docs/STREAMING.md).
 
 Channel cleanup is deliberately fail-closed. Before a source container can be deleted, the lifecycle verifies its original identity, the latest encode status, DCVC bitstream structure and frame count, Opus stream validity, metadata JSON, retained thumbnails, and safe path boundaries. It writes an archive manifest and append-only audit record before unlinking exact paths. Shell globs and recursive deletion are never used.

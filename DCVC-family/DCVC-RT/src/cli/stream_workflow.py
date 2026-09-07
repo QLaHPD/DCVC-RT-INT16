@@ -754,7 +754,10 @@ def process_stream_task(
                     width,
                     height,
                     config,
+                    source_width=source_width,
+                    source_height=source_height,
                 )
+                resolution_text = f"{source_width}, {source_height} -> {width}, {height}"
                 ffmpeg_process = encode_core.popen_command(
                     ffmpeg_command,
                     stdin=video_downloader.stdout,
@@ -769,12 +772,18 @@ def process_stream_task(
                     "source_url": task.webpage_url,
                     "src_fps": source_fps,
                     "out_fps": config.fps or "source",
+                    "source_width": source_width,
+                    "source_height": source_height,
+                    "output_width": width,
+                    "output_height": height,
+                    "resize_applied": (source_width, source_height) != (width, height),
                 })
                 emit(
                     "worker_start",
                     vid=base,
                     output_channel=channel_id,
                     audio="on" if need_audio else ("done" if audio_enabled else "off"),
+                    resolution=resolution_text,
                 )
 
                 def on_progress(frames, fps, elapsed):
@@ -1271,6 +1280,7 @@ def run(args) -> int:
                         "frames": 0,
                         "fps": 0.0,
                         "audio": message.get("audio", "off"),
+                        "resolution": message.get("resolution", ""),
                     })
                     progress.set_worker_text(worker_id, encode_core._format_worker_text(state))
                 elif message_type == "worker_prog":

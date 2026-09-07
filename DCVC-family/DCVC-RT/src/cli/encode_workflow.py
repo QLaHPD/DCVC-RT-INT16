@@ -253,12 +253,16 @@ def encode_audio_opus_from_file_to_temp(video_path: str, tmp_out_file: Path, bit
         raise RuntimeError(f"ffmpeg opus failed rc={rc}")
 
 
-def build_ffmpeg_chain_local(path: str, width: int, height: int, cfg: EncoderCfg) -> List[str]:
-    filters = [
-        f"scale={width}:{height}:flags=fast_bilinear+full_chroma_int:in_color_matrix={cfg.ff_color_matrix}:out_color_matrix={cfg.ff_color_matrix}",
-        "format=yuv420p",
-        "setsar=1/1",
-    ]
+def build_ffmpeg_chain_local(path: str, width: int, height: int, cfg: EncoderCfg,
+                             source_width: Optional[int] = None,
+                             source_height: Optional[int] = None) -> List[str]:
+    filters = []
+    if source_width != width or source_height != height:
+        filters.append(
+            f"scale={width}:{height}:flags=fast_bilinear+full_chroma_int:"
+            f"in_color_matrix={cfg.ff_color_matrix}:out_color_matrix={cfg.ff_color_matrix}"
+        )
+    filters.extend(("format=yuv420p", "setsar=1/1"))
     if cfg.fps and cfg.fps > 0:
         filters.append(f"fps={cfg.fps}:round=down")
     vf = ",".join(filters)
@@ -629,7 +633,15 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
         if src_w <= 0 or src_h <= 0:
             src_w, src_h = 854, 480
         new_w, new_h = compute_target_dims(src_w, src_h, enc_cfg.resolution, enc_cfg.pad_multiple)
-        ff_cmd = build_ffmpeg_chain_local(str(video_path), new_w, new_h, enc_cfg)
+        ff_cmd = build_ffmpeg_chain_local(
+            str(video_path),
+            new_w,
+            new_h,
+            enc_cfg,
+            source_width=src_w,
+            source_height=src_h,
+        )
+        resolution_text = f"{src_w}, {src_h} -> {new_w}, {new_h}"
 
         bin_path = channel_out / f"{base}_{new_w}x{new_h}_qI{enc_cfg.qp_i}_qP{enc_cfg.qp_p}.bin"
         append_progress_log(channel_out, {
@@ -638,10 +650,16 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
             "ff_cmd": ff_cmd,
             "src_fps": src_fps,
             "out_fps": enc_cfg.fps or "source",
+            "source_width": src_w,
+            "source_height": src_h,
+            "output_width": new_w,
+            "output_height": new_h,
+            "resize_applied": (src_w, src_h) != (new_w, new_h),
         })
         emit(
             "worker_start",
             audio="on" if task.need_audio and audio_enable else ("done" if audio_enable else "off"),
+            resolution=resolution_text,
         )
 
         def on_progress(frames, fps, elapsed):
@@ -867,8 +885,10 @@ def _format_worker_text(state: Dict) -> str:
         vid = vid[:27] + "..."
     device = state.get("device", "")
     device_text = f"{device} " if device else ""
+    resolution = state.get("resolution", "")
+    resolution_text = f" {resolution}" if resolution else ""
     return (
-        f"{device_text}{vid} {state.get('frames', 0)}f "
+        f"{device_text}{vid}{resolution_text} {state.get('frames', 0)}f "
         f"{state.get('fps', 0.0):.1f}fps Aud:{state.get('audio', 'off')}"
     )
 
@@ -1129,6 +1149,7 @@ def run(args) -> int:
                         "frames": 0,
                         "fps": 0.0,
                         "audio": msg.get("audio", "off"),
+                        "resolution": msg.get("resolution", ""),
                     }
                     progress.set_worker_text(wid, _format_worker_text(active[wid]))
                 elif typ == "worker_prog":
