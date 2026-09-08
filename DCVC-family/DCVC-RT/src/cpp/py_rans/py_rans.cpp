@@ -103,7 +103,9 @@ void RansEncoder::empty_cdf_buffer()
 void RansEncoder::flush()
 {
     m_encoder0->flush();
-    m_encoder1->flush();
+    if (m_use_two_encoders) {
+        m_encoder1->flush();
+    }
 }
 
 py::array_t<uint8_t> RansEncoder::get_encoded_stream()

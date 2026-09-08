@@ -51,6 +51,7 @@
 struct RansSymbol {
     uint16_t start;
     uint16_t range;  // range for normal coding and 0 for bypass coding
+    uint32_t reciprocal;  // floor(2^32/range) for range > 1; zero otherwise
 };
 
 enum class WorkType {

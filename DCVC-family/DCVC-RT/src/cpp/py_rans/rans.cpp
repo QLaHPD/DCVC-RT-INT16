@@ -73,8 +73,10 @@ int RansEncoderLib::add_cdf(const std::shared_ptr<std::vector<std::vector<int32_
         std::vector<RansSymbol> ransSym(cdfs->at(i).size());
         const int ransSize = static_cast<int>(ransSym.size() - 1);
         for (int j = 0; j < ransSize; j++) {
+            const auto range = static_cast<uint16_t>(cdf[j + 1] - cdf[j]);
             ransSym[j] = RansSymbol(
-                { static_cast<uint16_t>(cdf[j]), static_cast<uint16_t>(cdf[j + 1] - cdf[j]) });
+                { static_cast<uint16_t>(cdf[j]), range,
+                  range > 1 ? static_cast<uint32_t>((uint64_t(1) << 32) / range) : 0 });
         }
         ransSymbols->at(i) = ransSym;
     }
@@ -109,8 +111,6 @@ FORCE_INLINE void RansEncoderLib::encode_one_symbol(uint8_t*& ptr, RansState& ra
     }
 
     if (value == max_value) {
-        std::vector<uint16_t> bypassBins;
-        bypassBins.reserve(20);
         /* Determine the number of bypasses (in bypass_precision size) needed to
          * encode the raw value. */
         int32_t n_bypass = 0;
@@ -118,25 +118,16 @@ FORCE_INLINE void RansEncoderLib::encode_one_symbol(uint8_t*& ptr, RansState& ra
             ++n_bypass;
         }
 
-        /* Encode number of bypasses */
-        int32_t val = n_bypass;
-        while (val >= max_bypass_val) {
-            bypassBins.push_back(max_bypass_val);
-            val -= max_bypass_val;
-        }
-        bypassBins.push_back(static_cast<uint16_t>(val));
-
-        /* Encode raw value */
-        for (int32_t j = 0; j < n_bypass; ++j) {
-            const int32_t val1 = (raw_val >> (j * bypass_precision)) & max_bypass_val;
-            bypassBins.push_back(static_cast<uint16_t>(val1));
-        }
-
-        for (auto it = bypassBins.rbegin(); it < bypassBins.rend(); it++) {
-            RansEncPutBits(rans, ptr, *it);
-        }
+        // Emit the original bypass sequence backwards directly, without
+        // allocating a temporary vector for every escaped symbol.
+        for (int32_t j = n_bypass - 1; j >= 0; --j)
+            RansEncPutBits(rans, ptr, (raw_val >> (j * bypass_precision)) & max_bypass_val);
+        RansEncPutBits(rans, ptr, n_bypass % max_bypass_val);
+        for (int32_t j = 0; j < n_bypass / max_bypass_val; ++j)
+            RansEncPutBits(rans, ptr, max_bypass_val);
     }
-    RansEncPut(rans, ptr, ransSymbols[value].start, ransSymbols[value].range);
+    const auto& entry = ransSymbols[value];
+    RansEncPutReciprocal(rans, ptr, entry.start, entry.range, entry.reciprocal);
 }
 
 void RansEncoderLib::encode_y(const std::shared_ptr<std::vector<int16_t>> symbols,

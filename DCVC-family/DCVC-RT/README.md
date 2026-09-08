@@ -38,6 +38,12 @@ On the development Jetson Orin fixture, the steady codec loop changed as follows
 
 These are small-resolution, device-specific engineering measurements—not reproductions of the paper's 1080p A100 results. The reference and optimized paths produced byte-identical bitstreams and decoded YUV in the local regression.
 
+The CPU entropy encoder also uses exact reciprocal division, emits escaped
+symbols without temporary heap allocations, and avoids waking the inactive
+second coder. Rebuild the CPU extension to enable these changes; no new CLI
+option or prepared-model conversion is needed. See the
+[CPU measurements and compatibility checks](CPU_OPTIMIZATION_20260908.md).
+
 ### Unified media and archive workflow
 
 `main.py` provides five commands:

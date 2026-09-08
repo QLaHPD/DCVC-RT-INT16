@@ -99,6 +99,21 @@ static inline void RansEncPut(RansState& r, uint8_t*& ptr, uint32_t start, uint3
     r = ((r / freq) << SCALE_BITS) + (r % freq) + start;
 }
 
+// Exact quotient using a precomputed reciprocal. For freq > 1 the estimate
+// underestimates floor(r/freq) by at most one; the remainder corrects it.
+static inline void RansEncPutReciprocal(RansState& r, uint8_t*& ptr, uint32_t start,
+                                      uint32_t freq, uint32_t reciprocal)
+{
+    RansEncRenorm(r, ptr, freq);
+    uint32_t quotient = freq == 1 ? r : static_cast<uint32_t>((uint64_t(r) * reciprocal) >> 32);
+    uint32_t remainder = r - quotient * freq;
+    if (remainder >= freq) {
+        ++quotient;
+        remainder -= freq;
+    }
+    r = (quotient << SCALE_BITS) + remainder + start;
+}
+
 // Flushes the rANS encoder.
 static inline void RansEncFlush(const RansState& r, uint8_t*& ptr)
 {
