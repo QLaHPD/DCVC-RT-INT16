@@ -29,21 +29,22 @@ __device__ __forceinline__ void split_four_int16(const int16_t* ptr, uint32_t& l
     hi = __byte_perm(p, q, 0x7531);
 }
 
-template <bool WITH_BIAS, bool CONV3>
+template <bool WITH_BIAS, bool CONV3, int BN = 32, bool WITH_RESIDUAL = false>
 __global__ __launch_bounds__(128) void conv2d_int16_mma_kernel(
     int16_t* __restrict__ out, const int16_t* __restrict__ x,
     const int16_t* __restrict__ weight, const int16_t* __restrict__ bias,
-    int M, int N, int K, int H, int W)
+    int M, int N, int K, int H, int W, const int16_t* residual = nullptr)
 {
 #if __CUDA_ARCH__ >= 800
-    constexpr int BM = 64, BN = 32, BK = 32;
+    constexpr int BM = 64, BK = 32;
+    static_assert(BN == 16 || BN == 32 || BN == 64);
     __shared__ __align__(4) int16_t a_tile[BM][BK];
     // Padding reduces bank conflicts during the coalesced NCHW -> column-major store.
     __shared__ __align__(4) int16_t b_tile[BN][BK + 2];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const int group = lane / 4, quad = lane % 4;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
-    uint32_t ll[4][4] = {}, cross[4][4] = {}, hh[4][4] = {};
+    uint32_t ll[BN/8][4] = {}, cross[BN/8][4] = {}, hh[BN/8][4] = {};
     for (int k0 = 0; k0 < K; k0 += BK) {
         #pragma unroll
         for (int i = tid; i < BM * BK; i += 128) {
@@ -72,7 +73,7 @@ __global__ __launch_bounds__(128) void conv2d_int16_mma_kernel(
         for (int r = 0; r < 4; ++r)
             split_four_int16(&a_tile[warp*16+group+(r%2)*8][quad*4+(r/2)*16], al[r], ah[r]);
         #pragma unroll
-        for (int tile = 0; tile < 4; ++tile) {
+        for (int tile = 0; tile < BN/8; ++tile) {
             uint32_t bl[2], bh[2];
             #pragma unroll
             for (int r = 0; r < 2; ++r)
@@ -85,7 +86,7 @@ __global__ __launch_bounds__(128) void conv2d_int16_mma_kernel(
         __syncthreads();
     }
     #pragma unroll
-    for (int tile = 0; tile < 4; ++tile) {
+    for (int tile = 0; tile < BN/8; ++tile) {
         #pragma unroll
         for (int r = 0; r < 4; ++r) {
             const int m = m0 + warp*16 + group + (r/2)*8;
@@ -94,15 +95,19 @@ __global__ __launch_bounds__(128) void conv2d_int16_mma_kernel(
                 const uint32_t sum = ll[tile][r] + (cross[tile][r] << 8) + (hh[tile][r] << 16);
                 int32_t value = round_divide_int(static_cast<int32_t>(sum), WEIGHT_SCALE);
                 if constexpr (WITH_BIAS) value += static_cast<int32_t>(bias[m]);
-                out[(static_cast<int64_t>(blockIdx.z)*M+m)*N+n] = clip_to_int16(value);
+                const int64_t index = (static_cast<int64_t>(blockIdx.z)*M+m)*N+n;
+                // Preserve the convolution's saturation before adding the residual.
+                if constexpr (WITH_RESIDUAL)
+                    value = static_cast<int32_t>(clip_to_int16(value)) + residual[index];
+                out[index] = clip_to_int16(value);
             }
         }
     }
 #else
     // A build containing only pre-Ampere PTX can be JIT-loaded on a newer GPU.
     // Keep that configuration correct too: its PTX has no MMA instructions.
-    for (int i = threadIdx.x; i < 64*32; i += blockDim.x) {
-        const int m = blockIdx.y*64 + i/32, n = blockIdx.x*32 + i%32;
+    for (int i = threadIdx.x; i < 64*BN; i += blockDim.x) {
+        const int m = blockIdx.y*64 + i/BN, n = blockIdx.x*BN + i%BN;
         if (m >= M || n >= N) continue;
         uint32_t sum = 0;
         for (int k = 0; k < K; ++k) {
@@ -118,7 +123,10 @@ __global__ __launch_bounds__(128) void conv2d_int16_mma_kernel(
         }
         int32_t value = round_divide_int(static_cast<int32_t>(sum), WEIGHT_SCALE);
         if constexpr (WITH_BIAS) value += static_cast<int32_t>(bias[m]);
-        out[(static_cast<int64_t>(blockIdx.z)*M+m)*N+n] = clip_to_int16(value);
+        const int64_t index = (static_cast<int64_t>(blockIdx.z)*M+m)*N+n;
+        if constexpr (WITH_RESIDUAL)
+            value = static_cast<int32_t>(clip_to_int16(value)) + residual[index];
+        out[index] = clip_to_int16(value);
     }
 #endif
 }

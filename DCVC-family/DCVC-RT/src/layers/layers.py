@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from .cuda_inference import CUSTOMIZED_CUDA_INFERENCE
 from .int16_inference import add_tensors_int16, apply_module_int16, clip_to_int16, \
-    conv2d_bias_pixel_shuffle_2_module_int16, conv2d_module_int16, depthwise_wsilu_module_int16, \
+    conv2d_bias_pixel_shuffle_2_module_int16, conv2d_module_int16, conv2d_residual_module_int16, depthwise_wsilu_module_int16, \
     int16_inference_enabled, mul_feature_scale_int16, wsilu_chunk_add_int16, wsilu_int16
 if CUSTOMIZED_CUDA_INFERENCE:
     from .cuda_inference import DepthConvProxy, SubpelConv2xProxy
@@ -156,13 +156,11 @@ class DepthConvBlock(nn.Module):
         out = x
         out = conv2d_module_int16(out, self.dc[0])
         out = depthwise_wsilu_module_int16(out, self.dc[2])
-        out = conv2d_module_int16(out, self.dc[3])
-        out = add_tensors_int16(out, x)
+        out = conv2d_residual_module_int16(out, self.dc[3], x)
         identity = add_tensors_int16(out, x) if self.shortcut else out
         ffn = conv2d_module_int16(out, self.ffn[0])
         ffn = wsilu_chunk_add_int16(ffn)
-        out = conv2d_module_int16(ffn, self.ffn[2])
-        out = add_tensors_int16(out, identity)
+        out = conv2d_residual_module_int16(ffn, self.ffn[2], identity)
         if quant_step is not None:
             out = mul_feature_scale_int16(out, quant_step)
         if to_cat is not None:

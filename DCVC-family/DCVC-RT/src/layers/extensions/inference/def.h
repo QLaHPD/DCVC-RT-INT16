@@ -53,6 +53,8 @@ torch::Tensor conv2d_int16_cuda(const torch::Tensor& x, const torch::Tensor& wei
                                 const int stride_h, const int stride_w,
                                 const int pad_h, const int pad_w, const int groups);
 torch::Tensor add_bias_int16_cuda(const torch::Tensor& x, const torch::Tensor& bias);
+torch::Tensor conv2d_int16_residual_cuda(const torch::Tensor& x, const torch::Tensor& weight,
+    const torch::optional<torch::Tensor>& bias, const torch::Tensor& residual, const int tile_n);
 torch::Tensor add_tensors_int16_cuda(const torch::Tensor& x, const torch::Tensor& y);
 torch::Tensor mul_feature_scale_int16_cuda(const torch::Tensor& x, const torch::Tensor& scale);
 std::tuple<torch::Tensor, torch::Tensor> reciprocal_scale_int16_cuda(const torch::Tensor& q_dec,

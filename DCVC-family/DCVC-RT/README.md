@@ -54,6 +54,22 @@ The encoder supports per-channel queues, resumable progress logs, atomic output 
 
 The decoder accepts either a directory through `--input_folder` or one specific bitstream through `--input_file`; these options are mutually exclusive.
 
+INT16 depth blocks fuse dense 1x1 convolution and residual addition when the native
+extension supports it. Rebuild the extension after updating to enable this path;
+older extensions continue to use separate operations. Both paths preserve the
+convolution's clipping before the residual addition.
+
+Optional `DCVC_INT16_AUTOTUNE=1` measures 16-, 32-, and 64-column tiles for these
+fused convolutions on each CUDA device and input shape. Choices are cached for the
+current process. This adds timing and synchronization on first use of each shape;
+it does not change codec arithmetic or prepared models. The default uses 32
+columns without tuning. During CUDA Graph capture, an unseen shape uses the
+default instead of running timing operations. Set the variable alongside
+`DCVC_USE_INT16=1` when launching the encoder or decoder.
+
+See [residual fusion measurements](OPTIMIZATION_20260907.md) for validation,
+tile benchmarks, and CUDA Graph evaluation.
+
 ### Multi-GPU execution
 
 Encoding and decoding use file-level data parallelism. Each worker owns a complete model instance, selects one logical CUDA device before loading that model, and processes a whole video on that device. Videos never migrate between GPUs, and the codec arithmetic and bitstream syntax are unchanged.

@@ -17,6 +17,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("clamp_reciprocal_with_quant_cuda", &clamp_reciprocal_with_quant_cuda);
     m.def("add_and_multiply_cuda", &add_and_multiply_cuda);
     m.def("conv2d_int16_cuda", &conv2d_int16_cuda);
+    m.def("conv2d_int16_residual_cuda", &conv2d_int16_residual_cuda,
+          py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("residual"), py::arg("tile_n") = 32);
     m.def("round_and_to_int8_int16_cuda", &round_and_to_int8_int16_cuda);
     m.def("add_bias_int16_cuda", &add_bias_int16_cuda);
     m.def("add_tensors_int16_cuda", &add_tensors_int16_cuda);

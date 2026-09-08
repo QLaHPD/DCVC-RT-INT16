@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -1080,6 +1082,55 @@ torch::Tensor add_tensors_int16_cuda(const torch::Tensor& x, const torch::Tensor
     auto stream = c10::cuda::getCurrentCUDAStream();
     add_tensors_int16_kernel<<<ceil_div_int64(N, THREADS), THREADS, 0, stream>>>(
         out.data_ptr<int16_t>(), x_contiguous.data_ptr<int16_t>(), y_contiguous.data_ptr<int16_t>(), N);
+    return out;
+}
+
+torch::Tensor conv2d_int16_residual_cuda(const torch::Tensor& x, const torch::Tensor& weight,
+    const torch::optional<torch::Tensor>& bias, const torch::Tensor& residual, const int tile_n)
+{
+    check_cuda_int16(x, "x");
+    check_cuda_int16(weight, "weight");
+    check_cuda_int16(residual, "residual");
+    check_4d(x, "x");
+    check_4d(weight, "weight");
+    check_4d(residual, "residual");
+    TORCH_CHECK(weight.device() == x.device() && residual.device() == x.device(),
+                "all inputs must be on the same CUDA device");
+    TORCH_CHECK(weight.size(2) == 1 && weight.size(3) == 1 && weight.size(1) == x.size(1),
+                "expected a dense 1x1 convolution");
+    TORCH_CHECK(residual.size(0) == x.size(0) && residual.size(1) == weight.size(0) &&
+                residual.size(2) == x.size(2) && residual.size(3) == x.size(3),
+                "residual must match the convolution output shape");
+    TORCH_CHECK(tile_n == 16 || tile_n == 32 || tile_n == 64, "tile_n must be 16, 32 or 64");
+    if (bias.has_value()) {
+        check_cuda_int16(bias.value(), "bias");
+        TORCH_CHECK(bias.value().device() == x.device() && bias.value().dim() == 1 &&
+                    bias.value().size(0) == weight.size(0), "invalid convolution bias");
+    }
+    const c10::cuda::CUDAGuard guard(x.device());
+    if (!int16_mma_supported(x.get_device()))
+        return add_tensors_int16_cuda(conv2d_int16_cuda(x, weight, bias, 1, 1, 0, 0, 1), residual);
+    const auto xc = x.contiguous(), wc = weight.contiguous(), rc = residual.contiguous();
+    const auto bc = bias.has_value() ? bias.value().contiguous() : torch::Tensor();
+    const auto bp = bias.has_value() ? bc.data_ptr<int16_t>() : nullptr;
+    auto out = torch::empty_like(rc);
+    if (out.numel() == 0) return out;
+    const dim3 grid(ceil_div_int64(x.size(2)*x.size(3), tile_n),
+                    ceil_div_int64(weight.size(0), 64), x.size(0));
+    auto stream = c10::cuda::getCurrentCUDAStream();
+#define DCVC_RESIDUAL_MMA(BIAS, BN) \
+    conv2d_int16_mma_kernel<BIAS, false, BN, true><<<grid, 128, 0, stream>>>( \
+        out.data_ptr<int16_t>(), xc.data_ptr<int16_t>(), wc.data_ptr<int16_t>(), bp, \
+        weight.size(0), x.size(2)*x.size(3), x.size(1), x.size(2), x.size(3), rc.data_ptr<int16_t>())
+#define DCVC_RESIDUAL_TILE(BN) \
+    if (bias.has_value()) { DCVC_RESIDUAL_MMA(true, BN); } \
+    else { DCVC_RESIDUAL_MMA(false, BN); }
+    if (tile_n == 16) { DCVC_RESIDUAL_TILE(16); }
+    else if (tile_n == 64) { DCVC_RESIDUAL_TILE(64); }
+    else { DCVC_RESIDUAL_TILE(32); }
+#undef DCVC_RESIDUAL_TILE
+#undef DCVC_RESIDUAL_MMA
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 

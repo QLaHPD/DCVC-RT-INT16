@@ -20,6 +20,7 @@ try:
         required=("conv2d_int16_cuda",)
     )
     conv2d_int16_cuda = _INT16_EXT.conv2d_int16_cuda
+    conv2d_int16_residual_cuda = getattr(_INT16_EXT, "conv2d_int16_residual_cuda", None)
     add_bias_int16_cuda = getattr(_INT16_EXT, "add_bias_int16_cuda", None)
     add_tensors_int16_cuda = getattr(_INT16_EXT, "add_tensors_int16_cuda", None)
     mul_feature_scale_int16_cuda = getattr(_INT16_EXT, "mul_feature_scale_int16_cuda", None)
@@ -33,6 +34,7 @@ try:
     CUSTOMIZED_INT16_CUDA_INFERENCE = True
 except Exception:  # pylint: disable=W0718
     conv2d_int16_cuda = None
+    conv2d_int16_residual_cuda = None
     add_bias_int16_cuda = None
     add_tensors_int16_cuda = None
     mul_feature_scale_int16_cuda = None
@@ -47,6 +49,8 @@ except Exception:  # pylint: disable=W0718
 
 
 _BOOL_TRUE = {"1", "true", "yes", "on"}
+_AUTOTUNE_RESIDUAL = os.getenv("DCVC_INT16_AUTOTUNE", "0").strip().lower() in _BOOL_TRUE
+_RESIDUAL_TILES = {}
 _WSILU_LUTS = {}
 _PRIOR_LUTS = {}
 _SCALE_INDEX_LUTS = {}
@@ -310,6 +314,44 @@ def conv2d_module_int16(x, conv):
     pad_h, pad_w = conv.padding
     return conv2d_int16_cuda(x.contiguous(), weight, bias,
                              stride_h, stride_w, pad_h, pad_w, conv.groups)
+
+
+def conv2d_residual_module_int16(x, conv, residual):
+    if conv2d_int16_residual_cuda is not None and conv.kernel_size == (1, 1) and \
+            conv.stride == (1, 1) and conv.padding == (0, 0) and conv.groups == 1:
+        weight, bias = get_quantized_conv_params(conv, x.device)
+        tile = _residual_tile(x, weight, bias, residual) if _AUTOTUNE_RESIDUAL else 32
+        return conv2d_int16_residual_cuda(x, weight, bias, residual, tile)
+    return add_tensors_int16(conv2d_module_int16(x, conv), residual)
+
+
+def _residual_tile(x, weight, bias, residual):
+    # Timing choices affect scheduling only. Every tile executes the same exact
+    # integer arithmetic, including convolution saturation before residual add.
+    key = (x.device, tuple(x.shape), tuple(weight.shape), bias is not None)
+    if key in _RESIDUAL_TILES:
+        return _RESIDUAL_TILES[key]
+    with torch.cuda.device(x.device):
+        if torch.cuda.is_current_stream_capturing():
+            return 32
+        timings = {}
+        for tile in (16, 32, 64):
+            for _ in range(3):
+                conv2d_int16_residual_cuda(x, weight, bias, residual, tile)
+            samples = []
+            for _ in range(3):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(5):
+                    conv2d_int16_residual_cuda(x, weight, bias, residual, tile)
+                end.record()
+                end.synchronize()
+                samples.append(start.elapsed_time(end))
+            timings[tile] = sorted(samples)[1]
+        selected = min(timings, key=timings.get)
+    _RESIDUAL_TILES[key] = selected
+    return selected
 
 
 def conv2d_bias_quant_module_int16(x, conv, quant_step):
