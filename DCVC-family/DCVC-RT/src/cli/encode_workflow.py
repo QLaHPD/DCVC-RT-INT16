@@ -1184,7 +1184,7 @@ def _run_shared_encode(args, device_plan, out_root: Path,
     )
 
     ctx = get_context("spawn")
-    task_q = ctx.Queue()
+    task_queues = [ctx.Queue() for _ in range(worker_count)]
     progress_q = ctx.Queue()
     stop_event = ctx.Event()
     workers = []
@@ -1192,7 +1192,7 @@ def _run_shared_encode(args, device_plan, out_root: Path,
         proc = ctx.Process(
             target=worker_entry,
             args=(
-                wid, task_q, progress_q, stop_event, str(out_root), args.model_path_i,
+                wid, task_queues[wid], progress_q, stop_event, str(out_root), args.model_path_i,
                 args.model_path_p, enc_cfg_dict, args.audio, opus_params,
                 device_plan.using_cuda, cuda_plan[wid] if wid < len(cuda_plan) else None,
                 args.disk_finalize, True,
@@ -1277,7 +1277,7 @@ def _run_shared_encode(args, device_plan, out_root: Path,
                     "status": "shared-claimed",
                     "shared_owner": pool.instance_id,
                 })
-                task_q.put(refreshed)
+                task_queues[wid].put(refreshed)
                 dispatched = True
                 break
             if not dispatched and wid in idle:
@@ -1344,9 +1344,16 @@ def _run_shared_encode(args, device_plan, out_root: Path,
                     active.pop(wid, None)
                     if key is None or lease is None:
                         continue
+                    reported_key = (str(msg.get("channel_id", "")), str(msg.get("vid", "")))
                     success = typ == "worker_done"
                     error = str(msg.get("error", ""))
                     lost_claim = False
+                    if reported_key != key:
+                        success = False
+                        error = (
+                            f"worker {wid} reported {reported_key[0]}/{reported_key[1]} while assigned "
+                            f"{key[0]}/{key[1]}"
+                        )
                     if success:
                         try:
                             _publish_shared_result(
@@ -1407,8 +1414,8 @@ def _run_shared_encode(args, device_plan, out_root: Path,
             if idle and now - last_dispatch >= 1.0:
                 dispatch_available()
 
-        for _ in workers:
-            task_q.put(None)
+        for task_queue in task_queues:
+            task_queue.put(None)
         for proc in workers:
             proc.join(timeout=10.0)
         if any(proc.is_alive() for proc in workers):
@@ -1423,7 +1430,8 @@ def _run_shared_encode(args, device_plan, out_root: Path,
         for lease in leases.values():
             lease.release()
         progress.close()
-        _close_queue(task_q)
+        for task_queue in task_queues:
+            _close_queue(task_queue)
         _close_queue(progress_q)
         kill_all_children()
         cleanup_registered_ram_tmp()

@@ -81,7 +81,7 @@ class FakeEncoder:
 
 
 class SharedSchedulerTests(unittest.TestCase):
-    def test_two_instances_encode_each_video_once(self):
+    def test_two_multiworker_instances_encode_each_video_once(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             input_channel = root / "input" / "CHANNEL"
@@ -144,8 +144,8 @@ class SharedSchedulerTests(unittest.TestCase):
                 )
 
             device_plan = SimpleNamespace(
-                worker_count=1,
-                cuda_indices=(None,),
+                worker_count=3,
+                cuda_indices=(None, None, None),
                 using_cuda=False,
             )
             enc_cfg = {
