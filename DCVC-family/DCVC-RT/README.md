@@ -58,6 +58,8 @@ cleanup  Revalidate a completed channel and remove exact inventoried sources
 
 The encoder supports per-channel queues, resumable progress logs, atomic output commits, concurrent audio encoding, and a terminal dashboard with worker, channel, approval, and event views. Its overall ETA uses the average wall time of successfully completed videos divided across the active worker count; it appears after the first video finishes and intentionally remains a simple estimate.
 
+Local folder encoding can also be shared across machines with `--shared-work`. Peers using the same shared output directory atomically claim different videos, publish only while they still own a renewable lease, expose owner/frame/FPS status to one another, and reject incompatible model or encode settings. Shared mode retains originals; run one normal encode/cleanup pass after every peer exits. See [cooperative multi-machine encoding](docs/SHARED_WORK.md).
+
 The decoder accepts either a directory through `--input_folder` or one specific bitstream through `--input_file`; these options are mutually exclusive.
 
 INT16 depth blocks fuse dense 1x1 convolution and residual addition when the native

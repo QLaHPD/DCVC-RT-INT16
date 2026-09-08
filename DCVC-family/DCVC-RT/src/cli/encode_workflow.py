@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -30,8 +31,10 @@ from src.cli.progress import (
     RollingFrameRate,
     append_progress_log,
     build_encode_output_index,
+    encoded_base_from_bin_name,
     ensure_dir,
 )
+from src.cli.shared_work import SharedWorkError, SharedWorkPool, file_sha256
 from src.layers.cuda_inference import replicate_pad
 from src.models.image_model import DMCI
 from src.models.video_model import DMC
@@ -71,6 +74,7 @@ class EncodeTask:
     video_path: str
     need_video: bool
     need_audio: bool
+    publish_token: Optional[str] = None
 
 
 @dataclass
@@ -182,6 +186,13 @@ def write_bytes_final(dst: Path, data: bytes, mode: str):
     except BaseException:
         safe_unlink(tmp)
         raise
+
+
+def shared_stage_path(channel_out: Path, video_id: str, token: str, suffix: str) -> Path:
+    digest = hashlib.sha256(video_id.encode("utf-8")).hexdigest()
+    stage_dir = channel_out / ".dcvc-stage"
+    ensure_dir(stage_dir)
+    return stage_dir / f"{digest}.{token}{suffix}"
 
 
 def run_command(cmd: List[str]) -> Tuple[int, str, str]:
@@ -548,10 +559,16 @@ class NeuralEncoder:
 
 
 def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, encoder: NeuralEncoder,
-                     enc_cfg: EncoderCfg, audio_enable: bool, opus_params: Dict, finalize_mode: str) -> Tuple[bool, Optional[float]]:
+                     enc_cfg: EncoderCfg, audio_enable: bool, opus_params: Dict, finalize_mode: str,
+                     defer_publish: bool = False) -> Tuple[bool, Optional[float]]:
     video_path = Path(task.video_path)
     base = build_local_basename(video_path)
     ensure_dir(channel_out)
+    if defer_publish and not task.publish_token:
+        raise ValueError("shared-work task is missing its publish token")
+    staged_paths: List[Path] = []
+    publish_records: List[Dict[str, str]] = []
+    handed_to_parent = False
 
     def emit(event_type: str, **fields):
         progress_q.put({
@@ -574,6 +591,13 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
     audio_thread = None
     audio_result = {"ok": False, "error": None}
     opus_path = channel_out / f"{base}.opus"
+    opus_work_path = (
+        shared_stage_path(channel_out, base, task.publish_token, ".opus")
+        if defer_publish and task.need_audio else opus_path
+    )
+    if opus_work_path != opus_path:
+        staged_paths.append(opus_work_path)
+        publish_records.append({"temporary": str(opus_work_path), "final": str(opus_path)})
     if task.need_audio and audio_enable:
         tmp_dir = Path(os.environ.get("ENC_RAM_TMP_DIR", best_ram_dir()))
         tmp_opus = tmp_dir / f".tmp_{base}_{os.getpid()}.opus"
@@ -615,10 +639,11 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
                 safe_unlink(tmp_opus)
                 raise EncodeInterrupted("encode interrupted")
             if audio_result["ok"]:
-                atomic_copy_across_fs(tmp_opus, opus_path)
+                atomic_copy_across_fs(tmp_opus, opus_work_path)
                 safe_unlink(tmp_opus)
                 emit("worker_audio", status="done")
-                emit("worker_done", frames=0, elapsed=0.0)
+                emit("worker_done", frames=0, elapsed=0.0, publish=publish_records)
+                handed_to_parent = defer_publish
                 return True, 0.0
             safe_unlink(tmp_opus)
             emit("worker_fail", stage="audio", error=audio_result["error"] or "audio encode failed")
@@ -643,7 +668,14 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
         )
         resolution_text = f"{src_w}, {src_h} -> {new_w}, {new_h}"
 
-        bin_path = channel_out / f"{base}_{new_w}x{new_h}_qI{enc_cfg.qp_i}_qP{enc_cfg.qp_p}.bin"
+        final_bin_path = channel_out / f"{base}_{new_w}x{new_h}_qI{enc_cfg.qp_i}_qP{enc_cfg.qp_p}.bin"
+        bin_path = (
+            shared_stage_path(channel_out, base, task.publish_token, ".bin")
+            if defer_publish else final_bin_path
+        )
+        if bin_path != final_bin_path:
+            staged_paths.append(bin_path)
+            publish_records.insert(0, {"temporary": str(bin_path), "final": str(final_bin_path)})
         append_progress_log(channel_out, {
             "video_id": base,
             "status": "video-encoding",
@@ -693,7 +725,11 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
                         ff_proc.stdout.close()
                     ff_proc = None
 
-        append_progress_log(channel_out, {"video_id": base, "status": "video-done", "out_bin": str(bin_path)})
+        if not defer_publish:
+            append_progress_log(
+                channel_out,
+                {"video_id": base, "status": "video-done", "out_bin": str(final_bin_path)},
+            )
 
         if audio_thread:
             audio_thread.join()
@@ -701,7 +737,7 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
                 safe_unlink(tmp_opus)
                 raise EncodeInterrupted("encode interrupted")
             if audio_result["ok"]:
-                atomic_copy_across_fs(tmp_opus, opus_path)
+                atomic_copy_across_fs(tmp_opus, opus_work_path)
                 emit("worker_audio", status="done")
             else:
                 safe_unlink(tmp_opus)
@@ -709,7 +745,8 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
                 return False, None
 
         dur = time.time() - t0
-        emit("worker_done", frames=None, elapsed=dur)
+        emit("worker_done", frames=None, elapsed=dur, publish=publish_records)
+        handed_to_parent = defer_publish
         return True, dur
     except Exception as exc:
         append_progress_log(channel_out, {
@@ -729,6 +766,9 @@ def process_one_file(task: EncodeTask, progress_q, wid: int, channel_out: Path, 
                 pass
         if task.need_audio and audio_enable:
             safe_unlink(tmp_opus)
+        if defer_publish and not handed_to_parent:
+            for path in staged_paths:
+                safe_unlink(path)
 
 
 def _worker_sig_handler(sig, frame):
@@ -743,7 +783,7 @@ def _worker_sig_handler(sig, frame):
 
 def worker_entry(wid: int, task_q, progress_q, stop_event, output_root: str, model_i: str, model_p: str,
                  enc_cfg_dict: Dict, audio_mode: str, opus_params: Dict, use_cuda: bool,
-                 cuda_device_index: Optional[int], finalize_mode: str):
+                 cuda_device_index: Optional[int], finalize_mode: str, shared_publish: bool = False):
     global STOP_FLAG
     STOP_FLAG = False
     signal.signal(signal.SIGTERM, _worker_sig_handler)
@@ -765,6 +805,7 @@ def worker_entry(wid: int, task_q, progress_q, stop_event, output_root: str, mod
         "pid": os.getpid(),
         "device": str(device),
     })
+    progress_q.put({"type": "worker_ready", "wid": wid})
 
     while not stop_event.is_set():
         try:
@@ -785,7 +826,9 @@ def worker_entry(wid: int, task_q, progress_q, stop_event, output_root: str, mod
             audio_enable=(audio_mode == "opus"),
             opus_params=opus_params,
             finalize_mode=finalize_mode,
+            defer_publish=shared_publish,
         )
+        progress_q.put({"type": "worker_ready", "wid": wid})
 
     kill_all_children()
     cleanup_registered_ram_tmp()
@@ -878,6 +921,27 @@ def configure_parser(parser: argparse.ArgumentParser):
         help="Terminal interface. Auto uses the switchable TUI on a real terminal and plain output otherwise.",
     )
 
+    shared_group = parser.add_argument_group("Cooperative Multi-machine Work")
+    shared_group.add_argument(
+        "--shared-work",
+        action="store_true",
+        help=(
+            "Coordinate this encode queue through the shared output directory. Healthy peers "
+            "claim different videos, publish atomically, and wait for the whole shared queue."
+        ),
+    )
+    shared_group.add_argument(
+        "--shared-lease-seconds",
+        type=float,
+        default=900.0,
+        help="Recover a shared claim after this many seconds without a heartbeat (minimum 30).",
+    )
+    shared_group.add_argument(
+        "--shared-instance",
+        default=None,
+        help="Optional human-readable machine name recorded in shared claim status.",
+    )
+
 
 def _format_worker_text(state: Dict) -> str:
     vid = state.get("vid", "-")
@@ -918,6 +982,427 @@ def _terminate_workers(workers, grace_seconds: float = 3.0):
         if proc.is_alive():
             proc.kill()
             proc.join(timeout=1.0)
+
+
+def _shared_pipeline_config(args, enc_cfg_dict: Dict, opus_params: Dict,
+                            using_cuda: bool) -> Dict:
+    int16_enabled = os.environ.get("DCVC_USE_INT16", "").lower() in {"1", "true", "yes", "on"}
+    return {
+        "implementation": "dcvc-int16-managed-shared-v1",
+        "model_i_sha256": file_sha256(args.model_path_i),
+        "model_p_sha256": file_sha256(args.model_path_p),
+        "execution": (
+            "cuda-int16" if using_cuda and int16_enabled
+            else "cuda-float" if using_cuda
+            else "cpu-float"
+        ),
+        "encoder": {
+            key: enc_cfg_dict[key]
+            for key in (
+                "qp_i", "qp_p", "force_intra_period", "reset_interval", "resolution",
+                "pad_multiple", "ff_color_matrix", "fps", "force_zero_thres",
+            )
+        },
+        "audio": args.audio,
+        "opus": dict(opus_params) if args.audio == "opus" else None,
+    }
+
+
+def _shared_artifact_names(channel_out: Path, video_id: str, audio_enabled: bool) -> List[str]:
+    names = []
+    try:
+        with os.scandir(channel_out) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                if encoded_base_from_bin_name(entry.name) == video_id:
+                    names.append(entry.name)
+    except FileNotFoundError:
+        pass
+    if audio_enabled:
+        opus_name = f"{video_id}.opus"
+        opus_path = channel_out / opus_name
+        if opus_path.is_file() and opus_path.stat().st_size > 0:
+            names.append(opus_name)
+    return sorted(set(names))
+
+
+def _refresh_shared_task(task: EncodeTask, channel_out: Path, audio_enabled: bool,
+                         trust_atomic_video: bool = False) -> Tuple[Optional[EncodeTask], List[str]]:
+    index = build_encode_output_index(channel_out)
+    base = build_local_basename(Path(task.video_path))
+    video_exists = base in index.video_bases
+    video_done = video_exists and (
+        trust_atomic_video or index.log_state.get(base, {}).get("video_status") == "done"
+    )
+    audio_done = (not audio_enabled) or base in index.audio_bases
+    artifacts = _shared_artifact_names(channel_out, base, audio_enabled)
+    if video_done and audio_done:
+        return None, artifacts
+    return EncodeTask(
+        channel_id=task.channel_id,
+        video_path=task.video_path,
+        need_video=not video_done,
+        need_audio=audio_enabled and not audio_done,
+        publish_token=task.publish_token,
+    ), artifacts
+
+
+def _publish_shared_result(channel_out: Path, video_id: str, publish_records: List[Dict],
+                           lease, audio_enabled: bool) -> List[str]:
+    stage_dir = (channel_out / ".dcvc-stage").resolve()
+    moved_finals: List[Path] = []
+    temporary_paths: List[Path] = []
+    try:
+        for record in publish_records:
+            temporary = Path(record["temporary"])
+            final = Path(record["final"])
+            temporary_paths.append(temporary)
+            if temporary.parent.resolve() != stage_dir:
+                raise SharedWorkError(f"shared temporary output escaped its stage directory: {temporary}")
+            if final.parent.resolve() != channel_out.resolve():
+                raise SharedWorkError(f"shared final output escaped its channel directory: {final}")
+            if lease.token not in temporary.name:
+                raise SharedWorkError(f"shared temporary output has the wrong owner token: {temporary}")
+            if final.exists():
+                raise SharedWorkError(f"refusing to overwrite an existing shared output: {final}")
+            if not temporary.is_file() or temporary.stat().st_size <= 0:
+                raise SharedWorkError(f"shared worker did not produce a valid staged output: {temporary}")
+            lease.assert_owned()
+            os.replace(temporary, final)
+            moved_finals.append(final)
+
+        bin_outputs = [path for path in moved_finals if path.suffix == ".bin"]
+        if bin_outputs:
+            append_progress_log(channel_out, {
+                "video_id": video_id,
+                "status": "video-done",
+                "out_bin": str(bin_outputs[0]),
+                "shared_owner": lease.pool.instance_id,
+            })
+        artifacts = _shared_artifact_names(channel_out, video_id, audio_enabled)
+        if not any(name.endswith(".bin") for name in artifacts):
+            raise SharedWorkError(f"shared job {video_id!r} has no final bitstream")
+        if audio_enabled and f"{video_id}.opus" not in artifacts:
+            raise SharedWorkError(f"shared job {video_id!r} has no final Opus artifact")
+        lease.mark_done(artifacts)
+        append_progress_log(channel_out, {
+            "video_id": video_id,
+            "status": "shared-done",
+            "shared_owner": lease.pool.instance_id,
+            "artifacts": artifacts,
+        })
+        return artifacts
+    finally:
+        for temporary in temporary_paths:
+            safe_unlink(temporary)
+
+
+def _run_shared_encode(args, device_plan, out_root: Path,
+                       discoveries: List[ChannelEncodeDiscovery], all_tasks: List[EncodeTask],
+                       total_found: int, already_done: int, enc_cfg_dict: Dict,
+                       opus_params: Dict) -> int:
+    if args.auto_delete or args.cleanup_dry_run:
+        print("Error: shared work retains originals; run cleanup once after every shared encoder exits.")
+        return 2
+    try:
+        pool = SharedWorkPool(args.shared_lease_seconds, args.shared_instance)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 2
+
+    task_by_key: Dict[Tuple[str, str], EncodeTask] = {}
+    for task in all_tasks:
+        base = build_local_basename(Path(task.video_path))
+        key = (task.channel_id, base)
+        if key in task_by_key:
+            print(f"Error: duplicate video basename in shared channel {task.channel_id}: {base}")
+            return 2
+        task_by_key[key] = task
+
+    print("Shared work: hashing model checkpoints and checking pipeline compatibility...")
+    try:
+        pipeline_config = _shared_pipeline_config(
+            args, enc_cfg_dict, opus_params, device_plan.using_cuda
+        )
+        for discovery in discoveries:
+            if discovery.total_found:
+                pool.ensure_pipeline(out_root / discovery.channel_id, pipeline_config)
+    except (OSError, SharedWorkError) as exc:
+        print(f"Error: {exc}")
+        return 2
+
+    if not all_tasks:
+        print("All videos were already encoded. Shared work did not modify lifecycle or originals.")
+        return 0
+
+    worker_count = min(device_plan.worker_count, len(all_tasks))
+    cuda_plan = device_plan.cuda_indices[:worker_count]
+    if device_plan.using_cuda:
+        description = ", ".join(
+            f"worker {wid}->cuda:{cuda_plan[wid]}" for wid in range(worker_count)
+        )
+    else:
+        noun = "worker" if worker_count == 1 else "workers"
+        description = f"{worker_count} CPU {noun}"
+    print(f"Worker plan: {description}")
+    print(
+        f"Shared instance: {pool.instance_id}; lease={args.shared_lease_seconds:g}s. "
+        "Waiting until peers complete the same queue."
+    )
+
+    ctx = get_context("spawn")
+    task_q = ctx.Queue()
+    progress_q = ctx.Queue()
+    stop_event = ctx.Event()
+    workers = []
+    for wid in range(worker_count):
+        proc = ctx.Process(
+            target=worker_entry,
+            args=(
+                wid, task_q, progress_q, stop_event, str(out_root), args.model_path_i,
+                args.model_path_p, enc_cfg_dict, args.audio, opus_params,
+                device_plan.using_cuda, cuda_plan[wid] if wid < len(cuda_plan) else None,
+                args.disk_finalize, True,
+            ),
+            daemon=True,
+        )
+        proc.start()
+        workers.append(proc)
+
+    progress = EncodeDashboard(total_found, worker_count, out_root, mode=args.ui)
+    progress.set_done(already_done)
+    task_order = list(task_by_key)
+    terminal = set()
+    assigned: Dict[int, Tuple[str, str]] = {}
+    leases = {}
+    idle = set()
+    active: Dict[int, Dict] = {}
+    external_seen: Dict[Tuple[str, str], str] = {}
+    last_heartbeat = 0.0
+    last_dispatch = 0.0
+    had_failure = False
+    interrupted = False
+
+    def finish_key(key: Tuple[str, str], elapsed: Optional[float] = None):
+        if key in terminal:
+            return
+        terminal.add(key)
+        progress.increment_done(elapsed_seconds=elapsed)
+
+    def dispatch_available():
+        nonlocal last_dispatch
+        last_dispatch = time.monotonic()
+        assigned_keys = set(assigned.values())
+        for wid in sorted(tuple(idle)):
+            dispatched = False
+            external_count = 0
+            external_sample = None
+            for key in task_order:
+                if key in terminal or key in assigned_keys:
+                    continue
+                task = task_by_key[key]
+                channel_out = out_root / task.channel_id
+                if pool.completed_artifacts(channel_out, key[1]) is not None:
+                    finish_key(key)
+                    continue
+                lease, owner = pool.try_acquire(channel_out, key[1])
+                if lease is None:
+                    external_count += 1
+                    if owner is not None:
+                        external_sample = owner
+                    if owner is not None and external_seen.get(key) != owner.owner:
+                        external_seen[key] = owner.owner
+                        progress.write(f"{key[0]}/{key[1]}: claimed by {owner.owner_text}")
+                    continue
+
+                refreshed, artifacts = _refresh_shared_task(
+                    task, channel_out, args.audio == "opus", trust_atomic_video=True
+                )
+                if refreshed is None:
+                    if artifacts:
+                        recovered_bins = [name for name in artifacts if name.endswith(".bin")]
+                        if recovered_bins:
+                            append_progress_log(channel_out, {
+                                "video_id": key[1],
+                                "status": "video-done",
+                                "out_bin": str(channel_out / recovered_bins[0]),
+                                "shared_owner": pool.instance_id,
+                                "recovered": True,
+                            })
+                        lease.mark_done(artifacts)
+                    lease.release()
+                    finish_key(key)
+                    continue
+                refreshed.publish_token = lease.token
+                leases[wid] = lease
+                assigned[wid] = key
+                assigned_keys.add(key)
+                idle.discard(wid)
+                external_seen.pop(key, None)
+                append_progress_log(channel_out, {
+                    "video_id": key[1],
+                    "status": "shared-claimed",
+                    "shared_owner": pool.instance_id,
+                })
+                task_q.put(refreshed)
+                dispatched = True
+                break
+            if not dispatched and wid in idle:
+                remaining = len(task_order) - len(terminal) - len(assigned_keys)
+                if remaining:
+                    detail = f"{external_count} claimed"
+                    if external_sample is not None:
+                        frames = external_sample.progress.get("frames", 0)
+                        fps = external_sample.progress.get("fps", 0.0)
+                        detail = f"{external_sample.owner_text}: {frames}f {fps:.1f}fps"
+                    progress.set_worker_text(
+                        wid,
+                        f"[{wid}] waiting for {remaining} shared job(s) ({detail})",
+                    )
+
+    try:
+        while len(terminal) < len(task_order) or assigned:
+            try:
+                msg = progress_q.get(timeout=0.2)
+            except queue.Empty:
+                msg = None
+
+            if msg:
+                typ = msg.get("type")
+                wid = int(msg.get("wid", 0))
+                if typ == "worker_hello":
+                    progress.set_worker_text(
+                        wid, f"{msg.get('device', 'unknown')} ready (pid {msg.get('pid', '?')})"
+                    )
+                elif typ == "worker_ready":
+                    if wid not in assigned:
+                        idle.add(wid)
+                        progress.clear_worker(wid)
+                elif typ == "worker_task_start":
+                    key = assigned.get(wid)
+                    if key:
+                        active[wid] = {
+                            "vid": key[1],
+                            "device": (
+                                f"cuda:{cuda_plan[wid]}"
+                                if wid < len(cuda_plan) and cuda_plan[wid] is not None else "cpu"
+                            ),
+                            "frames": 0, "fps": 0.0, "audio": "starting",
+                        }
+                        progress.set_worker_text(wid, _format_worker_text(active[wid]))
+                elif typ == "worker_start":
+                    state = active.setdefault(wid, {"vid": msg.get("vid", "-")})
+                    state.update({
+                        "frames": 0, "fps": 0.0, "audio": msg.get("audio", "off"),
+                        "resolution": msg.get("resolution", ""),
+                    })
+                    progress.set_worker_text(wid, _format_worker_text(state))
+                elif typ == "worker_prog":
+                    state = active.setdefault(wid, {"vid": msg.get("vid", "-"), "audio": "off"})
+                    state.update({"frames": msg.get("frames", 0), "fps": msg.get("fps", 0.0)})
+                    progress.set_worker_text(wid, _format_worker_text(state))
+                elif typ == "worker_audio":
+                    state = active.setdefault(wid, {"vid": msg.get("vid", "-"), "frames": 0, "fps": 0.0})
+                    state["audio"] = msg.get("status", "off")
+                    progress.set_worker_text(wid, _format_worker_text(state))
+                elif typ in {"worker_done", "worker_fail"}:
+                    key = assigned.pop(wid, None)
+                    lease = leases.pop(wid, None)
+                    active.pop(wid, None)
+                    if key is None or lease is None:
+                        continue
+                    success = typ == "worker_done"
+                    error = str(msg.get("error", ""))
+                    lost_claim = False
+                    if success:
+                        try:
+                            _publish_shared_result(
+                                out_root / key[0], key[1], msg.get("publish") or [], lease,
+                                args.audio == "opus",
+                            )
+                        except Exception as exc:
+                            success = False
+                            error = str(exc)
+                            lost_claim = not lease._owns_path()
+                    lease.release()
+                    if success:
+                        finish_key(key, msg.get("elapsed"))
+                    elif lost_claim:
+                        progress.write(
+                            f"{key[0]}/{key[1]}: lease moved to another instance; waiting for its result"
+                        )
+                    else:
+                        had_failure = True
+                        finish_key(key)
+                        progress.write(f"{key[0]}/{key[1]}: failed: {error}")
+                    progress.clear_worker(wid)
+
+            now = time.monotonic()
+            heartbeat_interval = min(10.0, max(2.0, args.shared_lease_seconds / 3.0))
+            if now - last_heartbeat >= heartbeat_interval:
+                last_heartbeat = now
+                for wid, lease in list(leases.items()):
+                    state = active.get(wid, {})
+                    try:
+                        lease.heartbeat({
+                            "status": "encoding",
+                            "frames": state.get("frames", 0),
+                            "fps": state.get("fps", 0.0),
+                            "resolution": state.get("resolution", ""),
+                        })
+                    except SharedWorkError as exc:
+                        progress.write(str(exc))
+
+            for wid, proc in enumerate(workers):
+                if proc.is_alive() or wid not in assigned:
+                    continue
+                key = assigned.pop(wid)
+                lease = leases.pop(wid)
+                lease.release()
+                active.pop(wid, None)
+                had_failure = True
+                finish_key(key)
+                progress.write(f"{key[0]}/{key[1]}: worker exited before completion")
+
+            if not any(proc.is_alive() for proc in workers) and len(terminal) < len(task_order):
+                had_failure = True
+                for key in task_order:
+                    if key not in terminal:
+                        finish_key(key)
+                progress.write("All local workers exited before the shared queue completed.")
+
+            if idle and now - last_dispatch >= 1.0:
+                dispatch_available()
+
+        for _ in workers:
+            task_q.put(None)
+        for proc in workers:
+            proc.join(timeout=10.0)
+        if any(proc.is_alive() for proc in workers):
+            _terminate_workers(workers)
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_event.set()
+        progress.write("Interrupted. Stopping workers and releasing this instance's claims...")
+        _terminate_workers(workers)
+    finally:
+        stop_event.set()
+        for lease in leases.values():
+            lease.release()
+        progress.close()
+        _close_queue(task_q)
+        _close_queue(progress_q)
+        kill_all_children()
+        cleanup_registered_ram_tmp()
+
+    if interrupted:
+        return 130
+    if had_failure:
+        print("Shared run ended with failures. Originals were retained; rerun shared work to retry them.")
+        return 1
+    print("Shared queue complete. Originals were retained; run one normal encode/cleanup pass afterward if desired.")
+    return 0
 
 
 def run(args) -> int:
@@ -1019,6 +1504,19 @@ def run(args) -> int:
         "opus": dict(opus_params),
         "extensions": sorted(extensions),
     }
+    if args.shared_work:
+        return _run_shared_encode(
+            args=args,
+            device_plan=device_plan,
+            out_root=out_root,
+            discoveries=discoveries,
+            all_tasks=all_tasks,
+            total_found=total_found,
+            already_done=already_done,
+            enc_cfg_dict=enc_cfg_dict,
+            opus_params=opus_params,
+        )
+
     runtime_channels: List[ChannelRuntimeState] = []
     for discovery in discoveries:
         if discovery.total_found <= 0:

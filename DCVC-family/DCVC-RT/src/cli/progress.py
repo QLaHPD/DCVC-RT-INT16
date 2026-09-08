@@ -42,8 +42,14 @@ def append_progress_log(out_dir: Path, record: Dict, filename: str = ".progress.
     ensure_dir(out_dir)
     rec = dict(record)
     rec.setdefault("at", now_iso())
-    with progress_log_path(out_dir, filename).open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    data = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(progress_log_path(out_dir, filename), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        offset = 0
+        while offset < len(data):
+            offset += os.write(fd, data[offset:])
+    finally:
+        os.close(fd)
 
 
 def parse_encode_resume_state(log_file: Path) -> Dict[str, Dict[str, str]]:
