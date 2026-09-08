@@ -333,6 +333,29 @@ def iter_input_files(channel_dir: Path, recursive: bool, extensions: set[str]) -
     return files
 
 
+def select_unique_input_bases(files: List[Path]) -> Tuple[List[Path], List[Tuple[Path, Path]]]:
+    """Select one source for output names that intentionally omit the container suffix."""
+    extension_rank = {".mkv": 0, ".mp4": 1, ".webm": 2, ".mov": 3, ".avi": 4}
+    ordered = sorted(
+        files,
+        key=lambda path: (
+            build_local_basename(path),
+            extension_rank.get(path.suffix.lower(), len(extension_rank)),
+            str(path),
+        ),
+    )
+    selected: Dict[str, Path] = {}
+    duplicates: List[Tuple[Path, Path]] = []
+    for path in ordered:
+        base = build_local_basename(path)
+        chosen = selected.get(base)
+        if chosen is None:
+            selected[base] = path
+        else:
+            duplicates.append((chosen, path))
+    return sorted(selected.values(), key=lambda path: str(path)), duplicates
+
+
 def discover_channel_tasks(channel_id: str, in_root: Path, out_root: Path, recursive: bool,
                            extensions: set[str], audio_enabled: bool) -> ChannelEncodeDiscovery:
     channel_dir = in_root / channel_id
@@ -346,7 +369,9 @@ def discover_channel_tasks(channel_id: str, in_root: Path, out_root: Path, recur
             warning=f"Warning: channel folder not found: {channel_id}",
         )
 
-    files = iter_input_files(channel_dir, recursive, extensions)
+    files, duplicate_sources = select_unique_input_bases(
+        iter_input_files(channel_dir, recursive, extensions)
+    )
     channel_out = out_root / channel_id
     ensure_dir(channel_out)
     output_index = build_encode_output_index(channel_out)
@@ -374,6 +399,13 @@ def discover_channel_tasks(channel_id: str, in_root: Path, out_root: Path, recur
         source_paths=[str(path) for path in files],
         total_found=len(files),
         already_done=already_done,
+        warning=(
+            f"Warning: {channel_id}: selected {duplicate_sources[0][0].name} and retained "
+            f"duplicate source {duplicate_sources[0][1].name}"
+            + (f" ({len(duplicate_sources)} duplicate basenames total)"
+               if len(duplicate_sources) > 1 else "")
+            if duplicate_sources else None
+        ),
     )
 
 

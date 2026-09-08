@@ -10,6 +10,7 @@ from pathlib import Path
 from src.cli.channel_lifecycle import validate_channel, write_channel_inventory
 from src.cli.encode_workflow import (
     build_ffmpeg_chain_local,
+    discover_channel_tasks,
     EncoderCfg,
     EncodeTask,
     append_progress_log,
@@ -63,6 +64,31 @@ class FakeNeuralEncoder:
 
 
 class EncodeLifecycleMessageTests(unittest.TestCase):
+    def test_duplicate_container_variants_select_one_source_without_hiding_unique_webm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            channel = root / "input" / "CHANNEL"
+            channel.mkdir(parents=True)
+            (channel / "duplicate.mkv").write_bytes(b"mkv")
+            (channel / "duplicate.webm").write_bytes(b"webm")
+            (channel / "unique.webm").write_bytes(b"unique")
+
+            discovery = discover_channel_tasks(
+                "CHANNEL",
+                root / "input",
+                root / "output",
+                recursive=False,
+                extensions={".mkv", ".webm"},
+                audio_enabled=False,
+            )
+
+            self.assertEqual(discovery.total_found, 2)
+            self.assertEqual(
+                [Path(task.video_path).name for task in discovery.pending_tasks],
+                ["duplicate.mkv", "unique.webm"],
+            )
+            self.assertIn("retained duplicate source duplicate.webm", discovery.warning)
+
     def test_ffmpeg_omits_scale_when_source_and_output_dimensions_match(self):
         config = EncoderCfg(resolution=96, fps=24)
         command = build_ffmpeg_chain_local(

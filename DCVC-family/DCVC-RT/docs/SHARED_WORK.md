@@ -4,6 +4,8 @@ The local `encode` command can use a shared output directory as a small distribu
 
 The source root may have a different absolute path on each machine. The output root must refer to the same shared storage, and every machine must see the same channel IDs and source basenames. Use the same checkpoints and output-affecting options everywhere. The command hashes both checkpoints and stores a pipeline fingerprint per channel; incompatible peers stop with an error rather than mix outputs.
 
+Because final artifact names omit the source-container suffix, two inputs such as `item.mkv` and `item.webm` represent one queue item. Discovery deterministically prefers MKV, then MP4, WebM, MOV, and AVI, prints a warning, and retains the unused variant.
+
 Example for the Jetson:
 
 ```bash
