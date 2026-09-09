@@ -75,6 +75,11 @@ Outputs use the basename `<source-id>_<upload-date>` inside a channel directory:
 <id>_<date>.<thumbnail-extension>
 ```
 
+For a single-video rescue, if the destination channel already contains exactly one valid
+`<source-id>_*.info.json` without its completed media outputs, the stream command reuses that
+archived basename. This lets a URL repair a timestamp-named archive item without creating a
+second upload-date-named item. Existing metadata is preserved.
+
 An item is skipped when its metadata, non-empty matching bitstream, and requested non-empty Opus output already exist. A video-only success followed by an audio failure can therefore retry just the audio on the next run.
 
 Because there is no local source file, the local-source deletion lifecycle is not invoked by `stream`.

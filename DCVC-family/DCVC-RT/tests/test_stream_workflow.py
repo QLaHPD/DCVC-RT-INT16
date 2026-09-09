@@ -318,6 +318,73 @@ class StreamWorkflowTests(unittest.TestCase):
             self.assertEqual(worker_start["resolution"], "176, 96 -> 176, 96")
             self.assertEqual(records[-1]["type"], "worker_done")
 
+    def test_single_video_rescue_reuses_existing_archived_basename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "synthetic-source.mkv"
+            output_root = root / "output"
+            channel_output = output_root / "UC_TEST"
+            channel_output.mkdir(parents=True)
+            write_synthetic_av_fixture(source)
+            fake_ytdlp = root / "yt-dlp"
+            fake_ytdlp.write_text(
+                "#!/bin/sh\nexec cat \"$FAKE_STREAM_MEDIA\"\n",
+                encoding="utf-8",
+            )
+            fake_ytdlp.chmod(0o755)
+            archived_base = "stream_fixture_1615820413"
+            archived_metadata = {
+                "id": "stream_fixture",
+                "title": "Archived metadata must be preserved",
+            }
+            info_path = channel_output / f"{archived_base}.info.json"
+            info_path.write_text(json.dumps(archived_metadata), encoding="utf-8")
+            media = RemoteMedia(
+                metadata={
+                    "id": "stream_fixture",
+                    "upload_date": "20210315",
+                    "channel_id": "UC_TEST",
+                    "title": "Fresh remote metadata",
+                },
+                width=176,
+                height=96,
+                fps=24,
+                has_audio=True,
+                video_format_selector="bestvideo/best",
+                audio_format_selector="bestaudio/best",
+            )
+            task = StreamTask(
+                "test:stream_fixture",
+                "stream_fixture",
+                "https://example.invalid/watch/stream_fixture",
+                "UC_TEST",
+                "test",
+            )
+            messages = queue.Queue()
+
+            with patch("src.cli.stream_workflow.resolve_remote_media", return_value=media), \
+                    patch.dict(os.environ, {"FAKE_STREAM_MEDIA": str(source)}):
+                success, _ = process_stream_task(
+                    task=task,
+                    progress_q=messages,
+                    worker_id=0,
+                    output_root=output_root,
+                    encoder=FakeNeuralEncoder(),
+                    config=EncoderCfg(resolution=96, fps=24, ffmpeg_prefetch=2),
+                    audio_enabled=False,
+                    opus_params={},
+                    finalize_mode="atomic",
+                    ytdlp_executable=str(fake_ytdlp),
+                    cookies_path=None,
+                    source_max_height=480,
+                    write_thumbnail=False,
+                )
+
+            self.assertTrue(success)
+            self.assertEqual(json.loads(info_path.read_text(encoding="utf-8")), archived_metadata)
+            self.assertEqual(len(list(channel_output.glob(f"{archived_base}_*.bin"))), 1)
+            self.assertFalse((channel_output / "stream_fixture_20210315.info.json").exists())
+
     def test_failed_downloader_does_not_publish_partial_bitstream(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

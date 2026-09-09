@@ -567,6 +567,28 @@ def _existing_video_output(channel_out: Path, base: str, config: encode_core.Enc
     return next((path for path in matches if path.is_file() and path.stat().st_size > 0), None)
 
 
+def _existing_metadata_base(channel_out: Path, video_id: str) -> Optional[str]:
+    """Reuse an archived basename when rescuing one incomplete remote video."""
+
+    matches = []
+    for info_path in sorted(channel_out.glob(f"{video_id}_*.info.json")):
+        if not info_path.is_file() or info_path.is_symlink():
+            continue
+        try:
+            with info_path.open("r", encoding="utf-8") as source:
+                metadata = json.load(source)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(metadata, dict) and str(metadata.get("id") or "") == video_id:
+            matches.append(info_path.name[:-len(".info.json")])
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"multiple archived metadata basenames match remote video {video_id}: "
+            + ", ".join(matches)
+        )
+    return matches[0] if matches else None
+
+
 def _completed_stream_output(
     channel_out: Path,
     video_id: str,
@@ -644,9 +666,11 @@ def process_stream_task(
         ensure_dir(channel_out)
         upload_date = _safe_component(media.metadata.get("upload_date"), "00000000", 16)
         video_id = _safe_component(media.metadata.get("id"), task.video_id)
-        base = f"{video_id}_{upload_date}"
+        archived_base = _existing_metadata_base(channel_out, video_id)
+        base = archived_base or f"{video_id}_{upload_date}"
         info_path = channel_out / f"{base}.info.json"
-        _atomic_write_json(info_path, media.metadata)
+        if archived_base is None:
+            _atomic_write_json(info_path, media.metadata)
 
         if write_thumbnail:
             try:
