@@ -1274,6 +1274,19 @@ def _run_shared_encode(args, device_plan, out_root: Path,
                         progress.write(f"{key[0]}/{key[1]}: claimed by {owner.owner_text}")
                     continue
 
+                # A peer can publish, mark the job done, and release its claim
+                # after our first completed_artifacts() check but before this
+                # acquisition.  Recheck the authoritative done record while we
+                # own the claim rather than trusting the potentially stale
+                # channel artifact snapshot and encoding the video again.
+                completed = pool.completed_artifacts(channel_out, key[1])
+                if completed is not None:
+                    for name in completed:
+                        artifact_indexes[task.channel_id].add_artifact(name)
+                    lease.release()
+                    finish_key(key)
+                    continue
+
                 if lease.recovered_stale and task.channel_id not in refreshed_channels:
                     refresh_channel(task.channel_id)
 

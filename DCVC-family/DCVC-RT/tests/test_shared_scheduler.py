@@ -82,6 +82,115 @@ class FakeEncoder:
 
 
 class SharedSchedulerTests(unittest.TestCase):
+    def test_peer_completion_between_check_and_claim_is_not_reencoded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_channel = root / "input" / "CHANNEL"
+            output_root = root / "output"
+            output_channel = output_root / "CHANNEL"
+            input_channel.mkdir(parents=True)
+            output_channel.mkdir(parents=True)
+            source = input_channel / "video.mkv"
+            source.write_bytes(b"fixture")
+            model_i = root / "image.model"
+            model_p = root / "video.model"
+            model_i.write_bytes(b"same-image-model")
+            model_p.write_bytes(b"same-video-model")
+            task = workflow.EncodeTask("CHANNEL", str(source), True, False)
+            discovery = workflow.ChannelEncodeDiscovery(
+                channel_id="CHANNEL",
+                pending_tasks=[task],
+                source_paths=[task.video_path],
+                total_found=1,
+                already_done=0,
+            )
+            original_pool = workflow.SharedWorkPool
+
+            class CompletingDuringCheckPool(original_pool):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.injected_completion = False
+
+                def completed_artifacts(self, channel_out, video_id):
+                    completed = super().completed_artifacts(channel_out, video_id)
+                    if completed is not None or self.injected_completion:
+                        return completed
+
+                    # Force the exact race: the scheduler has observed no done
+                    # record, then a peer finishes and releases its claim before
+                    # the scheduler calls try_acquire().
+                    peer_lease, _ = self.try_acquire(channel_out, video_id)
+                    if peer_lease is None:
+                        raise AssertionError("peer could not acquire injected claim")
+                    final = Path(channel_out) / f"{video_id}_176x96_qI35_qP14.bin"
+                    final.write_bytes(b"peer-bitstream")
+                    peer_lease.mark_done([final.name])
+                    peer_lease.release()
+                    self.injected_completion = True
+                    return None
+
+            process_calls = []
+
+            def fake_process(task, progress_q, wid, channel_out, encoder, enc_cfg,
+                             audio_enable, opus_params, finalize_mode, defer_publish=False):
+                del encoder, enc_cfg, audio_enable, opus_params, finalize_mode
+                process_calls.append(task.video_path)
+                base = Path(task.video_path).stem
+                staged = workflow.shared_stage_path(channel_out, base, task.publish_token, ".bin")
+                staged.write_bytes(b"duplicate-bitstream")
+                progress_q.put({
+                    "type": "worker_done", "wid": wid, "vid": base,
+                    "channel_id": task.channel_id, "elapsed": 0.01,
+                    "publish": [{
+                        "temporary": str(staged),
+                        "final": str(channel_out / f"{base}_176x96_qI35_qP14.bin"),
+                    }],
+                })
+                return True, 0.01
+
+            args = SimpleNamespace(
+                auto_delete=False,
+                cleanup_dry_run=False,
+                shared_lease_seconds=30.0,
+                shared_instance="machine-b",
+                model_path_i=str(model_i),
+                model_path_p=str(model_p),
+                audio="none",
+                disk_finalize="atomic",
+                ui="plain",
+            )
+            device_plan = SimpleNamespace(
+                worker_count=1,
+                cuda_indices=(None,),
+                using_cuda=False,
+            )
+            enc_cfg = {
+                "qp_i": 35, "qp_p": 14, "force_intra_period": -1,
+                "reset_interval": 32, "resolution": 96, "pad_multiple": 16,
+                "ff_color_matrix": "bt709", "ff_hwaccel": "none",
+                "ffmpeg_prefetch": 8, "fps": 24, "force_zero_thres": None,
+            }
+
+            with mock.patch.object(workflow, "SharedWorkPool", CompletingDuringCheckPool), \
+                    mock.patch.object(workflow, "get_context", return_value=ThreadContext()), \
+                    mock.patch.object(workflow, "NeuralEncoder", FakeEncoder), \
+                    mock.patch.object(workflow, "process_one_file", side_effect=fake_process), \
+                    mock.patch.object(workflow, "EncodeDashboard", QuietDashboard), \
+                    mock.patch.object(workflow.signal, "signal"), \
+                    mock.patch.object(workflow, "set_torch_env"), \
+                    mock.patch.object(workflow, "release_cuda"):
+                result = workflow._run_shared_encode(
+                    args, device_plan, output_root, [discovery], [task],
+                    1, 0, enc_cfg, {},
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(process_calls, [])
+            self.assertEqual(
+                (output_channel / "video_176x96_qI35_qP14.bin").read_bytes(),
+                b"peer-bitstream",
+            )
+
     def test_two_multiworker_instances_encode_each_video_once(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
