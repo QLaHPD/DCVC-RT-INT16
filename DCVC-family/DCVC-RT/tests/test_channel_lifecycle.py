@@ -301,6 +301,23 @@ class ChannelLifecycleTests(unittest.TestCase):
         self.assertEqual(controller.awaiting_approvals(), [])
         controller.close()
 
+    @mock.patch("src.cli.lifecycle_runtime.datetime")
+    def test_lifecycle_events_include_local_start_time(self, datetime_mock):
+        datetime_mock.now.return_value.astimezone.return_value.isoformat.return_value = (
+            "2026-09-09T09:10:03-03:00"
+        )
+        fixture = LifecycleFixture(self.root, count=1)
+
+        controller = ChannelLifecycleController([
+            ChannelRuntimeState("TEST_CHANNEL", fixture.state_path, total=1, already_done=1, pending=0)
+        ], policy="prompt")
+
+        self.assertEqual(
+            controller.events()[0],
+            "[2026-09-09T09:10:03-03:00] TEST_CHANNEL: validating retained artifacts",
+        )
+        controller.close()
+
 
 if __name__ == "__main__":
     unittest.main()

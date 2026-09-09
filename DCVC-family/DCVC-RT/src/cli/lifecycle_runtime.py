@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
@@ -69,7 +70,8 @@ class ChannelLifecycleController:
                 self._channel_encoding_terminal(channel)
 
     def _event(self, text: str):
-        self._events.append(text)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        self._events.append(f"[{timestamp}] {text}")
 
     def events(self) -> List[str]:
         return list(self._events)
@@ -136,8 +138,11 @@ class ChannelLifecycleController:
         )
         future = self._executor.submit(cleanup_channel, channel.state_path, self.dry_run, actor)
         self._futures[future] = (channel.channel_id, "cleanup")
-        action = "dry-run cleanup" if self.dry_run else "exact-path deletion"
-        self._event(f"{channel.channel_id}: {action} started")
+        if self.dry_run:
+            action = "dry-run cleanup started"
+        else:
+            action = "exact-path cleanup started; revalidating artifacts before deletion"
+        self._event(f"{channel.channel_id}: {action}")
 
     def poll(self):
         completed = [future for future in self._futures if future.done()]
