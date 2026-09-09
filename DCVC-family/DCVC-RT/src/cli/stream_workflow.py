@@ -8,6 +8,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -627,6 +628,8 @@ def process_stream_task(
     youtube_player_client: str = "web_safari",
 ) -> Tuple[bool, Optional[float]]:
     started = time.time()
+    failure_log_dir: Optional[Path] = None
+    failure_video_id = task.video_id
 
     def emit(event_type: str, **fields):
         progress_q.put({
@@ -668,6 +671,8 @@ def process_stream_task(
         video_id = _safe_component(media.metadata.get("id"), task.video_id)
         archived_base = _existing_metadata_base(channel_out, video_id)
         base = archived_base or f"{video_id}_{upload_date}"
+        failure_log_dir = channel_out
+        failure_video_id = base
         info_path = channel_out / f"{base}.info.json"
         if archived_base is None:
             _atomic_write_json(info_path, media.metadata)
@@ -881,7 +886,20 @@ def process_stream_task(
             if temporary_opus is not None:
                 encode_core.safe_unlink(temporary_opus)
     except Exception as exc:  # pylint: disable=broad-except
-        emit("worker_fail", stage="stream", error=str(exc))
+        error = str(exc)
+        if failure_log_dir is not None:
+            try:
+                append_progress_log(failure_log_dir, {
+                    "video_id": failure_video_id,
+                    "remote_id": task.video_id,
+                    "status": "failed",
+                    "stage": "stream",
+                    "source_url": task.webpage_url,
+                    "error": error,
+                })
+            except OSError:
+                pass
+        emit("worker_fail", vid=failure_video_id, stage="stream", error=error)
         return False, None
 
 
@@ -1383,5 +1401,11 @@ def run(args) -> int:
     failures = sum(state["failures"] for state in channel_state.values())
     if interrupted:
         return 130
+    for channel_id, state in sorted(channel_state.items()):
+        if state["failures"]:
+            print(
+                f"Stream failure for {channel_id}: {state.get('last_error') or 'unknown error'}",
+                file=sys.stderr,
+            )
     print(f"Streaming encode finished: {len(terminal) - failures} succeeded, {failures} failed.")
     return 1 if failures or unreported_failure or terminal != expected else 0

@@ -446,6 +446,15 @@ class StreamWorkflowTests(unittest.TestCase):
                 records.append(messages.get_nowait())
             self.assertEqual(records[-1]["type"], "worker_fail")
             self.assertIn("rc=17", records[-1]["error"])
+            progress_records = [
+                json.loads(line)
+                for line in (channel_output / ".progress.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(progress_records[-1]["status"], "failed")
+            self.assertEqual(progress_records[-1]["stage"], "stream")
+            self.assertIn("rc=17", progress_records[-1]["error"])
 
 
 if __name__ == "__main__":
