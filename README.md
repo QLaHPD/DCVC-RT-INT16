@@ -16,6 +16,12 @@ Highlights:
 - Persistent archive manifests, SHA-256 hashes, and restart-safe deletion auditing
 - Portable native-extension build script for each target computer
 
+## Blender Bunny configuration sweep
+
+This exploratory rate-distortion sweep records an earlier search for the best encoder configurations on the Blender Bunny test video rendered at 144p (256×144). It compares 1,803 configurations over 300 frames and identifies 116 Pareto-optimal results. Lower file size and higher PSNR are preferred; open the standalone SVG to inspect each point's QP, intra-period, and reset-interval settings.
+
+[![Pareto frontier of file size versus PSNR for the Blender Bunny 256×144 test](DCVC-family/DCVC-RT/docs/assets/pareto_frontier_blender_bunny_256x144.svg)](DCVC-family/DCVC-RT/docs/assets/pareto_frontier_blender_bunny_256x144.svg)
+
 The rest of the repository is retained from upstream so its history, license, and the other DCVC-family implementations remain intact. The original upstream root README is preserved as [UPSTREAM_ROOT_README.md](UPSTREAM_ROOT_README.md).
 
 ## Attribution
