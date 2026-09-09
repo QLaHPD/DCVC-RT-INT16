@@ -378,10 +378,14 @@ def _deletion_intents(output_dir: Path) -> set[str]:
 
 
 def _resolve_output_artifact(value: str, output_dir: Path) -> Path:
+    # Progress logs can be shared by machines that mount the same channel at
+    # different absolute paths. Final encode artifacts always live directly in
+    # the current channel output directory, so only the recorded filename is
+    # portable and authoritative here.
     path = Path(value)
-    if not path.is_absolute():
-        path = output_dir / path.name
-    return path.absolute()
+    if not path.name or path.name in {".", ".."}:
+        raise LifecycleError(f"invalid output artifact path: {value!r}")
+    return (output_dir / path.name).absolute()
 
 
 def _probe_opus(path: Path) -> float:
@@ -544,8 +548,8 @@ def validate_channel(state_path: Path) -> ChannelValidation:
         if not done_record or not isinstance(done_record.get("out_bin"), str):
             result.errors.append(f"no completed bitstream record for {base}")
         else:
-            bin_path = _resolve_output_artifact(done_record["out_bin"], output_dir)
             try:
+                bin_path = _resolve_output_artifact(done_record["out_bin"], output_dir)
                 artifact_base = encoded_base_from_bin_name(bin_path.name)
                 if artifact_base != base:
                     raise LifecycleError(f"bitstream filename does not match source {base}: {bin_path}")

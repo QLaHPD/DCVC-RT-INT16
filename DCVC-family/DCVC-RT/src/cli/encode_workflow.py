@@ -1795,7 +1795,7 @@ def run(args) -> int:
             if (
                 cleanup_policy == "prompt"
                 and progress.interactive
-                and lifecycle.awaiting_approvals()
+                and lifecycle.awaiting_actions()
                 and not exit_approvals
             ):
                 continue
@@ -1819,19 +1819,25 @@ def run(args) -> int:
         kill_all_children()
         cleanup_registered_ram_tmp()
 
+    lifecycle_failures = [
+        channel_id for channel_id, channel in sorted(lifecycle.channels.items())
+        if channel.failures or channel.status.endswith("-failed")
+    ]
     pending_approvals = lifecycle.awaiting_approvals()
     if pending_approvals:
         print(
             "Cleanup approval remains pending for: " + ", ".join(pending_approvals) +
             ". Re-run the cleanup command later; no originals were deleted for these channels."
         )
+    elif lifecycle_failures:
+        print(
+            "Channel lifecycle checks failed for: " + ", ".join(lifecycle_failures) +
+            ". Review the channel cleanup audit; unapproved originals were retained."
+        )
     elif not all_tasks:
         print("All videos were already encoded; channel lifecycle checks completed.")
 
-    lifecycle_failure = any(
-        channel.failures or channel.status.endswith("-failed")
-        for channel in lifecycle.channels.values()
-    )
+    lifecycle_failure = bool(lifecycle_failures)
     if interrupted:
         return 130
     return 1 if had_task_failure or unreported_worker_failure or lifecycle_failure else 0

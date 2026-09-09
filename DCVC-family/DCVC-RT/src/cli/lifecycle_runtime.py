@@ -228,6 +228,14 @@ class ChannelLifecycleController:
             if channel.status == "awaiting-approval"
         ]
 
+    def awaiting_actions(self) -> List[str]:
+        return [
+            channel_id for channel_id, channel in sorted(self.channels.items())
+            if channel.status in {
+                "awaiting-approval", "validation-failed", "cleanup-failed", "validate-failed"
+            }
+        ]
+
     def has_background_work(self) -> bool:
         return bool(self._futures)
 

@@ -193,6 +193,31 @@ class ChannelLifecycleTests(unittest.TestCase):
         self.assertTrue(any("bitstream" in error or "truncated" in error for error in result.errors))
 
     @mock.patch("src.cli.channel_lifecycle._probe_opus", return_value=1.0)
+    def test_shared_progress_path_is_rebased_to_current_output_directory(self, _probe):
+        fixture = LifecycleFixture(self.root, count=1)
+        progress_path = fixture.output_dir / ".progress.jsonl"
+        records = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
+        for record in records:
+            if record.get("status") == "video-done":
+                record["out_bin"] = str(
+                    Path("/remote/machine/mount/YOUTUBE/TEST_CHANNEL") / Path(record["out_bin"]).name
+                )
+        progress_path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+        )
+
+        validation = validate_channel(fixture.state_path)
+
+        self.assertTrue(validation.eligible, validation.errors)
+        bitstreams = [
+            artifact.path
+            for item in validation.items
+            for artifact in item.artifacts
+            if artifact.kind == "bitstream"
+        ]
+        self.assertEqual(bitstreams, [str(next(fixture.output_dir.glob("*.bin")).absolute())])
+
+    @mock.patch("src.cli.channel_lifecycle._probe_opus", return_value=1.0)
     def test_later_failed_progress_record_invalidates_old_success(self, _probe):
         fixture = LifecycleFixture(self.root, count=1)
         with (fixture.output_dir / ".progress.jsonl").open("a", encoding="utf-8") as f:
@@ -257,6 +282,23 @@ class ChannelLifecycleTests(unittest.TestCase):
         self.assertEqual(controller.channels["TEST_CHANNEL"].status, "encode-failed")
         self.assertFalse(controller.has_background_work())
         self.assertTrue(fixture.sources[0].exists())
+        controller.close()
+
+    def test_validation_failure_remains_actionable_in_prompt_mode(self):
+        fixture = LifecycleFixture(self.root, count=1)
+        next(fixture.output_dir.glob("*.bin")).unlink()
+        controller = ChannelLifecycleController([
+            ChannelRuntimeState("TEST_CHANNEL", fixture.state_path, total=1, already_done=1, pending=0)
+        ], policy="prompt")
+
+        deadline = time.time() + 5
+        while time.time() < deadline and controller.channels["TEST_CHANNEL"].status == "validating":
+            controller.poll()
+            time.sleep(0.01)
+
+        self.assertEqual(controller.channels["TEST_CHANNEL"].status, "validation-failed")
+        self.assertEqual(controller.awaiting_actions(), ["TEST_CHANNEL"])
+        self.assertEqual(controller.awaiting_approvals(), [])
         controller.close()
 
 
