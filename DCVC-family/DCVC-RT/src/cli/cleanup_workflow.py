@@ -76,7 +76,12 @@ def run(args) -> int:
         actor = "cleanup-cli:auto" if args.auto_delete else (
             "cleanup-cli:dry-run" if args.dry_run else "cleanup-cli:user"
         )
-        result = cleanup_channel(state_path, dry_run=args.dry_run, actor=actor)
+        result = cleanup_channel(
+            state_path,
+            dry_run=args.dry_run,
+            actor=actor,
+            prevalidated=validation,
+        )
         if result.success:
             if result.dry_run:
                 print(f"{channel_id}: dry run complete; no originals deleted.")

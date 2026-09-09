@@ -136,12 +136,18 @@ class ChannelLifecycleController:
             actor=actor,
             dry_run=self.dry_run,
         )
-        future = self._executor.submit(cleanup_channel, channel.state_path, self.dry_run, actor)
+        future = self._executor.submit(
+            cleanup_channel,
+            channel.state_path,
+            self.dry_run,
+            actor,
+            channel.validation,
+        )
         self._futures[future] = (channel.channel_id, "cleanup")
         if self.dry_run:
             action = "dry-run cleanup started"
         else:
-            action = "exact-path cleanup started; revalidating artifacts before deletion"
+            action = "exact-path cleanup started; checking validated file identities before deletion"
         self._event(f"{channel.channel_id}: {action}")
 
     def poll(self):

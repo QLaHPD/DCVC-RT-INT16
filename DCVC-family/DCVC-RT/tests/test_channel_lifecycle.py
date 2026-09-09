@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -136,6 +137,65 @@ class ChannelLifecycleTests(unittest.TestCase):
         self.assertEqual(result.deleted_files, 0)
         self.assertTrue(all(source.exists() for source in fixture.sources))
         self.assertTrue((fixture.output_dir / ARCHIVE_MANIFEST_FILENAME).is_file())
+
+    @mock.patch("src.cli.channel_lifecycle._probe_opus", return_value=1.0)
+    def test_prevalidated_cleanup_uses_fast_identity_check(self, _probe):
+        fixture = LifecycleFixture(self.root, count=1)
+        validation = validate_channel(fixture.state_path)
+        self.assertTrue(validation.eligible, validation.errors)
+
+        with mock.patch(
+            "src.cli.channel_lifecycle.validate_channel",
+            side_effect=AssertionError("full validation must not run again"),
+        ):
+            result = cleanup_channel(
+                fixture.state_path,
+                dry_run=True,
+                actor="unit-test",
+                prevalidated=validation,
+            )
+
+        self.assertTrue(result.success, result.errors)
+        self.assertTrue(fixture.sources[0].exists())
+
+    @mock.patch("src.cli.channel_lifecycle._probe_opus", return_value=1.0)
+    def test_prevalidated_cleanup_stops_if_retained_artifact_changed(self, _probe):
+        fixture = LifecycleFixture(self.root, count=1)
+        validation = validate_channel(fixture.state_path)
+        bitstream = next(fixture.output_dir.glob("*.bin"))
+        metadata = bitstream.stat()
+        os.utime(
+            bitstream,
+            ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000),
+        )
+
+        result = cleanup_channel(
+            fixture.state_path,
+            actor="unit-test",
+            prevalidated=validation,
+        )
+
+        self.assertFalse(result.success)
+        self.assertTrue(fixture.sources[0].exists())
+        self.assertTrue(any("retained artifact changed" in error for error in result.errors))
+
+    @mock.patch("src.cli.channel_lifecycle._probe_opus", return_value=1.0)
+    def test_cleanup_stops_while_shared_work_claim_is_active(self, _probe):
+        fixture = LifecycleFixture(self.root, count=1)
+        validation = validate_channel(fixture.state_path)
+        claim = fixture.output_dir / ".dcvc-shared-work" / "claims" / "active-job"
+        claim.mkdir(parents=True)
+        (claim / "state.json").write_text("{}\n", encoding="utf-8")
+
+        result = cleanup_channel(
+            fixture.state_path,
+            actor="unit-test",
+            prevalidated=validation,
+        )
+
+        self.assertFalse(result.success)
+        self.assertTrue(fixture.sources[0].exists())
+        self.assertTrue(any("shared-work claim" in error for error in result.errors))
 
     @mock.patch("src.cli.channel_lifecycle._probe_opus", return_value=1.0)
     def test_partial_failure_is_restart_safe(self, _probe):

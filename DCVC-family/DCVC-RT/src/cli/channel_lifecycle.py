@@ -45,6 +45,9 @@ class ArtifactRecord:
     path: str
     size: int
     sha256: str
+    mtime_ns: int = 0
+    device: int = 0
+    inode: int = 0
 
 
 @dataclass
@@ -70,11 +73,13 @@ class ChannelValidation:
     retained_bytes: int
     items: List[ItemValidation]
     errors: List[str] = field(default_factory=list)
+    inventory_signature: str = ""
 
     def to_dict(self) -> Dict:
         return {
             "channel_id": self.channel_id,
             "state_path": self.state_path,
+            "inventory_signature": self.inventory_signature,
             "eligible": self.eligible,
             "reclaimable_bytes": self.reclaimable_bytes,
             "retained_bytes": self.retained_bytes,
@@ -166,6 +171,32 @@ def _sha256(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _file_identity(metadata: os.stat_result):
+    return metadata.st_size, metadata.st_mtime_ns, metadata.st_dev, metadata.st_ino
+
+
+def _inventory_signature(state: Dict) -> str:
+    stable_state = {
+        key: state.get(key)
+        for key in (
+            "schema_version",
+            "channel_id",
+            "input_dir",
+            "output_dir",
+            "source_extensions",
+            "audio_required",
+            "metadata_required",
+            "encoder_config",
+            "inventory_errors",
+            "items",
+        )
+    }
+    encoded = json.dumps(
+        stable_state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -421,10 +452,22 @@ def _probe_opus(path: Path) -> float:
 
 
 def _artifact(kind: str, path: Path, output_root: Path) -> ArtifactRecord:
-    metadata = _safe_regular_file(path, output_root)
-    if metadata.st_size <= 0:
+    before = _safe_regular_file(path, output_root)
+    if before.st_size <= 0:
         raise LifecycleError(f"empty retained artifact: {path}")
-    return ArtifactRecord(kind=kind, path=str(path), size=metadata.st_size, sha256=_sha256(path))
+    sha256 = _sha256(path)
+    after = _safe_regular_file(path, output_root)
+    if _file_identity(before) != _file_identity(after):
+        raise LifecycleError(f"retained artifact changed during validation: {path}")
+    return ArtifactRecord(
+        kind=kind,
+        path=str(path),
+        size=after.st_size,
+        sha256=sha256,
+        mtime_ns=after.st_mtime_ns,
+        device=after.st_dev,
+        inode=after.st_ino,
+    )
 
 
 def _inspect_bitstream_strict(path: Path):
@@ -586,6 +629,7 @@ def validate_channel(state_path: Path) -> ChannelValidation:
     validation = ChannelValidation(
         channel_id=channel_id,
         state_path=str(state_path),
+        inventory_signature=_inventory_signature(state),
         eligible=not validation_errors,
         reclaimable_bytes=reclaimable,
         retained_bytes=retained,
@@ -602,6 +646,89 @@ def validate_channel(state_path: Path) -> ChannelValidation:
         errors=validation.errors,
     )
     return validation
+
+
+def _snapshot_validation_errors(
+    state_path: Path,
+    state: Dict,
+    validation: ChannelValidation,
+) -> List[str]:
+    errors: List[str] = []
+    if not validation.eligible:
+        return list(validation.errors) or ["cached channel validation was not eligible"]
+    if Path(validation.state_path).absolute() != state_path:
+        errors.append("cached validation belongs to a different channel state file")
+    if validation.inventory_signature != _inventory_signature(state):
+        errors.append("channel inventory changed after validation")
+
+    channel_id = validate_channel_id(str(state.get("channel_id", "")))
+    if validation.channel_id != channel_id:
+        errors.append("cached validation belongs to a different channel")
+    input_dir = Path(state["input_dir"]).resolve(strict=True)
+    output_dir = Path(state["output_dir"]).resolve(strict=True)
+    allowed = {str(value).lower() for value in state.get("source_extensions", [])}
+    state_items = {
+        str(Path(item.get("source_path", ""))): item
+        for item in state.get("items") or []
+    }
+    if len(state_items) != len(validation.items):
+        errors.append("channel source inventory count changed after validation")
+
+    completed, _ = _progress_details(output_dir)
+    for validated_item in validation.items:
+        source = Path(validated_item.source_path)
+        item_state = state_items.get(str(source))
+        if item_state is None:
+            errors.append(f"source left the channel inventory after validation: {source}")
+        elif validated_item.already_deleted:
+            if source.exists():
+                errors.append(f"audited deleted source exists again: {source}")
+        else:
+            try:
+                metadata = _safe_regular_file(source, input_dir, allowed)
+                expected = (
+                    int(item_state["source_size"]),
+                    int(item_state["source_mtime_ns"]),
+                    int(item_state["source_device"]),
+                    int(item_state["source_inode"]),
+                )
+                if _file_identity(metadata) != expected:
+                    raise LifecycleError(f"source changed after validation: {source}")
+            except (LifecycleError, KeyError, TypeError, ValueError) as exc:
+                errors.append(str(exc))
+
+        bitstreams = [
+            artifact for artifact in validated_item.artifacts if artifact.kind == "bitstream"
+        ]
+        done_record = completed.get(validated_item.base)
+        if len(bitstreams) != 1 or not done_record or not isinstance(done_record.get("out_bin"), str):
+            errors.append(f"completed bitstream record changed after validation: {validated_item.base}")
+        elif Path(done_record["out_bin"]).name != Path(bitstreams[0].path).name:
+            errors.append(f"completed bitstream path changed after validation: {validated_item.base}")
+
+        for artifact in validated_item.artifacts:
+            path = Path(artifact.path)
+            try:
+                metadata = _safe_regular_file(path, output_dir)
+                expected = (artifact.size, artifact.mtime_ns, artifact.device, artifact.inode)
+                if _file_identity(metadata) != expected:
+                    raise LifecycleError(f"retained artifact changed after validation: {path}")
+            except (AttributeError, LifecycleError, OSError) as exc:
+                errors.append(str(exc))
+
+    claims_dir = output_dir / ".dcvc-shared-work" / "claims"
+    try:
+        active_claims = [entry for entry in claims_dir.iterdir() if (entry / "state.json").exists()]
+    except FileNotFoundError:
+        active_claims = []
+    except OSError as exc:
+        errors.append(f"cannot check shared-work claims before cleanup: {exc}")
+        active_claims = []
+    if active_claims:
+        errors.append(
+            f"{len(active_claims)} shared-work claim(s) are still active; wait for all encoders to finish"
+        )
+    return errors
 
 
 def _write_archive_manifest(state: Dict, validation: ChannelValidation, output_dir: Path) -> Path:
@@ -645,20 +772,37 @@ def record_lifecycle_status(state_path: Path, status: str, event: str, **fields)
     )
 
 
-def cleanup_channel(state_path: Path, dry_run: bool = False, actor: str = "user") -> CleanupResult:
+def cleanup_channel(
+    state_path: Path,
+    dry_run: bool = False,
+    actor: str = "user",
+    prevalidated: Optional[ChannelValidation] = None,
+) -> CleanupResult:
     state_path = Path(state_path).absolute()
     state = _load_json(state_path)
     output_dir = Path(state["output_dir"])
     channel_id = str(state.get("channel_id", ""))
-    validation = validate_channel(state_path)
-    if not validation.eligible:
+    validation = prevalidated if prevalidated is not None else validate_channel(state_path)
+    validation_errors = _snapshot_validation_errors(state_path, state, validation)
+    if prevalidated is not None:
+        _append_audit(
+            output_dir,
+            "validation-snapshot-confirmed" if not validation_errors else "validation-snapshot-invalidated",
+            channel_id=channel_id,
+            sources=len(validation.items),
+            errors=validation_errors,
+        )
+    if validation_errors:
+        state["cleanup_status"] = "cleanup-failed"
+        state["updated_at"] = now_iso()
+        _atomic_write_json(state_path, state)
         return CleanupResult(
             channel_id=channel_id,
             success=False,
             dry_run=dry_run,
             deleted_files=0,
             reclaimed_bytes=0,
-            errors=list(validation.errors),
+            errors=validation_errors,
         )
 
     manifest_path = _write_archive_manifest(state, validation, output_dir)
