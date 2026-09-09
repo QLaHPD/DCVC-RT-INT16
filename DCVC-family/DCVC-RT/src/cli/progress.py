@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Deque, Dict, Optional, Set
+from typing import Deque, Dict, List, Optional, Set
 
 from tqdm import tqdm
 
@@ -149,6 +149,28 @@ class EncodeOutputIndex:
     video_bases: Set[str]
     audio_bases: Set[str]
     log_state: Dict[str, Dict[str, str]]
+    video_artifacts: Dict[str, List[str]]
+    audio_artifacts: Dict[str, str]
+
+    def add_artifact(self, name: str):
+        if name.endswith(".opus"):
+            base = Path(name).stem
+            self.audio_bases.add(base)
+            self.audio_artifacts[base] = name
+            return
+        base = encoded_base_from_bin_name(name)
+        if base is None:
+            return
+        self.video_bases.add(base)
+        names = self.video_artifacts.setdefault(base, [])
+        if name not in names:
+            names.append(name)
+
+    def artifact_names(self, base: str, audio_enabled: bool) -> List[str]:
+        names = list(self.video_artifacts.get(base, ()))
+        if audio_enabled and base in self.audio_artifacts:
+            names.append(self.audio_artifacts[base])
+        return sorted(set(names))
 
 
 @dataclass
@@ -157,25 +179,33 @@ class DecodeOutputIndex:
     log_state: Dict[str, str]
 
 
-def build_encode_output_index(channel_out: Path) -> EncodeOutputIndex:
+def build_encode_output_index(channel_out: Path, *, parse_progress: bool = True) -> EncodeOutputIndex:
     video_bases: Set[str] = set()
     audio_bases: Set[str] = set()
+    video_artifacts: Dict[str, List[str]] = {}
+    audio_artifacts: Dict[str, str] = {}
     if channel_out.exists():
         with os.scandir(channel_out) as it:
             for entry in it:
                 if not entry.is_file():
                     continue
                 if entry.name.endswith(".opus"):
-                    audio_bases.add(Path(entry.name).stem)
+                    base = Path(entry.name).stem
+                    audio_bases.add(base)
+                    audio_artifacts[base] = entry.name
                     continue
                 base = encoded_base_from_bin_name(entry.name)
                 if base is not None:
                     video_bases.add(base)
+                    video_artifacts.setdefault(base, []).append(entry.name)
 
     return EncodeOutputIndex(
         video_bases=video_bases,
         audio_bases=audio_bases,
-        log_state=parse_encode_resume_state(progress_log_path(channel_out)),
+        log_state=(parse_encode_resume_state(progress_log_path(channel_out))
+                   if parse_progress else {}),
+        video_artifacts=video_artifacts,
+        audio_artifacts=audio_artifacts,
     )
 
 

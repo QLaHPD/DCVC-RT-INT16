@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from src.cli.encode_workflow import _publish_shared_result, shared_stage_path
+from src.cli.progress import build_encode_output_index
 from src.cli.shared_work import SharedWorkError, SharedWorkPool
 
 
@@ -47,11 +48,13 @@ class SharedWorkTests(unittest.TestCase):
 
     def test_stale_claim_is_recovered_and_old_owner_is_fenced(self):
         lease, _ = self.first.try_acquire(self.channel, "video")
+        self.assertFalse(lease.recovered_stale)
         state_path = lease.claim_path / "state.json"
         old = time.time() - 60
         os.utime(state_path, (old, old))
         replacement, _ = self.second.try_acquire(self.channel, "video")
         self.assertIsNotNone(replacement)
+        self.assertTrue(replacement.recovered_stale)
         with self.assertRaisesRegex(SharedWorkError, "was lost"):
             lease.assert_owned()
         lease.release()
@@ -77,6 +80,7 @@ class SharedWorkTests(unittest.TestCase):
 
     def test_only_current_lease_can_publish_staged_output(self):
         lease, _ = self.first.try_acquire(self.channel, "video")
+        output_index = build_encode_output_index(self.channel, parse_progress=False)
         staged = shared_stage_path(self.channel, "video", lease.token, ".bin")
         staged.write_bytes(b"complete-bitstream")
         final = self.channel / "video_176x96_qI35_qP14.bin"
@@ -86,10 +90,12 @@ class SharedWorkTests(unittest.TestCase):
             [{"temporary": str(staged), "final": str(final)}],
             lease,
             audio_enabled=False,
+            output_index=output_index,
         )
         self.assertEqual(artifacts, [final.name])
         self.assertEqual(final.read_bytes(), b"complete-bitstream")
         self.assertEqual(self.first.completed_artifacts(self.channel, "video"), (final.name,))
+        self.assertEqual(output_index.artifact_names("video", False), [final.name])
         lease.release()
 
     def test_expired_owner_cannot_publish_after_takeover(self):

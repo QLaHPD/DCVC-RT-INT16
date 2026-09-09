@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from src.cli import encode_workflow as workflow
+from src.cli import progress as progress_module
 
 
 class ThreadProcess:
@@ -94,7 +95,7 @@ class SharedSchedulerTests(unittest.TestCase):
             model_i.write_bytes(b"same-image-model")
             model_p.write_bytes(b"same-video-model")
             tasks = []
-            for index in range(4):
+            for index in range(10):
                 source = input_channel / f"video_{index}.mkv"
                 source.write_bytes(b"fixture")
                 tasks.append(workflow.EncodeTask("CHANNEL", str(source), True, False))
@@ -144,8 +145,8 @@ class SharedSchedulerTests(unittest.TestCase):
                 )
 
             device_plan = SimpleNamespace(
-                worker_count=3,
-                cuda_indices=(None, None, None),
+                worker_count=5,
+                cuda_indices=(None, None, None, None, None),
                 using_cuda=False,
             )
             enc_cfg = {
@@ -155,6 +156,15 @@ class SharedSchedulerTests(unittest.TestCase):
                 "ffmpeg_prefetch": 8, "fps": 24, "force_zero_thres": None,
             }
             results = []
+            snapshot_builds = []
+            snapshot_lock = threading.Lock()
+
+            def counted_build(channel_out, *, parse_progress=True):
+                with snapshot_lock:
+                    snapshot_builds.append((Path(channel_out), parse_progress))
+                return progress_module.build_encode_output_index(
+                    channel_out, parse_progress=parse_progress
+                )
 
             def run_instance(name):
                 results.append(workflow._run_shared_encode(
@@ -166,6 +176,7 @@ class SharedSchedulerTests(unittest.TestCase):
                     mock.patch.object(workflow, "NeuralEncoder", FakeEncoder), \
                     mock.patch.object(workflow, "process_one_file", side_effect=fake_process), \
                     mock.patch.object(workflow, "EncodeDashboard", QuietDashboard), \
+                    mock.patch.object(workflow, "build_encode_output_index", side_effect=counted_build), \
                     mock.patch.object(workflow.signal, "signal"), \
                     mock.patch.object(workflow, "set_torch_env"), \
                     mock.patch.object(workflow, "release_cuda"):
@@ -179,10 +190,70 @@ class SharedSchedulerTests(unittest.TestCase):
             self.assertFalse(first.is_alive())
             self.assertFalse(second.is_alive())
             self.assertEqual(results, [0, 0])
-            self.assertEqual(sorted(encoded), [f"video_{index}" for index in range(4)])
-            for index in range(4):
+            self.assertEqual(snapshot_builds, [
+                (output_channel, False),
+                (output_channel, False),
+            ])
+            self.assertEqual(sorted(encoded), sorted(f"video_{index}" for index in range(10)))
+            for index in range(10):
                 output = output_channel / f"video_{index}_176x96_qI35_qP14.bin"
                 self.assertEqual(output.read_bytes(), f"encoded-video_{index}".encode())
+
+    def test_shared_snapshot_skips_progress_and_incomplete_artifact_lookup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            channel = Path(directory)
+            source = channel / "video.mkv"
+            source.write_bytes(b"source")
+            (channel / ".progress.jsonl").write_text("large historical log\n")
+
+            with mock.patch.object(
+                progress_module, "parse_encode_resume_state",
+                side_effect=AssertionError("shared snapshot parsed progress"),
+            ):
+                index = progress_module.build_encode_output_index(
+                    channel, parse_progress=False
+                )
+
+            task = workflow.EncodeTask("CHANNEL", str(source), True, True)
+            with mock.patch.object(
+                workflow, "_shared_artifact_names",
+                side_effect=AssertionError("incomplete task requested artifact names"),
+            ):
+                refreshed, artifacts = workflow._refresh_shared_task(
+                    task,
+                    channel,
+                    audio_enabled=True,
+                    trust_atomic_video=True,
+                    output_index=index,
+                )
+
+            self.assertTrue(refreshed.need_video)
+            self.assertTrue(refreshed.need_audio)
+            self.assertEqual(artifacts, [])
+
+    def test_snapshot_keeps_artifact_names_for_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            channel = Path(directory)
+            source = channel / "video.mkv"
+            source.write_bytes(b"source")
+            bitstream = channel / "video_176x96_qI35_qP14.bin"
+            opus = channel / "video.opus"
+            bitstream.write_bytes(b"bitstream")
+            opus.write_bytes(b"audio")
+            index = progress_module.build_encode_output_index(
+                channel, parse_progress=False
+            )
+
+            refreshed, artifacts = workflow._refresh_shared_task(
+                workflow.EncodeTask("CHANNEL", str(source), True, True),
+                channel,
+                audio_enabled=True,
+                trust_atomic_video=True,
+                output_index=index,
+            )
+
+            self.assertIsNone(refreshed)
+            self.assertEqual(artifacts, [opus.name, bitstream.name])
 
 
 if __name__ == "__main__":

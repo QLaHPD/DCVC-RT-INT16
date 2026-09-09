@@ -81,12 +81,13 @@ class ClaimInfo:
 
 class JobLease:
     def __init__(self, pool: "SharedWorkPool", channel_out: Path, video_id: str,
-                 claim_path: Path, token: str, directory_fd: int):
+                 claim_path: Path, token: str, directory_fd: int, recovered_stale: bool = False):
         self.pool = pool
         self.channel_out = channel_out
         self.video_id = video_id
         self.claim_path = claim_path
         self.token = token
+        self.recovered_stale = recovered_stale
         self._directory_fd = directory_fd
         self._closed = False
 
@@ -314,6 +315,7 @@ class SharedWorkPool:
         self.pipeline_id_for(channel_out)
         claim_path = self.claim_path(channel_out, video_id)
         token = uuid.uuid4().hex
+        recovered_stale = False
         for _ in range(4):
             try:
                 claim_path.mkdir()
@@ -337,10 +339,14 @@ class SharedWorkPool:
                 except OSError:
                     return None, info
                 shutil.rmtree(stale_path, ignore_errors=True)
+                recovered_stale = True
                 continue
 
             directory_fd = os.open(claim_path, os.O_RDONLY | os.O_DIRECTORY)
-            lease = JobLease(self, channel_out, video_id, claim_path, token, directory_fd)
+            lease = JobLease(
+                self, channel_out, video_id, claim_path, token, directory_fd,
+                recovered_stale=recovered_stale,
+            )
             try:
                 lease._write_state({"status": "claimed"})
                 lease.assert_owned()

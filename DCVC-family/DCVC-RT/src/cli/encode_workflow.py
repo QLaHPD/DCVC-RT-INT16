@@ -28,10 +28,10 @@ from src.cli.jetson_decode import DecodeError, start_jetson_pipe, validate_decod
 from src.cli.device_plan import build_worker_device_plan
 from src.cli.lifecycle_runtime import ChannelLifecycleController, ChannelRuntimeState
 from src.cli.progress import (
+    EncodeOutputIndex,
     RollingFrameRate,
     append_progress_log,
     build_encode_output_index,
-    encoded_base_from_bin_name,
     ensure_dir,
 )
 from src.cli.shared_work import SharedWorkError, SharedWorkPool, file_sha256
@@ -51,6 +51,7 @@ os.environ.setdefault("PYTHONWARNINGS", "ignore")
 CHILD_PROCS: List[subprocess.Popen] = []
 TMP_RAM_PATHS: List[Path] = []
 STOP_FLAG = False
+SHARED_ARTIFACT_REFRESH_SECONDS = 300.0
 
 
 @dataclass
@@ -1040,48 +1041,40 @@ def _shared_pipeline_config(args, enc_cfg_dict: Dict, opus_params: Dict,
     }
 
 
-def _shared_artifact_names(channel_out: Path, video_id: str, audio_enabled: bool) -> List[str]:
-    names = []
-    try:
-        with os.scandir(channel_out) as entries:
-            for entry in entries:
-                if not entry.is_file():
-                    continue
-                if encoded_base_from_bin_name(entry.name) == video_id:
-                    names.append(entry.name)
-    except FileNotFoundError:
-        pass
-    if audio_enabled:
-        opus_name = f"{video_id}.opus"
-        opus_path = channel_out / opus_name
-        if opus_path.is_file() and opus_path.stat().st_size > 0:
-            names.append(opus_name)
-    return sorted(set(names))
+def _shared_artifact_names(channel_out: Path, video_id: str, audio_enabled: bool,
+                           output_index: Optional[EncodeOutputIndex] = None) -> List[str]:
+    if output_index is None:
+        output_index = build_encode_output_index(channel_out, parse_progress=False)
+    return output_index.artifact_names(video_id, audio_enabled)
 
 
 def _refresh_shared_task(task: EncodeTask, channel_out: Path, audio_enabled: bool,
-                         trust_atomic_video: bool = False) -> Tuple[Optional[EncodeTask], List[str]]:
-    index = build_encode_output_index(channel_out)
+                         trust_atomic_video: bool = False,
+                         output_index: Optional[EncodeOutputIndex] = None
+                         ) -> Tuple[Optional[EncodeTask], List[str]]:
+    index = output_index or build_encode_output_index(
+        channel_out, parse_progress=not trust_atomic_video
+    )
     base = build_local_basename(Path(task.video_path))
     video_exists = base in index.video_bases
     video_done = video_exists and (
         trust_atomic_video or index.log_state.get(base, {}).get("video_status") == "done"
     )
     audio_done = (not audio_enabled) or base in index.audio_bases
-    artifacts = _shared_artifact_names(channel_out, base, audio_enabled)
     if video_done and audio_done:
-        return None, artifacts
+        return None, _shared_artifact_names(channel_out, base, audio_enabled, index)
     return EncodeTask(
         channel_id=task.channel_id,
         video_path=task.video_path,
         need_video=not video_done,
         need_audio=audio_enabled and not audio_done,
         publish_token=task.publish_token,
-    ), artifacts
+    ), []
 
 
 def _publish_shared_result(channel_out: Path, video_id: str, publish_records: List[Dict],
-                           lease, audio_enabled: bool) -> List[str]:
+                           lease, audio_enabled: bool,
+                           output_index: Optional[EncodeOutputIndex] = None) -> List[str]:
     stage_dir = (channel_out / ".dcvc-stage").resolve()
     moved_finals: List[Path] = []
     temporary_paths: List[Path] = []
@@ -1103,6 +1096,8 @@ def _publish_shared_result(channel_out: Path, video_id: str, publish_records: Li
             lease.assert_owned()
             os.replace(temporary, final)
             moved_finals.append(final)
+            if output_index is not None:
+                output_index.add_artifact(final.name)
 
         bin_outputs = [path for path in moved_finals if path.suffix == ".bin"]
         if bin_outputs:
@@ -1112,7 +1107,9 @@ def _publish_shared_result(channel_out: Path, video_id: str, publish_records: Li
                 "out_bin": str(bin_outputs[0]),
                 "shared_owner": lease.pool.instance_id,
             })
-        artifacts = _shared_artifact_names(channel_out, video_id, audio_enabled)
+        artifacts = _shared_artifact_names(
+            channel_out, video_id, audio_enabled, output_index
+        )
         if not any(name.endswith(".bin") for name in artifacts):
             raise SharedWorkError(f"shared job {video_id!r} has no final bitstream")
         if audio_enabled and f"{video_id}.opus" not in artifacts:
@@ -1167,6 +1164,17 @@ def _run_shared_encode(args, device_plan, out_root: Path,
     if not all_tasks:
         print("All videos were already encoded. Shared work did not modify lifecycle or originals.")
         return 0
+
+    artifact_indexes = {
+        discovery.channel_id: build_encode_output_index(
+            out_root / discovery.channel_id, parse_progress=False
+        )
+        for discovery in discoveries
+        if discovery.total_found
+    }
+    artifact_index_refreshed_at = {
+        channel_id: time.monotonic() for channel_id in artifact_indexes
+    }
 
     worker_count = min(device_plan.worker_count, len(all_tasks))
     cuda_plan = device_plan.cuda_indices[:worker_count]
@@ -1226,6 +1234,15 @@ def _run_shared_encode(args, device_plan, out_root: Path,
         nonlocal last_dispatch
         last_dispatch = time.monotonic()
         assigned_keys = set(assigned.values())
+        refreshed_channels = set()
+
+        def refresh_channel(channel_id: str):
+            artifact_indexes[channel_id] = build_encode_output_index(
+                out_root / channel_id, parse_progress=False
+            )
+            artifact_index_refreshed_at[channel_id] = time.monotonic()
+            refreshed_channels.add(channel_id)
+
         for wid in sorted(tuple(idle)):
             dispatched = False
             external_count = 0
@@ -1235,7 +1252,16 @@ def _run_shared_encode(args, device_plan, out_root: Path,
                     continue
                 task = task_by_key[key]
                 channel_out = out_root / task.channel_id
-                if pool.completed_artifacts(channel_out, key[1]) is not None:
+                if (
+                    task.channel_id not in refreshed_channels
+                    and time.monotonic() - artifact_index_refreshed_at[task.channel_id]
+                    >= SHARED_ARTIFACT_REFRESH_SECONDS
+                ):
+                    refresh_channel(task.channel_id)
+                completed = pool.completed_artifacts(channel_out, key[1])
+                if completed is not None:
+                    for name in completed:
+                        artifact_indexes[task.channel_id].add_artifact(name)
                     finish_key(key)
                     continue
                 lease, owner = pool.try_acquire(channel_out, key[1])
@@ -1248,8 +1274,12 @@ def _run_shared_encode(args, device_plan, out_root: Path,
                         progress.write(f"{key[0]}/{key[1]}: claimed by {owner.owner_text}")
                     continue
 
+                if lease.recovered_stale and task.channel_id not in refreshed_channels:
+                    refresh_channel(task.channel_id)
+
                 refreshed, artifacts = _refresh_shared_task(
-                    task, channel_out, args.audio == "opus", trust_atomic_video=True
+                    task, channel_out, args.audio == "opus", trust_atomic_video=True,
+                    output_index=artifact_indexes[task.channel_id],
                 )
                 if refreshed is None:
                     if artifacts:
@@ -1359,6 +1389,7 @@ def _run_shared_encode(args, device_plan, out_root: Path,
                             _publish_shared_result(
                                 out_root / key[0], key[1], msg.get("publish") or [], lease,
                                 args.audio == "opus",
+                                output_index=artifact_indexes[key[0]],
                             )
                         except Exception as exc:
                             success = False
