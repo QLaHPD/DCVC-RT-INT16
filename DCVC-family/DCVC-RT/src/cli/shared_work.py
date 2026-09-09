@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -167,10 +168,22 @@ class JobLease:
                         os.unlink(name, dir_fd=self._directory_fd)
                     except FileNotFoundError:
                         pass
-                try:
-                    self.claim_path.rmdir()
-                except FileNotFoundError:
-                    pass
+                # SSHFS can briefly report ENOTEMPTY after both directory
+                # entries were successfully unlinked.  Retry that visibility
+                # lag, then leave an empty ownerless directory for normal stale
+                # recovery rather than letting cleanup mask Ctrl-C or a worker
+                # result.  Never remove unknown entries recursively here.
+                for attempt in range(3):
+                    try:
+                        self.claim_path.rmdir()
+                        break
+                    except FileNotFoundError:
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                            raise
+                        if attempt < 2:
+                            time.sleep(0.05)
         finally:
             os.close(self._directory_fd)
             self._closed = True

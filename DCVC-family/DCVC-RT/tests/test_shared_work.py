@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from src.cli.encode_workflow import _publish_shared_result, shared_stage_path
 from src.cli.progress import build_encode_output_index
@@ -117,6 +119,46 @@ class SharedWorkTests(unittest.TestCase):
             )
         self.assertFalse(final.exists())
         replacement.release()
+        lease.release()
+
+    def test_release_retries_transient_sshfs_nonempty_result(self):
+        lease, _ = self.first.try_acquire(self.channel, "video")
+        original_rmdir = Path.rmdir
+        attempts = 0
+
+        def transient_nonempty(path):
+            nonlocal attempts
+            if path == lease.claim_path:
+                attempts += 1
+                if attempts < 3:
+                    raise OSError(errno.ENOTEMPTY, "Directory not empty")
+            return original_rmdir(path)
+
+        with mock.patch.object(Path, "rmdir", new=transient_nonempty):
+            lease.release()
+
+        self.assertEqual(attempts, 3)
+        self.assertFalse(lease.claim_path.exists())
+        lease.release()
+
+    def test_release_does_not_raise_if_sshfs_keeps_reporting_nonempty(self):
+        lease, _ = self.first.try_acquire(self.channel, "video")
+        original_rmdir = Path.rmdir
+        attempts = 0
+
+        def persistently_nonempty(path):
+            nonlocal attempts
+            if path == lease.claim_path:
+                attempts += 1
+                raise OSError(errno.ENOTEMPTY, "Directory not empty")
+            return original_rmdir(path)
+
+        with mock.patch.object(Path, "rmdir", new=persistently_nonempty):
+            lease.release()
+
+        self.assertEqual(attempts, 3)
+        self.assertTrue(lease.claim_path.is_dir())
+        self.assertEqual(list(lease.claim_path.iterdir()), [])
         lease.release()
 
 
