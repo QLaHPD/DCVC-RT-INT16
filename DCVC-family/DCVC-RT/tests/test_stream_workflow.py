@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -194,6 +195,43 @@ class StreamWorkflowTests(unittest.TestCase):
         self.assertNotIn("-o", arguments)
 
     @patch("src.cli.stream_workflow._run_ytdlp")
+    def test_listing_uses_disposable_writable_cookie_copy(self, run_ytdlp):
+        entry = {
+            "id": "abc123",
+            "url": "https://www.youtube.com/watch?v=abc123",
+            "channel_id": "UC_TEST",
+            "extractor_key": "Youtube",
+        }
+        temporary_paths = []
+
+        def fake_run(_executable, arguments):
+            cookie_path = Path(arguments[arguments.index("--cookies") + 1])
+            temporary_paths.append(cookie_path)
+            self.assertEqual(stat.S_IMODE(cookie_path.stat().st_mode), 0o660)
+            self.assertEqual(cookie_path.read_bytes(), b"original cookies\n")
+            cookie_path.write_bytes(b"yt-dlp changed its cookie jar\n")
+            return 0, json.dumps(entry) + "\n", ""
+
+        run_ytdlp.side_effect = fake_run
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "cookies.txt"
+            source.write_bytes(b"original cookies\n")
+            source.chmod(0o440)
+
+            tasks, warnings = list_stream_tasks(
+                "/external/yt-dlp",
+                ["https://www.youtube.com/@example/videos"],
+                cookies_path=str(source),
+            )
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(tasks[0].video_id, "abc123")
+            self.assertEqual(source.read_bytes(), b"original cookies\n")
+            self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o440)
+            self.assertEqual(len(temporary_paths), 1)
+            self.assertFalse(temporary_paths[0].exists())
+
+    @patch("src.cli.stream_workflow._run_ytdlp")
     def test_resolves_separate_video_and_audio_formats_without_download(self, run_ytdlp):
         metadata = {
             "id": "abc123",
@@ -249,10 +287,30 @@ class StreamWorkflowTests(unittest.TestCase):
             write_synthetic_av_fixture(source)
             fake_ytdlp = root / "yt-dlp"
             fake_ytdlp.write_text(
-                "#!/bin/sh\nexec cat \"$FAKE_STREAM_MEDIA\"\n",
+                "#!/bin/sh\n"
+                "cookie_path=''\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  if [ \"$1\" = '--cookies' ]; then\n"
+                "    cookie_path=$2\n"
+                "    shift 2\n"
+                "  else\n"
+                "    shift\n"
+                "  fi\n"
+                "done\n"
+                "if [ -n \"$cookie_path\" ]; then\n"
+                "  mode=$(stat -c '%a' \"$cookie_path\") || exit 18\n"
+                "  printf '%s %s\\n' \"$cookie_path\" \"$mode\" >> \"$FAKE_COOKIE_LOG\"\n"
+                "  printf '# changed by fake yt-dlp\\n' >> \"$cookie_path\"\n"
+                "fi\n"
+                "exec cat \"$FAKE_STREAM_MEDIA\"\n",
                 encoding="utf-8",
             )
             fake_ytdlp.chmod(0o755)
+            cookie_source = root / "cookies.txt"
+            original_cookies = b"immutable exported cookies\n"
+            cookie_source.write_bytes(original_cookies)
+            cookie_source.chmod(0o440)
+            cookie_log = root / "cookie-copies.log"
             original_size = source.stat().st_size
             metadata = {
                 "id": "stream_fixture",
@@ -278,7 +336,10 @@ class StreamWorkflowTests(unittest.TestCase):
             )
             messages = queue.Queue()
             with patch("src.cli.stream_workflow.resolve_remote_media", return_value=media), \
-                    patch.dict(os.environ, {"FAKE_STREAM_MEDIA": str(source)}):
+                    patch.dict(os.environ, {
+                        "FAKE_STREAM_MEDIA": str(source),
+                        "FAKE_COOKIE_LOG": str(cookie_log),
+                    }):
                 success, elapsed = process_stream_task(
                     task=task,
                     progress_q=messages,
@@ -296,7 +357,7 @@ class StreamWorkflowTests(unittest.TestCase):
                     },
                     finalize_mode="atomic",
                     ytdlp_executable=str(fake_ytdlp),
-                    cookies_path=None,
+                    cookies_path=str(cookie_source),
                     source_max_height=480,
                     write_thumbnail=False,
                 )
@@ -305,6 +366,13 @@ class StreamWorkflowTests(unittest.TestCase):
             self.assertGreater(elapsed, 0)
             self.assertTrue(source.exists())
             self.assertEqual(source.stat().st_size, original_size)
+            self.assertEqual(cookie_source.read_bytes(), original_cookies)
+            self.assertEqual(stat.S_IMODE(cookie_source.stat().st_mode), 0o440)
+            cookie_copies = [line.split() for line in cookie_log.read_text().splitlines()]
+            self.assertEqual(len(cookie_copies), 2)
+            self.assertEqual({mode for _path, mode in cookie_copies}, {"660"})
+            self.assertEqual(len({path for path, _mode in cookie_copies}), 2)
+            self.assertTrue(all(not Path(path).exists() for path, _mode in cookie_copies))
             channel_output = output_root / "UC_TEST"
             self.assertEqual(len(list(channel_output.glob("*.bin"))), 1)
             self.assertEqual(len(list(channel_output.glob("*.opus"))), 1)

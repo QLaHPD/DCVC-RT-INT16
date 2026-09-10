@@ -222,7 +222,7 @@ DCVC_USE_INT16=1 python main.py stream \
   --cuda_idx 0 1 2 3 4 --ui auto
 ```
 
-For an initial end-to-end check, add `--max-videos 1`. Private or age-restricted sources can use `--cookies /path/to/cookies.txt`; the cookies file is read by the external yt-dlp process and is never copied into the output.
+For an initial end-to-end check, add `--max-videos 1`. Private or age-restricted sources can use `--cookies /path/to/cookies.txt`. The supplied file remains unchanged: every yt-dlp invocation receives its own temporary RAM copy with mode `660`, and that copy is removed afterward. A read-only backup can therefore be passed directly. See [direct remote streaming](docs/STREAMING.md) for authenticated YouTube client selection.
 
 ## Tests
 

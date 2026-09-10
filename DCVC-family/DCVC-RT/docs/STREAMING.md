@@ -56,7 +56,9 @@ DCVC_USE_INT16=1 python main.py stream \
   --output_root /data/encoded
 ```
 
-The three source options may be combined. `--max-videos 1` is recommended for the first test. Use `--cookies` for sources that require an authenticated yt-dlp session.
+The three source options may be combined. `--max-videos 1` is recommended for the first test. Use `--cookies` for sources that require an authenticated yt-dlp session. The supplied cookie file is treated as immutable input and may be a read-only backup. Before each yt-dlp invocation, the command makes a private RAM copy with mode `660`; yt-dlp may rewrite that copy, which is deleted when the invocation finishes. Video and audio downloaders receive separate copies, so concurrent workers cannot corrupt the original or one another's cookie jars.
+
+Some authenticated YouTube sessions expose media formats through yt-dlp's automatic client selection but not through `web_safari`. In that case, add `--youtube-player-client default`.
 
 ## Formats and bandwidth
 

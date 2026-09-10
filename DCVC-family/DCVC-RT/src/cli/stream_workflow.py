@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -60,6 +61,42 @@ def _safe_component(value: object, fallback: str, max_length: int = 160) -> str:
 
 def _cookies_args(cookies_path: Optional[str]) -> List[str]:
     return ["--cookies", cookies_path] if cookies_path else []
+
+
+def _make_ytdlp_cookie_copy(cookies_path: Optional[str]) -> Optional[str]:
+    """Give one yt-dlp process a writable cookie jar without touching the source."""
+
+    if not cookies_path:
+        return None
+    source = Path(cookies_path)
+    temporary_directory = encode_core.best_ram_dir(os.environ.get("ENC_RAM_TMP_DIR"))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".dcvc-ytdlp-cookies-",
+        suffix=".txt",
+        dir=temporary_directory,
+    )
+    temporary_path = Path(temporary_name)
+    descriptor_open = True
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            descriptor_open = False
+            with source.open("rb") as cookie_source:
+                shutil.copyfileobj(cookie_source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        temporary_path.chmod(0o660)
+        encode_core.register_tmp_ram(temporary_path)
+        return str(temporary_path)
+    except Exception:
+        if descriptor_open:
+            os.close(descriptor)
+        encode_core.safe_unlink(temporary_path)
+        raise
+
+
+def _remove_ytdlp_cookie_copy(cookies_path: Optional[str]):
+    if cookies_path:
+        encode_core.safe_unlink(Path(cookies_path))
 
 
 def _ytdlp_runtime_args(youtube_player_client: str) -> List[str]:
@@ -165,19 +202,23 @@ def list_stream_tasks(
     seen = set()
 
     for source_index, source_url in enumerate(source_urls, start=1):
-        arguments = [
-            *_ytdlp_runtime_args(youtube_player_client),
-            "--flat-playlist",
-            "--skip-download",
-            "--no-warnings",
-            "--no-progress",
-            "--dump-json",
-            *_cookies_args(cookies_path),
-        ]
-        if max_videos:
-            arguments.extend(("--playlist-end", str(max_videos)))
-        arguments.append(source_url)
-        returncode, stdout, stderr = _run_ytdlp(executable, arguments)
+        working_cookies = _make_ytdlp_cookie_copy(cookies_path)
+        try:
+            arguments = [
+                *_ytdlp_runtime_args(youtube_player_client),
+                "--flat-playlist",
+                "--skip-download",
+                "--no-warnings",
+                "--no-progress",
+                "--dump-json",
+                *_cookies_args(working_cookies),
+            ]
+            if max_videos:
+                arguments.extend(("--playlist-end", str(max_videos)))
+            arguments.append(source_url)
+            returncode, stdout, stderr = _run_ytdlp(executable, arguments)
+        finally:
+            _remove_ytdlp_cookie_copy(working_cookies)
 
         parsed = 0
         for line in stdout.splitlines():
@@ -351,19 +392,23 @@ def resolve_remote_media(
     )
     video_format_selector = f"bestvideo{height_filter}/best{height_filter}/best"
     audio_format_selector = "bestaudio/best"
-    arguments = [
-        *_ytdlp_runtime_args(youtube_player_client),
-        "--no-playlist",
-        "--skip-download",
-        "--no-warnings",
-        "--no-progress",
-        "--dump-single-json",
-        "--format",
-        metadata_format_selector,
-        *_cookies_args(cookies_path),
-        task.webpage_url,
-    ]
-    returncode, stdout, stderr = _run_ytdlp(executable, arguments)
+    working_cookies = _make_ytdlp_cookie_copy(cookies_path)
+    try:
+        arguments = [
+            *_ytdlp_runtime_args(youtube_player_client),
+            "--no-playlist",
+            "--skip-download",
+            "--no-warnings",
+            "--no-progress",
+            "--dump-single-json",
+            "--format",
+            metadata_format_selector,
+            *_cookies_args(working_cookies),
+            task.webpage_url,
+        ]
+        returncode, stdout, stderr = _run_ytdlp(executable, arguments)
+    finally:
+        _remove_ytdlp_cookie_copy(working_cookies)
     if returncode != 0:
         detail = stderr.strip()[-2000:] or f"exit {returncode}"
         raise RuntimeError(f"yt-dlp metadata/format resolution failed: {detail}")
@@ -439,19 +484,21 @@ def encode_remote_audio_to_temp(
     opus_params: Dict,
     youtube_player_client: str = "web_safari",
 ):
-    downloader = encode_core.popen_command(
-        build_ytdlp_stream_command(
-            executable,
-            webpage_url,
-            format_selector,
-            cookies_path,
-            youtube_player_client,
-        ),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    working_cookies = _make_ytdlp_cookie_copy(cookies_path)
+    downloader = None
     ffmpeg = None
     try:
+        downloader = encode_core.popen_command(
+            build_ytdlp_stream_command(
+                executable,
+                webpage_url,
+                format_selector,
+                working_cookies,
+                youtube_player_client,
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         ffmpeg = encode_core.popen_command([
             "ffmpeg",
             "-hide_banner",
@@ -492,6 +539,7 @@ def encode_remote_audio_to_temp(
     finally:
         encode_core.kill_popen(ffmpeg)
         encode_core.kill_popen(downloader)
+        _remove_ytdlp_cookie_copy(working_cookies)
 
 
 def _process_error_tail(process: Optional[subprocess.Popen], limit: int = 1200) -> str:
@@ -747,6 +795,7 @@ def process_stream_task(
         video_downloader = None
         ffmpeg_process = None
         staging_bin = None
+        video_cookies = None
         try:
             if need_video:
                 source_width, source_height, source_fps = (
@@ -767,12 +816,13 @@ def process_stream_task(
                 )
                 staging_bin = channel_out / f".{output_bin.name}.stream.{os.getpid()}"
                 encode_core.safe_unlink(staging_bin)
+                video_cookies = _make_ytdlp_cookie_copy(cookies_path)
                 video_downloader = encode_core.popen_command(
                     build_ytdlp_stream_command(
                         ytdlp_executable,
                         task.webpage_url,
                         media.video_format_selector,
-                        cookies_path,
+                        video_cookies,
                         youtube_player_client,
                     ),
                     stdout=subprocess.PIPE,
@@ -885,6 +935,7 @@ def process_stream_task(
                 encode_core.safe_unlink(staging_bin)
             if temporary_opus is not None:
                 encode_core.safe_unlink(temporary_opus)
+            _remove_ytdlp_cookie_copy(video_cookies)
     except Exception as exc:  # pylint: disable=broad-except
         error = str(exc)
         if failure_log_dir is not None:
