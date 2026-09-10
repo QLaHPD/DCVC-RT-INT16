@@ -60,7 +60,11 @@ The encoder supports per-channel queues, resumable progress logs, atomic output 
 
 Local folder encoding can also be shared across machines with `--shared-work`. Peers using the same shared output directory atomically claim different videos, publish only while they still own a renewable lease, expose owner/frame/FPS status to one another, and reject incompatible model or encode settings. Shared mode retains originals; run one normal encode/cleanup pass after every peer exits. See [cooperative multi-machine encoding](docs/SHARED_WORK.md).
 
-The decoder accepts either a directory through `--input_folder` or one specific bitstream through `--input_file`; these options are mutually exclusive. Video `.bin` files decode to YUV, while standalone thumbnail `.dcvci` files decode to PNG and can also be opened by `main.py view`.
+The decoder accepts either a directory through `--input_folder` or one specific bitstream through `--input_file`; these options are mutually exclusive. Video `.bin` files decode to YUV, while standalone thumbnail `.dcvci` files decode to PNG. Use `--input_kind images` or `--input_kind videos` to select one kind when a channel contains both.
+
+`main.py view` opens a `.bin` video, one `.dcvci` image, or a live gallery for a folder of `.dcvci` images. The viewer decodes frames directly to memory and does not create YUV or PNG output. Folder galleries keep the image model loaded and support the buttons, slider, Left/Right arrows, and Home/End keys.
+
+DCVC bitstreams do not carry a marker identifying whether float or INT16 arithmetic produced them. Both decoder commands therefore accept `--runtime int16`, which verifies CUDA and the native INT16 extension before loading a model and refuses to fall back to float. `--runtime auto` preserves the environment-based behavior and prints the runtime it selected.
 
 INT16 depth blocks fuse dense 1x1 convolution and residual addition when the native
 extension supports it. Rebuild the extension after updating to enable this path;
@@ -168,13 +172,39 @@ Each image keeps its exact dimensions and is stored as `<original-name>_qI45.dcv
 
 When this mode is active, validated original thumbnail files join the same cleanup approval as the source videos. `--keep-originals` retains both. Shared workers defer thumbnails; after every `--shared-work` peer exits, run one ordinary encode pass with the thumbnail options to encode them, build the final inventory, and offer cleanup.
 
-Decode one archived thumbnail with the existing command:
+Decode one archived thumbnail to PNG:
 
 ```bash
-python main.py decode \
+DCVC_INT16_AUTOTUNE=1 python main.py decode \
   --input_file /data/encoded/CHANNEL/video.webp_qI45.dcvci \
   --output_folder /data/decoded \
-  --cuda true
+  --cuda true --runtime int16
+```
+
+Decode every archived image in a channel while ignoring its `.bin` videos:
+
+```bash
+DCVC_INT16_AUTOTUNE=1 python main.py decode \
+  --input_folder /data/encoded/CHANNEL \
+  --input_kind images \
+  --output_folder /data/decoded \
+  --cuda true --runtime int16
+```
+
+Browse those images live without writing decoded files:
+
+```bash
+DCVC_INT16_AUTOTUNE=1 python main.py view \
+  /data/encoded/CHANNEL \
+  --cuda true --runtime int16
+```
+
+The same explicit runtime fixes predictive live playback for an INT16 video and reports `Decoder runtime: CUDA INT16` before opening the window:
+
+```bash
+DCVC_INT16_AUTOTUNE=1 python main.py view \
+  /data/encoded/CHANNEL/video.bin \
+  --cuda true --runtime int16
 ```
 
 On a single-GPU Jetson, the default remains one worker. On a multi-GPU host, the default is one worker per visible GPU. Use `--procs` to override encoding concurrency or `--worker` to override decoding concurrency.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ import torch
 
 from src.models.image_model import DMCI
 from src.models.video_model import DMC
+from src.layers import int16_inference as int16_runtime
 from src.utils.common import load_model_for_inference, set_torch_env
 from src.utils.stream_helper import (
     BitstreamInfo,
@@ -72,7 +74,7 @@ class BitstreamFrameIndex:
 @dataclass
 class DecoderModels:
     i_frame_net: DMCI
-    p_frame_net: DMC
+    p_frame_net: Optional[DMC]
     device: torch.device
 
 
@@ -99,16 +101,49 @@ def resolve_decode_device(use_cuda: bool = True, cuda_idx: Optional[int] = None)
     return torch.device("cpu")
 
 
+def configure_decode_runtime(requested: str, use_cuda: bool) -> str:
+    """Select and verify decoder arithmetic before loading model weights."""
+
+    requested = str(requested or "auto").lower()
+    if requested not in {"auto", "int16", "float"}:
+        raise ValueError(f"unsupported decoder runtime: {requested}")
+    if requested == "int16":
+        if not use_cuda:
+            raise ValueError("INT16 decoding requires --cuda true")
+        if not torch.cuda.is_available():
+            raise ValueError("INT16 decoding requires an available CUDA device")
+        if not int16_runtime.CUSTOMIZED_INT16_CUDA_INFERENCE:
+            raise ValueError(
+                "INT16 decoding was requested, but the INT16 CUDA extension is unavailable; "
+                "build it on this machine with ./build_native_extensions.sh"
+            )
+        os.environ["DCVC_USE_INT16"] = "1"
+        if not int16_runtime.int16_inference_enabled():
+            raise ValueError("INT16 decoding was requested but could not be enabled")
+        return "CUDA INT16"
+    if requested == "float":
+        os.environ["DCVC_USE_INT16"] = "0"
+        return "CUDA float" if use_cuda and torch.cuda.is_available() else "CPU float"
+
+    if int16_runtime.int16_inference_enabled() and use_cuda and torch.cuda.is_available():
+        return "CUDA INT16"
+    return "CUDA float" if use_cuda and torch.cuda.is_available() else "CPU float"
+
+
 def load_decoder_models(
     model_path_i: str,
     model_path_p: str,
     device: torch.device | str,
     force_zero_thres: Optional[float] = None,
+    load_p_model: bool = True,
 ) -> DecoderModels:
     set_torch_env()
     device = torch.device(device)
     i_frame_net = load_model_for_inference(DMCI(), model_path_i, device, force_zero_thres)
-    p_frame_net = load_model_for_inference(DMC(), model_path_p, device, force_zero_thres)
+    p_frame_net = (
+        load_model_for_inference(DMC(), model_path_p, device, force_zero_thres)
+        if load_p_model else None
+    )
     return DecoderModels(i_frame_net=i_frame_net, p_frame_net=p_frame_net, device=device)
 
 
@@ -225,8 +260,11 @@ class BitstreamFrameSource:
             self._next_index = 0
             return
         self.index.validate_frame_index(frame_index)
-        self.models.p_frame_net.clear_dpb()
-        self.models.p_frame_net.set_curr_poc(frame_index)
+        if self.models.p_frame_net is not None:
+            self.models.p_frame_net.clear_dpb()
+            self.models.p_frame_net.set_curr_poc(frame_index)
+        elif any(record.nal_type == NalType.NAL_P for record in self.index.frames):
+            raise ValueError("predictive bitstream requires the video model")
         self._next_index = frame_index
 
     def seek(self, frame_index: int, output_format: str = "rgb") -> DecodedFrame:
@@ -334,10 +372,13 @@ class BitstreamFrameSource:
 
         if record.nal_type == NalType.NAL_I:
             decoded = self.models.i_frame_net.decompress(bit_stream, record.sps, qp)
-            self.models.p_frame_net.clear_dpb()
-            self.models.p_frame_net.add_ref_frame(None, decoded["x_hat"])
+            if self.models.p_frame_net is not None:
+                self.models.p_frame_net.clear_dpb()
+                self.models.p_frame_net.add_ref_frame(None, decoded["x_hat"])
             return decoded
 
+        if self.models.p_frame_net is None:
+            raise ValueError("predictive bitstream requires the video model")
         if record.sps["use_ada_i"]:
             self.models.p_frame_net.reset_ref_feature()
         return self.models.p_frame_net.decompress(bit_stream, record.sps, qp)

@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     view_parser = subparsers.add_parser(
         "view",
-        help="Open an interactive DCVC-RT bitstream viewer",
+        help="View a DCVC-RT video, image, or image folder without writing decoded files",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     configure_view_parser(view_parser)

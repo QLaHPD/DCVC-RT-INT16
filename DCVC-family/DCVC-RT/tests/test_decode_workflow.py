@@ -63,6 +63,44 @@ class DecodeInputTests(unittest.TestCase):
             self.assertEqual((total, already_done, len(tasks)), (1, 0, 1))
             self.assertTrue(tasks[0].is_intra_image)
 
+    def test_image_filter_ignores_video_bitstreams(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "video.bin").write_bytes(b"video")
+            image = root / "thumbnail.webp_qI30.dcvci"
+            image.write_bytes(b"image")
+            args = SimpleNamespace(
+                input_file=None,
+                input_folder=str(root),
+                input_kind="images",
+                output_folder=str(root / "decoded"),
+                original_folder=None,
+            )
+
+            tasks, total, already_done = build_decode_tasks(args)
+
+            self.assertEqual((total, already_done), (1, 0))
+            self.assertEqual([Path(task.bin_path) for task in tasks], [image])
+
+    def test_video_filter_ignores_intra_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "video.bin"
+            video.write_bytes(b"video")
+            (root / "thumbnail.webp_qI30.dcvci").write_bytes(b"image")
+            args = SimpleNamespace(
+                input_file=None,
+                input_folder=str(root),
+                input_kind="videos",
+                output_folder=str(root / "decoded"),
+                original_folder=None,
+            )
+
+            tasks, total, already_done = build_decode_tasks(args)
+
+            self.assertEqual((total, already_done), (1, 0))
+            self.assertEqual([Path(task.bin_path) for task in tasks], [video])
+
     def test_file_and_folder_arguments_are_mutually_exclusive(self):
         parser = argparse.ArgumentParser()
         configure_parser(parser)

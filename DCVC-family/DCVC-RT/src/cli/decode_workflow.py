@@ -15,7 +15,13 @@ from typing import Dict, List, Optional
 import torch
 from PIL import Image
 
-from src.codec.frame_decoder import BitstreamFrameSource, DecoderModels, load_decoder_models, resolve_decode_device
+from src.codec.frame_decoder import (
+    BitstreamFrameSource,
+    DecoderModels,
+    configure_decode_runtime,
+    load_decoder_models,
+    resolve_decode_device,
+)
 from src.cli.device_plan import build_worker_device_plan
 from src.cli.progress import (
     MultiWorkerProgress,
@@ -76,6 +82,12 @@ def _worker_sig_handler(sig, frame):
 def build_decode_tasks(args) -> tuple[List[DecodeTask], int, int]:
     output_dir = Path(args.output_folder)
     ensure_dir(output_dir)
+    input_kind = getattr(args, "input_kind", "all")
+    allowed_suffixes = {
+        "all": {".bin", ".dcvci"},
+        "videos": {".bin"},
+        "images": {".dcvci"},
+    }[input_kind]
     if args.input_file:
         input_file = Path(args.input_file)
         if not input_file.is_file():
@@ -83,6 +95,9 @@ def build_decode_tasks(args) -> tuple[List[DecodeTask], int, int]:
             return [], 0, 0
         if input_file.suffix.lower() not in {".bin", ".dcvci"}:
             print(f"Warning: Input file '{args.input_file}' is not a .bin or .dcvci bitstream.")
+            return [], 0, 0
+        if input_file.suffix.lower() not in allowed_suffixes:
+            print(f"Warning: Input file '{args.input_file}' does not match --input_kind {input_kind}.")
             return [], 0, 0
         bin_paths = [input_file]
     else:
@@ -92,7 +107,7 @@ def build_decode_tasks(args) -> tuple[List[DecodeTask], int, int]:
             return [], 0, 0
         bin_paths = sorted(
             path for path in input_dir.iterdir()
-            if path.is_file() and path.suffix.lower() in {".bin", ".dcvci"}
+            if path.is_file() and path.suffix.lower() in allowed_suffixes
         )
     output_index = build_decode_output_index(output_dir)
 
@@ -264,6 +279,7 @@ def worker_entry(wid: int, task_q, progress_q, stop_event, args_dict: Dict, use_
         args_dict["model_path_p"],
         device,
         args_dict["force_zero_thres"],
+        load_p_model=args_dict.get("load_p_model", True),
     )
     progress_q.put({
         "type": "worker_hello",
@@ -303,6 +319,12 @@ def configure_parser(parser: argparse.ArgumentParser):
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--input_folder", type=str, help="Folder with .bin and .dcvci files.")
     input_group.add_argument("--input_file", type=str, help="One specific .bin or .dcvci bitstream to decode.")
+    parser.add_argument(
+        "--input_kind",
+        choices=("all", "videos", "images"),
+        default="all",
+        help="Select both bitstream types, only .bin videos, or only .dcvci images.",
+    )
     parser.add_argument("--output_folder", type=str, required=True, help="Folder for decoded .yuv or .png files.")
     parser.add_argument("--original_folder", type=str, default=None, help="[Optional] Folder with original videos for bitrate/frame count.")
     parser.add_argument(
@@ -323,6 +345,15 @@ def configure_parser(parser: argparse.ArgumentParser):
         help="Logical CUDA device indices to use; defaults to every visible GPU.",
     )
     parser.add_argument("--force_zero_thres", type=float, default=None)
+    parser.add_argument(
+        "--runtime",
+        choices=("auto", "int16", "float"),
+        default="auto",
+        help=(
+            "Decoder arithmetic. Use int16 for INT16 archives; it fails instead of silently "
+            "falling back when the native INT16 runtime is unavailable."
+        ),
+    )
 
 
 def _format_worker_text(state: Dict) -> str:
@@ -353,7 +384,12 @@ def run(args) -> int:
 
     pending_tasks, total_found, already_done = build_decode_tasks(args)
     if total_found == 0:
-        print("Nothing to do — no .bin or .dcvci files found.")
+        kind_text = {
+            "all": ".bin or .dcvci",
+            "videos": ".bin",
+            "images": ".dcvci",
+        }[args.input_kind]
+        print(f"Nothing to do — no {kind_text} files found.")
         return 0
 
     if args.cuda and not device_plan.using_cuda:
@@ -365,6 +401,18 @@ def run(args) -> int:
         progress.close()
         print("Nothing to do — all bitstreams are already decoded.")
         return 0
+
+    try:
+        runtime_label = configure_decode_runtime(args.runtime, device_plan.using_cuda)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 2
+    print(f"Decoder runtime: {runtime_label}")
+    if args.runtime == "auto" and "float" in runtime_label.lower():
+        print(
+            "Warning: auto selected the float decoder. Bitstreams do not identify their "
+            "arithmetic runtime; use --runtime int16 for an INT16 archive."
+        )
 
     worker_count = min(device_plan.worker_count, len(pending_tasks))
     cuda_plan = device_plan.cuda_indices[:worker_count]
@@ -382,6 +430,7 @@ def run(args) -> int:
     progress_q = ctx.Queue()
     stop_event = ctx.Event()
     args_dict = vars(args).copy()
+    args_dict["load_p_model"] = any(not task.is_intra_image for task in pending_tasks)
 
     workers = []
     for wid in range(worker_count):
