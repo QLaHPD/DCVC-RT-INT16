@@ -207,7 +207,7 @@ class ViewerApp:
 
 
 def configure_parser(parser: argparse.ArgumentParser):
-    parser.add_argument("bin_path", help="DCVC-RT .bin bitstream to view.")
+    parser.add_argument("bin_path", help="DCVC-RT .bin video or .dcvci intra-image bitstream to view.")
     parser.add_argument("--model_path_i", type=str, default="./checkpoints/cvpr2025_image.pth.tar")
     parser.add_argument("--model_path_p", type=str, default="./checkpoints/cvpr2025_video.pth.tar")
     parser.add_argument("--cuda", type=str2bool, default=True)

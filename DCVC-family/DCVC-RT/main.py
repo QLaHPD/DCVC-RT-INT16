@@ -26,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     encode_parser = subparsers.add_parser(
         "encode",
-        help="Encode videos into DCVC-RT bitstreams",
+        help="Encode videos and optional thumbnails into DCVC-RT bitstreams",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     configure_encode_parser(encode_parser)
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     decode_parser = subparsers.add_parser(
         "decode",
-        help="Decode DCVC-RT bitstreams into YUV",
+        help="Decode DCVC-RT video bitstreams to YUV and intra images to PNG",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     configure_decode_parser(decode_parser)
@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup_parser = subparsers.add_parser(
         "cleanup",
-        help="Validate completed channel artifacts and safely remove exact original-video paths",
+        help="Validate completed channel artifacts and safely remove exact inventoried source paths",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     configure_cleanup_parser(cleanup_parser)

@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image
+
 from src.cli.channel_lifecycle import (
     ARCHIVE_MANIFEST_FILENAME,
     AUDIT_FILENAME,
@@ -23,17 +25,20 @@ from src.utils.stream_helper import write_ip, write_sps
 SOURCE_EXTENSIONS = {".mkv", ".webm", ".mp4"}
 
 
-def write_valid_bitstream(path: Path, frames: int = 1):
+def write_valid_bitstream(
+    path: Path, frames: int = 1, width: int = 176, height: int = 96,
+    qp: int = 14, i_frame: bool = True,
+):
     with path.open("wb") as f:
         write_sps(f, {
             "sps_id": 0,
-            "height": 96,
-            "width": 176,
+            "height": height,
+            "width": width,
             "ec_part": 0,
             "use_ada_i": 0,
         })
         for index in range(frames):
-            write_ip(f, index == 0, 0, 14, b"test-entropy-payload")
+            write_ip(f, i_frame and index == 0, 0, qp, b"test-entropy-payload")
 
 
 class LifecycleFixture:
@@ -251,6 +256,69 @@ class ChannelLifecycleTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertTrue(fixture.sources[0].exists())
         self.assertTrue(any("bitstream" in error or "truncated" in error for error in result.errors))
+
+    @mock.patch("src.cli.channel_lifecycle._probe_opus", return_value=1.0)
+    def test_dcvc_intra_thumbnail_is_validated_and_deleted_with_video(self, _probe):
+        fixture = LifecycleFixture(self.root, count=1)
+        thumbnail = fixture.input_dir / f"{fixture.bases[0]}.webp"
+        Image.new("RGB", (12, 7), (40, 80, 120)).save(thumbnail)
+        artifact = fixture.output_dir / f"{thumbnail.name}_qI45.dcvci"
+        write_valid_bitstream(artifact, width=12, height=7, qp=45)
+        state_path = write_channel_inventory(
+            channel_id="TEST_CHANNEL",
+            input_dir=fixture.input_dir,
+            output_dir=fixture.output_dir,
+            source_paths=fixture.sources,
+            source_extensions=SOURCE_EXTENSIONS,
+            audio_required=True,
+            metadata_required=True,
+            encoder_config={"qp_i": 35, "qp_p": 14, "thumbnail_codec": "dcvc-intra"},
+            thumbnail_sources=[thumbnail],
+            thumbnail_codec="dcvc-intra",
+            thumbnail_qp=45,
+        )
+
+        validation = validate_channel(state_path)
+        self.assertTrue(validation.eligible, validation.errors)
+        self.assertEqual(validation.delete_file_count, 2)
+        self.assertEqual(len(validation.thumbnails), 1)
+        self.assertEqual(validation.thumbnails[0].artifact.kind, "thumbnail-intra")
+
+        result = cleanup_channel(state_path, actor="unit-test")
+        self.assertTrue(result.success, result.errors)
+        self.assertEqual(result.deleted_files, 2)
+        self.assertFalse(fixture.sources[0].exists())
+        self.assertFalse(thumbnail.exists())
+        self.assertTrue(artifact.exists())
+        self.assertTrue((fixture.input_dir / f"{fixture.bases[0]}.info.json").exists())
+
+    @mock.patch("src.cli.channel_lifecycle._probe_opus", return_value=1.0)
+    def test_invalid_dcvc_intra_thumbnail_blocks_all_cleanup(self, _probe):
+        fixture = LifecycleFixture(self.root, count=1)
+        thumbnail = fixture.input_dir / f"{fixture.bases[0]}.webp"
+        Image.new("RGB", (12, 7), (40, 80, 120)).save(thumbnail)
+        artifact = fixture.output_dir / f"{thumbnail.name}_qI45.dcvci"
+        write_valid_bitstream(artifact, width=12, height=7, qp=45)
+        artifact.write_bytes(artifact.read_bytes()[:-2])
+        state_path = write_channel_inventory(
+            channel_id="TEST_CHANNEL",
+            input_dir=fixture.input_dir,
+            output_dir=fixture.output_dir,
+            source_paths=fixture.sources,
+            source_extensions=SOURCE_EXTENSIONS,
+            audio_required=True,
+            metadata_required=True,
+            encoder_config={"thumbnail_codec": "dcvc-intra"},
+            thumbnail_sources=[thumbnail],
+            thumbnail_codec="dcvc-intra",
+            thumbnail_qp=45,
+        )
+
+        result = cleanup_channel(state_path, actor="unit-test")
+        self.assertFalse(result.success)
+        self.assertTrue(fixture.sources[0].exists())
+        self.assertTrue(thumbnail.exists())
+        self.assertTrue(any("malformed" in error for error in result.errors))
 
     @mock.patch("src.cli.channel_lifecycle._probe_opus", return_value=1.0)
     def test_shared_progress_path_is_rebased_to_current_output_directory(self, _probe):

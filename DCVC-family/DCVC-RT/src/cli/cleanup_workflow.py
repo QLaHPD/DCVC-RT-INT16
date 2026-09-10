@@ -44,7 +44,7 @@ def run(args) -> int:
             failures += 1
             continue
 
-        source_count = sum(not item.already_deleted for item in validation.items)
+        source_count = validation.delete_file_count
         print(
             f"{channel_id}: sources={source_count} "
             f"reclaimable={format_bytes(validation.reclaimable_bytes)} "

@@ -111,7 +111,8 @@ def render_dashboard_lines(
             detail = channel.get("last_error") or ""
             body.append(
                 f"{marker} {channel['channel_id']}  {channel['status']}  "
-                f"files={channel['total']} reclaim={format_bytes(channel.get('reclaimable_bytes', 0))} "
+                f"files={channel.get('delete_files', channel['total'])} "
+                f"reclaim={format_bytes(channel.get('reclaimable_bytes', 0))} "
                 f"{detail}"
             )
         if not body:

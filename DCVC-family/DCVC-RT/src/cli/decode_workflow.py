@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+from PIL import Image
 
 from src.codec.frame_decoder import BitstreamFrameSource, DecoderModels, load_decoder_models, resolve_decode_device
 from src.cli.device_plan import build_worker_device_plan
@@ -25,6 +26,7 @@ from src.cli.progress import (
     original_base_from_encoded_stem,
 )
 from src.utils.common import str2bool
+from src.utils.stream_helper import NalType
 from src.utils.video_writer import YUV420Writer
 
 
@@ -36,6 +38,7 @@ class DecodeTask:
     bin_path: str
     base_name: str
     original_path: Optional[str]
+    is_intra_image: bool = False
 
 
 def extract_video_data(video_path: str):
@@ -78,8 +81,8 @@ def build_decode_tasks(args) -> tuple[List[DecodeTask], int, int]:
         if not input_file.is_file():
             print(f"Warning: Input file '{args.input_file}' not found.")
             return [], 0, 0
-        if input_file.suffix.lower() != ".bin":
-            print(f"Warning: Input file '{args.input_file}' is not a .bin bitstream.")
+        if input_file.suffix.lower() not in {".bin", ".dcvci"}:
+            print(f"Warning: Input file '{args.input_file}' is not a .bin or .dcvci bitstream.")
             return [], 0, 0
         bin_paths = [input_file]
     else:
@@ -89,7 +92,7 @@ def build_decode_tasks(args) -> tuple[List[DecodeTask], int, int]:
             return [], 0, 0
         bin_paths = sorted(
             path for path in input_dir.iterdir()
-            if path.is_file() and path.suffix.lower() == ".bin"
+            if path.is_file() and path.suffix.lower() in {".bin", ".dcvci"}
         )
     output_index = build_decode_output_index(output_dir)
 
@@ -110,7 +113,13 @@ def build_decode_tasks(args) -> tuple[List[DecodeTask], int, int]:
     already_done = 0
     for bin_path in bin_paths:
         base_name = bin_path.stem
-        if output_index.log_state.get(base_name) == "done" or base_name in output_index.decoded_bases:
+        is_intra_image = bin_path.suffix.lower() == ".dcvci"
+        image_output_exists = is_intra_image and (output_dir / f"{base_name}.png").is_file()
+        if (
+            output_index.log_state.get(base_name) == "done"
+            or (not is_intra_image and base_name in output_index.decoded_bases)
+            or image_output_exists
+        ):
             already_done += 1
             continue
 
@@ -123,12 +132,14 @@ def build_decode_tasks(args) -> tuple[List[DecodeTask], int, int]:
             bin_path=str(bin_path),
             base_name=base_name,
             original_path=original_path,
+            is_intra_image=is_intra_image,
         ))
 
     return pending_tasks, len(bin_paths), already_done
 
 
 def run_decoding(task: DecodeTask, output_folder: str, progress_q, wid: int, models: DecoderModels):
+    t0 = time.monotonic()
     output_dir = Path(output_folder)
     append_progress_log(output_dir, {
         "video_id": task.base_name,
@@ -146,6 +157,41 @@ def run_decoding(task: DecodeTask, output_folder: str, progress_q, wid: int, mod
     })
     bin_size = Path(task.bin_path).stat().st_size
     pic_height, pic_width = source.index.height, source.index.width
+
+    if task.is_intra_image:
+        try:
+            if source.index.frame_count != 1 or source.index.frames[0].nal_type != NalType.NAL_I:
+                raise ValueError(".dcvci must contain exactly one I-frame")
+            decoded = source.seek(0, output_format="rgb")
+            output_path = output_dir / f"{task.base_name}.png"
+            temporary = output_path.with_name(f".{output_path.name}.tmp.{os.getpid()}")
+            try:
+                Image.fromarray(decoded.rgb, mode="RGB").save(temporary, format="PNG")
+                with temporary.open("rb") as stream:
+                    os.fsync(stream.fileno())
+                os.replace(temporary, output_path)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+            append_progress_log(output_dir, {
+                "video_id": task.base_name,
+                "status": "decode-done",
+                "out_image": str(output_path),
+                "frames": 1,
+            })
+            progress_q.put({
+                "type": "worker_done",
+                "wid": wid,
+                "vid": task.base_name,
+                "frames": 1,
+                "frame_total": 1,
+                "elapsed": time.monotonic() - t0,
+            })
+            return
+        finally:
+            source.close()
 
     total_kbps = 0
     if task.original_path and os.path.exists(task.original_path):
@@ -165,7 +211,6 @@ def run_decoding(task: DecodeTask, output_folder: str, progress_q, wid: int, mod
     recon_writer = YUV420Writer(str(output_path), pic_width, pic_height)
 
     frame_idx = 0
-    t0 = time.monotonic()
     t_last = t0
     rolling_fps = RollingFrameRate(window_seconds=3.0, start_time=t0)
 
@@ -256,9 +301,9 @@ def configure_parser(parser: argparse.ArgumentParser):
     parser.add_argument("--model_path_i", type=str, default="./checkpoints/cvpr2025_image.pth.tar")
     parser.add_argument("--model_path_p", type=str, default="./checkpoints/cvpr2025_video.pth.tar")
     input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("--input_folder", type=str, help="Folder with .bin files.")
-    input_group.add_argument("--input_file", type=str, help="One specific .bin bitstream to decode.")
-    parser.add_argument("--output_folder", type=str, required=True, help="Folder for decoded .yuv files.")
+    input_group.add_argument("--input_folder", type=str, help="Folder with .bin and .dcvci files.")
+    input_group.add_argument("--input_file", type=str, help="One specific .bin or .dcvci bitstream to decode.")
+    parser.add_argument("--output_folder", type=str, required=True, help="Folder for decoded .yuv or .png files.")
     parser.add_argument("--original_folder", type=str, default=None, help="[Optional] Folder with original videos for bitrate/frame count.")
     parser.add_argument(
         "--worker",
@@ -308,7 +353,7 @@ def run(args) -> int:
 
     pending_tasks, total_found, already_done = build_decode_tasks(args)
     if total_found == 0:
-        print("Nothing to do — no .bin files found.")
+        print("Nothing to do — no .bin or .dcvci files found.")
         return 0
 
     if args.cuda and not device_plan.using_cuda:

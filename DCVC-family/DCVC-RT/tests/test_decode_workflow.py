@@ -46,6 +46,23 @@ class DecodeInputTests(unittest.TestCase):
 
             self.assertEqual((tasks, total, already_done), ([], 0, 0))
 
+    def test_specific_intra_image_builds_image_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bitstream = root / "selected.webp_qI45.dcvci"
+            bitstream.write_bytes(b"fixture")
+            args = SimpleNamespace(
+                input_file=str(bitstream),
+                input_folder=None,
+                output_folder=str(root / "decoded"),
+                original_folder=None,
+            )
+
+            tasks, total, already_done = build_decode_tasks(args)
+
+            self.assertEqual((total, already_done, len(tasks)), (1, 0, 1))
+            self.assertTrue(tasks[0].is_intra_image)
+
     def test_file_and_folder_arguments_are_mutually_exclusive(self):
         parser = argparse.ArgumentParser()
         configure_parser(parser)

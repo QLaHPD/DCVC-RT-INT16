@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import queue
 import json
 import subprocess
@@ -14,6 +15,7 @@ from src.cli.encode_workflow import (
     EncoderCfg,
     EncodeTask,
     append_progress_log,
+    configure_parser,
     process_one_file,
     write_bytes_final,
 )
@@ -64,6 +66,21 @@ class FakeNeuralEncoder:
 
 
 class EncodeLifecycleMessageTests(unittest.TestCase):
+    def test_thumbnail_codec_options_are_part_of_encode_parser(self):
+        parser = argparse.ArgumentParser()
+        configure_parser(parser)
+        args = parser.parse_args([
+            "--base_root", "/input",
+            "--output_root", "/output",
+            "--channel_ids", "CHANNEL",
+            "--thumbnail_codec", "dcvc-intra",
+            "--thumbnail_qp", "45",
+            "--thumbnail_workers", "2",
+        ])
+        self.assertEqual(args.thumbnail_codec, "dcvc-intra")
+        self.assertEqual(args.thumbnail_qp, 45)
+        self.assertEqual(args.thumbnail_workers, 2)
+
     def test_duplicate_container_variants_select_one_source_without_hiding_unique_webm(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

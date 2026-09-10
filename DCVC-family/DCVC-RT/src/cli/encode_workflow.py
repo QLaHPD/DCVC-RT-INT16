@@ -35,6 +35,12 @@ from src.cli.progress import (
     ensure_dir,
 )
 from src.cli.shared_work import SharedWorkError, SharedWorkPool, file_sha256
+from src.cli.thumbnail_codec import (
+    DEFAULT_THUMBNAIL_EXTENSIONS,
+    ThumbnailDiscovery,
+    discover_thumbnails,
+    thumbnail_worker_entry,
+)
 from src.layers.cuda_inference import replicate_pad
 from src.models.image_model import DMCI
 from src.models.video_model import DMC
@@ -930,17 +936,17 @@ def configure_parser(parser: argparse.ArgumentParser):
     lifecycle_group.add_argument(
         "--auto-delete",
         action="store_true",
-        help="After strict channel validation, delete only the exact discovered source-video paths without prompting.",
+        help="After strict channel validation, delete only exact inventoried source paths without prompting.",
     )
     lifecycle_group.add_argument(
         "--keep-originals",
         action="store_true",
-        help="Do not offer or perform source-video cleanup. By default completed channels await TUI approval.",
+        help="Do not offer or perform source cleanup. By default completed channels await TUI approval.",
     )
     lifecycle_group.add_argument(
         "--cleanup-dry-run",
         action="store_true",
-        help="Run validation and write archive manifests/audit records, but do not unlink source videos.",
+        help="Run validation and write archive manifests/audit records, but do not unlink sources.",
     )
     lifecycle_group.add_argument(
         "--allow-missing-metadata",
@@ -975,6 +981,42 @@ def configure_parser(parser: argparse.ArgumentParser):
         help="Optional human-readable machine name recorded in shared claim status.",
     )
 
+    thumbnail_group = parser.add_argument_group("Thumbnail Intra Coding")
+    thumbnail_group.add_argument(
+        "--thumbnail_codec",
+        "--thumbnail-codec",
+        choices=["keep", "dcvc-intra"],
+        default="keep",
+        help=(
+            "Keep ordinary image sidecars, or encode every channel image as a standalone "
+            "DCVC I-frame before lifecycle validation."
+        ),
+    )
+    thumbnail_group.add_argument(
+        "--thumbnail_qp",
+        "--thumbnail-qp",
+        type=int,
+        default=45,
+        help="I-frame QP for --thumbnail_codec dcvc-intra (0-63).",
+    )
+    thumbnail_group.add_argument(
+        "--thumbnail_workers",
+        "--thumbnail-workers",
+        type=int,
+        default=None,
+        help=(
+            "Thumbnail workers. By default, use one per selected GPU or one CPU worker; "
+            "each worker loads only the image model."
+        ),
+    )
+    thumbnail_group.add_argument(
+        "--thumbnail_extensions",
+        "--thumbnail-extensions",
+        nargs="+",
+        default=list(DEFAULT_THUMBNAIL_EXTENSIONS),
+        help="Image extensions included by --thumbnail_codec dcvc-intra.",
+    )
+
 
 def _format_worker_text(state: Dict) -> str:
     vid = state.get("vid", "-")
@@ -988,6 +1030,165 @@ def _format_worker_text(state: Dict) -> str:
         f"{device_text}{vid}{resolution_text} {state.get('frames', 0)}f "
         f"{state.get('fps', 0.0):.1f}fps Aud:{state.get('audio', 'off')}"
     )
+
+
+def _thumbnail_worker_devices(args, device_plan) -> Tuple[bool, List[Optional[int]]]:
+    if args.thumbnail_workers is not None and args.thumbnail_workers <= 0:
+        raise ValueError("--thumbnail_workers must be greater than zero")
+    if not device_plan.using_cuda:
+        return False, [None] * (args.thumbnail_workers or 1)
+    selected = []
+    for index in device_plan.cuda_indices:
+        if index is not None and index not in selected:
+            selected.append(index)
+    if not selected:
+        return False, [None] * (args.thumbnail_workers or 1)
+    count = args.thumbnail_workers or len(selected)
+    return True, [selected[index % len(selected)] for index in range(count)]
+
+
+def _run_thumbnail_phase(
+    args,
+    device_plan,
+    in_root: Path,
+    out_root: Path,
+    sources: List[str],
+) -> Tuple[bool, Dict[str, ThumbnailDiscovery]]:
+    discoveries: Dict[str, ThumbnailDiscovery] = {}
+    allowed = {
+        value.lower() if value.startswith(".") else f".{value.lower()}"
+        for value in args.thumbnail_extensions
+    }
+    for channel_id in sources:
+        discovery = discover_thumbnails(
+            channel_id=channel_id,
+            input_dir=in_root / channel_id,
+            output_dir=out_root / channel_id,
+            qp=args.thumbnail_qp,
+            recursive=args.recursive,
+            extensions=allowed,
+        )
+        discoveries[channel_id] = discovery
+        for error in discovery.errors:
+            print(f"Error: {channel_id}: {error}")
+
+    if any(discovery.errors for discovery in discoveries.values()):
+        return False, discoveries
+    all_tasks = [
+        task
+        for channel_id in sources
+        for task in discoveries[channel_id].pending_tasks
+    ]
+    total = sum(value.total_found for value in discoveries.values())
+    already_done = sum(value.already_done for value in discoveries.values())
+    if total == 0:
+        print("Thumbnail phase: no matching images found.")
+        return True, discoveries
+    if not all_tasks:
+        print(f"Thumbnail phase: all {total} image(s) already have verified DCVC intra outputs.")
+        return True, discoveries
+
+    use_cuda, cuda_plan = _thumbnail_worker_devices(args, device_plan)
+    worker_count = min(len(cuda_plan), len(all_tasks))
+    cuda_plan = cuda_plan[:worker_count]
+    if use_cuda:
+        description = ", ".join(
+            f"worker {wid}->cuda:{cuda_plan[wid]}" for wid in range(worker_count)
+        )
+    else:
+        noun = "worker" if worker_count == 1 else "workers"
+        description = f"{worker_count} CPU {noun}"
+    print(f"Thumbnail worker plan: {description}")
+
+    ctx = get_context("spawn")
+    task_q = ctx.Queue()
+    progress_q = ctx.Queue()
+    stop_event = ctx.Event()
+    workers = []
+    for wid in range(worker_count):
+        proc = ctx.Process(
+            target=thumbnail_worker_entry,
+            args=(
+                wid,
+                task_q,
+                progress_q,
+                stop_event,
+                args.model_path_i,
+                args.force_zero_thres,
+                use_cuda,
+                cuda_plan[wid],
+            ),
+            daemon=True,
+        )
+        proc.start()
+        workers.append(proc)
+    for task in all_tasks:
+        task_q.put(task)
+    for _ in workers:
+        task_q.put(None)
+
+    progress = EncodeDashboard(total, worker_count, out_root, mode=args.ui)
+    progress.set_done(already_done)
+    terminal = set()
+    expected = {(task.channel_id, task.source_relative) for task in all_tasks}
+    failed = False
+    interrupted = False
+    try:
+        while any(proc.is_alive() for proc in workers) or not progress_q.empty():
+            try:
+                message = progress_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            typ = message.get("type")
+            wid = int(message.get("wid", 0))
+            if typ == "worker_hello":
+                progress.set_worker_text(
+                    wid, f"{message.get('device', 'unknown')} ready (pid {message.get('pid', '?')})"
+                )
+            elif typ == "worker_start":
+                progress.set_worker_text(
+                    wid,
+                    f"{message.get('device', '')}{message.get('vid', '-')} "
+                    f"{message.get('resolution', '')} thumbnail",
+                )
+            elif typ in {"worker_done", "worker_fail"}:
+                key = (str(message.get("channel_id", "")), str(message.get("vid", "")))
+                if key in terminal:
+                    continue
+                terminal.add(key)
+                failed = failed or typ == "worker_fail"
+                progress.increment_done(
+                    elapsed_seconds=message.get("elapsed") if typ == "worker_done" else None
+                )
+                progress.clear_worker(wid)
+                if typ == "worker_fail":
+                    progress.write(f"{key[0]}/{key[1]}: thumbnail failed: {message.get('error', '')}")
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_event.set()
+        _terminate_workers(workers, grace_seconds=1.0)
+    finally:
+        progress.close()
+        stop_event.set()
+        for proc in workers:
+            proc.join(timeout=2.0)
+        if any(proc.is_alive() for proc in workers):
+            _terminate_workers(workers, grace_seconds=1.0)
+        _close_queue(task_q)
+        _close_queue(progress_q)
+
+    missing = expected - terminal
+    if missing:
+        failed = True
+        for channel_id, relative in sorted(missing)[:10]:
+            print(f"Error: {channel_id}/{relative}: thumbnail worker exited without a result")
+    if interrupted:
+        raise KeyboardInterrupt
+    if failed:
+        print("Thumbnail phase ended with failures. Original images and videos were retained.")
+        return False, discoveries
+    print(f"Thumbnail phase complete: {len(all_tasks)} encoded, {already_done} resumed.")
+    return True, discoveries
 
 
 def _close_queue(mp_queue):
@@ -1493,6 +1694,12 @@ def run(args) -> int:
     if args.auto_delete and args.keep_originals:
         print("Error: --auto-delete and --keep-originals are mutually exclusive.")
         return 2
+    if not 0 <= args.thumbnail_qp <= 63:
+        print("Error: --thumbnail_qp must be in the range 0-63.")
+        return 2
+    if args.thumbnail_workers is not None and args.thumbnail_workers <= 0:
+        print("Error: --thumbnail_workers must be greater than zero.")
+        return 2
 
     try:
         device_plan = build_worker_device_plan(
@@ -1553,7 +1760,7 @@ def run(args) -> int:
         already_done += discovery.already_done
         all_tasks.extend(discovery.pending_tasks)
 
-    if total_found == 0:
+    if total_found == 0 and args.thumbnail_codec == "keep":
         print("Nothing to do — no videos found.")
         return 0
 
@@ -1587,8 +1794,15 @@ def run(args) -> int:
         "audio": args.audio,
         "opus": dict(opus_params),
         "extensions": sorted(extensions),
+        "thumbnail_codec": args.thumbnail_codec,
+        "thumbnail_qp": args.thumbnail_qp if args.thumbnail_codec == "dcvc-intra" else None,
     }
     if args.shared_work:
+        if args.thumbnail_codec == "dcvc-intra":
+            print(
+                "Thumbnail intra coding is deferred in --shared-work mode. Run one normal "
+                "encode pass with the same thumbnail options after every peer finishes."
+            )
         return _run_shared_encode(
             args=args,
             device_plan=device_plan,
@@ -1601,9 +1815,38 @@ def run(args) -> int:
             opus_params=opus_params,
         )
 
+    thumbnail_discoveries: Dict[str, ThumbnailDiscovery] = {}
+    if args.thumbnail_codec == "dcvc-intra":
+        int16_enabled = os.environ.get("DCVC_USE_INT16", "").lower() in {
+            "1", "true", "yes", "on",
+        }
+        if int16_enabled and args.thumbnail_qp > 47:
+            print(
+                "Warning: INT16 thumbnail quality was observed to degrade above QP 47 on "
+                "the tested model; continuing with the requested value."
+            )
+        thumbnails_ok, thumbnail_discoveries = _run_thumbnail_phase(
+            args=args,
+            device_plan=device_plan,
+            in_root=in_root,
+            out_root=out_root,
+            sources=sources,
+        )
+        if not thumbnails_ok:
+            return 1
+
+    if total_found == 0 and not any(
+        value.total_found for value in thumbnail_discoveries.values()
+    ):
+        print("Nothing to do — no videos or thumbnails found.")
+        return 0
+
     runtime_channels: List[ChannelRuntimeState] = []
     for discovery in discoveries:
-        if discovery.total_found <= 0:
+        thumbnail_discovery = thumbnail_discoveries.get(discovery.channel_id)
+        if discovery.total_found <= 0 and not (
+            thumbnail_discovery and thumbnail_discovery.total_found > 0
+        ):
             continue
         state_path = write_channel_inventory(
             channel_id=discovery.channel_id,
@@ -1614,6 +1857,15 @@ def run(args) -> int:
             audio_required=audio_enabled,
             metadata_required=not args.allow_missing_metadata,
             encoder_config=inventory_config,
+            thumbnail_sources=(
+                [Path(value) for value in thumbnail_discovery.source_paths]
+                if thumbnail_discovery else ()
+            ),
+            thumbnail_extensions=(
+                args.thumbnail_extensions if thumbnail_discovery else ()
+            ),
+            thumbnail_codec=args.thumbnail_codec,
+            thumbnail_qp=args.thumbnail_qp,
         )
         runtime_channels.append(ChannelRuntimeState(
             channel_id=discovery.channel_id,
@@ -1636,15 +1888,15 @@ def run(args) -> int:
     workers = []
     worker_count = min(device_plan.worker_count, len(all_tasks)) if all_tasks else 0
     cuda_plan = device_plan.cuda_indices[:worker_count]
-    if device_plan.using_cuda:
+    if worker_count == 0:
+        workers_description = "no workers needed"
+    elif device_plan.using_cuda:
         workers_description = ", ".join(
             f"worker {wid}->cuda:{cuda_plan[wid]}" for wid in range(worker_count)
         )
     elif worker_count:
         noun = "worker" if worker_count == 1 else "workers"
         workers_description = f"{worker_count} CPU {noun}"
-    else:
-        workers_description = "no workers needed"
     print(f"Worker plan: {workers_description}")
     for wid in range(worker_count):
         proc = ctx.Process(
@@ -1835,7 +2087,10 @@ def run(args) -> int:
             ". Review the channel cleanup audit; unapproved originals were retained."
         )
     elif not all_tasks:
-        print("All videos were already encoded; channel lifecycle checks completed.")
+        if args.thumbnail_codec == "dcvc-intra":
+            print("All videos and thumbnails were already encoded; channel lifecycle checks completed.")
+        else:
+            print("All videos were already encoded; channel lifecycle checks completed.")
 
     lifecycle_failure = bool(lifecycle_failures)
     if interrupted:

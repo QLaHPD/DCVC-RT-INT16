@@ -49,18 +49,18 @@ option or prepared-model conversion is needed. See the
 `main.py` provides five commands:
 
 ```text
-encode   FFmpeg input -> DCVC bitstream plus optional Opus audio
+encode   FFmpeg input -> DCVC bitstream plus optional Opus audio and intra-coded thumbnails
 stream   yt-dlp remote input -> DCVC bitstream plus optional Opus, without a source file
 decode   DCVC bitstream -> decoded YUV/video workflow
 view     Interactive bitstream viewer
 cleanup  Revalidate a completed channel and remove exact inventoried sources
 ```
 
-The encoder supports per-channel queues, resumable progress logs, atomic output commits, concurrent audio encoding, and a terminal dashboard with worker, channel, approval, and event views. Its overall ETA uses the average wall time of successfully completed videos divided across the active worker count; it appears after the first video finishes and intentionally remains a simple estimate.
+The encoder supports per-channel queues, resumable progress logs, atomic output commits, concurrent audio encoding, optional thumbnail intra coding, and a terminal dashboard with worker, channel, approval, and event views. Its overall ETA uses the average wall time of successfully completed videos divided across the active worker count; it appears after the first video finishes and intentionally remains a simple estimate.
 
 Local folder encoding can also be shared across machines with `--shared-work`. Peers using the same shared output directory atomically claim different videos, publish only while they still own a renewable lease, expose owner/frame/FPS status to one another, and reject incompatible model or encode settings. Shared mode retains originals; run one normal encode/cleanup pass after every peer exits. See [cooperative multi-machine encoding](docs/SHARED_WORK.md).
 
-The decoder accepts either a directory through `--input_folder` or one specific bitstream through `--input_file`; these options are mutually exclusive.
+The decoder accepts either a directory through `--input_folder` or one specific bitstream through `--input_file`; these options are mutually exclusive. Video `.bin` files decode to YUV, while standalone thumbnail `.dcvci` files decode to PNG and can also be opened by `main.py view`.
 
 INT16 depth blocks fuse dense 1x1 convolution and residual addition when the native
 extension supports it. Rebuild the extension after updating to enable this path;
@@ -106,7 +106,7 @@ Local and streamed encoding report each video's dimensions as `source width, sou
 
 yt-dlp remains an external runtime tool and is not copied into the Conda environment. The command searches `PATH` and the directory containing `CONDA_EXE`, or it can be selected explicitly with `--yt-dlp`. Current YouTube extraction defaults to yt-dlp's `web_safari` player client and permits its recommended EJS challenge component; both the rationale and override are documented in [docs/STREAMING.md](docs/STREAMING.md).
 
-Channel cleanup is deliberately fail-closed. Before a source container can be deleted, the lifecycle verifies its original identity, the latest encode status, DCVC bitstream structure and frame count, Opus stream validity, metadata JSON, retained thumbnails, and safe path boundaries. It writes an archive manifest and append-only audit record before unlinking exact paths. Shell globs and recursive deletion are never used.
+Channel cleanup is deliberately fail-closed. Before a source can be deleted, the lifecycle verifies its original identity, the latest encode status, DCVC bitstream structure and frame count, Opus stream validity, metadata JSON, retained or intra-coded thumbnails, and safe path boundaries. It writes an archive manifest and append-only audit record before unlinking exact paths. Shell globs and recursive deletion are never used.
 
 See [docs/MANAGED_ARCHIVE.md](docs/MANAGED_ARCHIVE.md) for operating details.
 
@@ -157,6 +157,25 @@ DCVC_USE_INT16=1 python main.py encode \
 ```
 
 With no cleanup option, completed channels await approval while other channels continue encoding. Add `--auto-delete` for validation-gated unattended cleanup, `--cleanup-dry-run` to exercise every check without unlinking, or `--keep-originals` to disable cleanup.
+
+To compress every `.webp`, `.jpg`, `.jpeg`, and `.png` in each selected channel with the image model, add:
+
+```bash
+--thumbnail_codec dcvc-intra --thumbnail_qp 45
+```
+
+Each image keeps its exact dimensions and is stored as `<original-name>_qI45.dcvci`, containing one SPS and one I-frame. The phase has its own resumable `.thumbnail-progress.jsonl`, commits outputs atomically, and round-trip decodes each result before it becomes eligible for cleanup. It loads only the image model and defaults to one thumbnail worker per selected GPU; use `--thumbnail_workers` to override that count. In the tested INT16 checkpoint, QP 45 is a practical default and quality degraded above QP 47, so higher values print a warning.
+
+When this mode is active, validated original thumbnail files join the same cleanup approval as the source videos. `--keep-originals` retains both. Shared workers defer thumbnails; after every `--shared-work` peer exits, run one ordinary encode pass with the thumbnail options to encode them, build the final inventory, and offer cleanup.
+
+Decode one archived thumbnail with the existing command:
+
+```bash
+python main.py decode \
+  --input_file /data/encoded/CHANNEL/video.webp_qI45.dcvci \
+  --output_folder /data/decoded \
+  --cuda true
+```
 
 On a single-GPU Jetson, the default remains one worker. On a multi-GPU host, the default is one worker per visible GPU. Use `--procs` to override encoding concurrency or `--worker` to override decoding concurrency.
 

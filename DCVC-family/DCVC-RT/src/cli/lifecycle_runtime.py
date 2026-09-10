@@ -46,6 +46,7 @@ class ChannelRuntimeState:
             "status": self.status,
             "reclaimable_bytes": validation.reclaimable_bytes if validation else 0,
             "retained_bytes": validation.retained_bytes if validation else 0,
+            "delete_files": validation.delete_file_count if validation else self.total,
             "validation_errors": len(validation.errors) if validation else 0,
             "last_error": self.last_error,
         }
@@ -190,11 +191,11 @@ class ChannelLifecycleController:
                         "awaiting-approval",
                         "cleanup-awaiting-approval",
                         reclaimable_bytes=result.reclaimable_bytes,
-                        files=sum(not item.already_deleted for item in result.items),
+                        files=result.delete_file_count,
                     )
                     self._event(
                         f"{channel_id}: awaiting deletion approval for "
-                        f"{sum(not item.already_deleted for item in result.items)} source file(s)"
+                        f"{result.delete_file_count} source file(s)"
                     )
             else:
                 channel.cleanup = result

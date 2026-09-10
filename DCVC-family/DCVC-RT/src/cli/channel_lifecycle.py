@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from src.cli.progress import encoded_base_from_bin_name, progress_log_path
+from src.cli.thumbnail_codec import (
+    DEFAULT_THUMBNAIL_EXTENSIONS,
+    image_dimensions,
+    inspect_intra_image_bitstream,
+    thumbnail_output_name,
+)
 from src.utils.stream_helper import NalType, SPSHelper, read_header, read_sps_remaining, skip_ip_remaining
 
 
@@ -65,6 +71,22 @@ class ItemValidation:
 
 
 @dataclass
+class ThumbnailValidation:
+    source_path: str
+    source_size: int
+    width: int
+    height: int
+    qp: int
+    already_deleted: bool = False
+    artifact: Optional[ArtifactRecord] = None
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def valid(self) -> bool:
+        return not self.errors
+
+
+@dataclass
 class ChannelValidation:
     channel_id: str
     state_path: str
@@ -72,8 +94,15 @@ class ChannelValidation:
     reclaimable_bytes: int
     retained_bytes: int
     items: List[ItemValidation]
+    thumbnails: List[ThumbnailValidation] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     inventory_signature: str = ""
+
+    @property
+    def delete_file_count(self) -> int:
+        return sum(not item.already_deleted for item in self.items) + sum(
+            not item.already_deleted for item in self.thumbnails
+        )
 
     def to_dict(self) -> Dict:
         return {
@@ -90,6 +119,10 @@ class ChannelValidation:
                     "valid": item.valid,
                 }
                 for item in self.items
+            ],
+            "thumbnails": [
+                {**asdict(item), "valid": item.valid}
+                for item in self.thumbnails
             ],
         }
 
@@ -189,6 +222,10 @@ def _inventory_signature(state: Dict) -> str:
             "audio_required",
             "metadata_required",
             "encoder_config",
+            "thumbnail_codec",
+            "thumbnail_extensions",
+            "thumbnail_qp",
+            "thumbnails",
             "inventory_errors",
             "items",
         )
@@ -265,6 +302,10 @@ def write_channel_inventory(
     audio_required: bool,
     metadata_required: bool,
     encoder_config: Dict,
+    thumbnail_sources: Sequence[Path] = (),
+    thumbnail_extensions: Iterable[str] = DEFAULT_THUMBNAIL_EXTENSIONS,
+    thumbnail_codec: str = "keep",
+    thumbnail_qp: int = 45,
 ) -> Path:
     channel_id = validate_channel_id(channel_id)
     input_dir = input_dir.resolve(strict=True)
@@ -280,6 +321,12 @@ def write_channel_inventory(
                 "resume it with the cleanup command before starting a new inventory"
             )
     allowed = {suffix.lower() for suffix in source_extensions}
+    thumbnail_allowed = {
+        suffix.lower() if suffix.startswith(".") else f".{suffix.lower()}"
+        for suffix in thumbnail_extensions
+    }
+    if thumbnail_codec not in {"keep", "dcvc-intra"}:
+        raise LifecycleError(f"unsupported thumbnail codec: {thumbnail_codec}")
     items = []
     seen_bases: Dict[str, str] = {}
     inventory_errors = []
@@ -298,10 +345,11 @@ def write_channel_inventory(
             )
         seen_bases[base] = str(source)
         sidecars = []
-        for suffix in (".webp", ".jpg", ".jpeg", ".png"):
-            candidate = source.with_name(base + suffix)
-            if candidate.is_file() and not candidate.is_symlink():
-                sidecars.append(str(candidate.absolute()))
+        if thumbnail_codec == "keep":
+            for suffix in DEFAULT_THUMBNAIL_EXTENSIONS:
+                candidate = source.with_name(base + suffix)
+                if candidate.is_file() and not candidate.is_symlink():
+                    sidecars.append(str(candidate.absolute()))
         items.append({
             "base": base,
             "source_path": str(source),
@@ -313,6 +361,33 @@ def write_channel_inventory(
             "sidecar_sources": sidecars,
         })
 
+    thumbnails = []
+    seen_thumbnail_sources = set()
+    if thumbnail_codec == "dcvc-intra":
+        for source in sorted((Path(value) for value in thumbnail_sources), key=lambda value: str(value)):
+            source = source.resolve(strict=False)
+            if str(source) in seen_thumbnail_sources:
+                inventory_errors.append(f"duplicate thumbnail source path: {source}")
+                continue
+            seen_thumbnail_sources.add(str(source))
+            try:
+                metadata = _safe_regular_file(source, input_dir, thumbnail_allowed)
+                width, height = image_dimensions(source)
+            except (LifecycleError, OSError, ValueError) as exc:
+                inventory_errors.append(str(exc))
+                continue
+            thumbnails.append({
+                "source_path": str(source),
+                "source_size": metadata.st_size,
+                "source_mtime_ns": metadata.st_mtime_ns,
+                "source_device": metadata.st_dev,
+                "source_inode": metadata.st_ino,
+                "width": width,
+                "height": height,
+                "qp": int(thumbnail_qp),
+                "artifact_name": thumbnail_output_name(source, thumbnail_qp),
+            })
+
     payload = {
         "schema_version": STATE_SCHEMA_VERSION,
         "created_at": now_iso(),
@@ -323,6 +398,10 @@ def write_channel_inventory(
         "audio_required": bool(audio_required),
         "metadata_required": bool(metadata_required),
         "encoder_config": dict(encoder_config),
+        "thumbnail_codec": thumbnail_codec,
+        "thumbnail_extensions": sorted(thumbnail_allowed),
+        "thumbnail_qp": int(thumbnail_qp) if thumbnail_codec == "dcvc-intra" else None,
+        "thumbnails": thumbnails,
         "inventory_errors": inventory_errors,
         "cleanup_status": "encoding",
         "items": items,
@@ -333,6 +412,7 @@ def write_channel_inventory(
         "inventory-written",
         channel_id=channel_id,
         sources=len(items),
+        thumbnails=len(thumbnails),
         errors=len(inventory_errors),
     )
     return path
@@ -525,6 +605,9 @@ def validate_channel(state_path: Path) -> ChannelValidation:
             f"channel directories do not match channel ID {channel_id!r}: {input_dir}, {output_dir}"
         )
     allowed = {str(value).lower() for value in state.get("source_extensions", [])}
+    thumbnail_allowed = {
+        str(value).lower() for value in state.get("thumbnail_extensions", [])
+    }
     metadata_required = bool(state.get("metadata_required", True))
     audio_required = bool(state.get("audio_required", True))
     completed, frame_counts = _progress_details(output_dir)
@@ -532,6 +615,7 @@ def validate_channel(state_path: Path) -> ChannelValidation:
     pending_delete_intents = _deletion_intents(output_dir)
     validation_errors = list(state.get("inventory_errors") or [])
     item_results: List[ItemValidation] = []
+    thumbnail_results: List[ThumbnailValidation] = []
 
     for item in state.get("items") or []:
         base = str(item.get("base", ""))
@@ -618,14 +702,75 @@ def validate_channel(state_path: Path) -> ChannelValidation:
 
         item_results.append(result)
 
-    if not item_results:
-        validation_errors.append("channel inventory contains no source videos")
+    for item in state.get("thumbnails") or []:
+        source = Path(item.get("source_path", ""))
+        result = ThumbnailValidation(
+            source_path=str(source),
+            source_size=int(item.get("source_size", 0)),
+            width=int(item.get("width", 0)),
+            height=int(item.get("height", 0)),
+            qp=int(item.get("qp", -1)),
+            already_deleted=(
+                str(source) in already_deleted
+                or (str(source) in pending_delete_intents and not source.exists())
+            ),
+        )
+        if result.already_deleted:
+            if source.exists():
+                result.errors.append(f"audited deleted thumbnail exists again: {source}")
+        else:
+            try:
+                metadata = _safe_regular_file(source, input_dir, thumbnail_allowed)
+                expected = (
+                    int(item["source_size"]), int(item["source_mtime_ns"]),
+                    int(item["source_device"]), int(item["source_inode"]),
+                )
+                if _file_identity(metadata) != expected:
+                    raise LifecycleError(f"thumbnail changed since discovery: {source}")
+                if image_dimensions(source) != (result.width, result.height):
+                    raise LifecycleError(f"thumbnail dimensions changed since discovery: {source}")
+            except (LifecycleError, KeyError, OSError, TypeError, ValueError) as exc:
+                result.errors.append(str(exc))
+
+        try:
+            artifact_name = Path(str(item["artifact_name"])).name
+            if artifact_name != str(item["artifact_name"]):
+                raise LifecycleError(f"invalid thumbnail artifact name: {item['artifact_name']!r}")
+            artifact_path = output_dir / artifact_name
+            info = inspect_intra_image_bitstream(artifact_path)
+            if (info.width, info.height) != (result.width, result.height):
+                raise LifecycleError(
+                    f"thumbnail bitstream dimensions mismatch for {source.name}: "
+                    f"expected {result.width}x{result.height}, got {info.width}x{info.height}"
+                )
+            if info.qp != result.qp:
+                raise LifecycleError(
+                    f"thumbnail bitstream QP mismatch for {source.name}: "
+                    f"expected {result.qp}, got {info.qp}"
+                )
+            result.artifact = _artifact("thumbnail-intra", artifact_path, output_dir)
+        except (KeyError, OSError, LifecycleError, TypeError, ValueError) as exc:
+            result.errors.append(str(exc))
+        thumbnail_results.append(result)
+
+    if not item_results and not thumbnail_results:
+        validation_errors.append("channel inventory contains no source videos or thumbnails")
     for item in item_results:
         validation_errors.extend(f"{item.base}: {error}" for error in item.errors)
+    for item in thumbnail_results:
+        validation_errors.extend(
+            f"{Path(item.source_path).name}: {error}" for error in item.errors
+        )
     reclaimable = sum(
         item.source_size for item in item_results if item.valid and not item.already_deleted
+    ) + sum(
+        item.source_size for item in thumbnail_results if item.valid and not item.already_deleted
     )
-    retained = sum(artifact.size for item in item_results for artifact in item.artifacts)
+    retained = sum(
+        artifact.size for item in item_results for artifact in item.artifacts
+    ) + sum(
+        item.artifact.size for item in thumbnail_results if item.artifact is not None
+    )
     validation = ChannelValidation(
         channel_id=channel_id,
         state_path=str(state_path),
@@ -634,6 +779,7 @@ def validate_channel(state_path: Path) -> ChannelValidation:
         reclaimable_bytes=reclaimable,
         retained_bytes=retained,
         items=item_results,
+        thumbnails=thumbnail_results,
         errors=validation_errors,
     )
     _append_audit(
@@ -641,6 +787,7 @@ def validate_channel(state_path: Path) -> ChannelValidation:
         "validation-passed" if validation.eligible else "validation-failed",
         channel_id=channel_id,
         sources=len(item_results),
+        thumbnails=len(thumbnail_results),
         reclaimable_bytes=reclaimable,
         retained_bytes=retained,
         errors=validation.errors,
@@ -667,12 +814,21 @@ def _snapshot_validation_errors(
     input_dir = Path(state["input_dir"]).resolve(strict=True)
     output_dir = Path(state["output_dir"]).resolve(strict=True)
     allowed = {str(value).lower() for value in state.get("source_extensions", [])}
+    thumbnail_allowed = {
+        str(value).lower() for value in state.get("thumbnail_extensions", [])
+    }
     state_items = {
         str(Path(item.get("source_path", ""))): item
         for item in state.get("items") or []
     }
     if len(state_items) != len(validation.items):
         errors.append("channel source inventory count changed after validation")
+    state_thumbnails = {
+        str(Path(item.get("source_path", ""))): item
+        for item in state.get("thumbnails") or []
+    }
+    if len(state_thumbnails) != len(validation.thumbnails):
+        errors.append("channel thumbnail inventory count changed after validation")
 
     completed, _ = _progress_details(output_dir)
     for validated_item in validation.items:
@@ -716,6 +872,42 @@ def _snapshot_validation_errors(
             except (AttributeError, LifecycleError, OSError) as exc:
                 errors.append(str(exc))
 
+    for validated_item in validation.thumbnails:
+        source = Path(validated_item.source_path)
+        item_state = state_thumbnails.get(str(source))
+        if item_state is None:
+            errors.append(f"thumbnail left the channel inventory after validation: {source}")
+        elif validated_item.already_deleted:
+            if source.exists():
+                errors.append(f"audited deleted thumbnail exists again: {source}")
+        else:
+            try:
+                metadata = _safe_regular_file(source, input_dir, thumbnail_allowed)
+                expected = (
+                    int(item_state["source_size"]),
+                    int(item_state["source_mtime_ns"]),
+                    int(item_state["source_device"]),
+                    int(item_state["source_inode"]),
+                )
+                if _file_identity(metadata) != expected:
+                    raise LifecycleError(f"thumbnail changed after validation: {source}")
+            except (LifecycleError, KeyError, TypeError, ValueError) as exc:
+                errors.append(str(exc))
+
+        artifact = validated_item.artifact
+        if artifact is None:
+            errors.append(f"validated thumbnail has no retained artifact: {source}")
+            continue
+        if item_state is not None and Path(artifact.path).name != item_state.get("artifact_name"):
+            errors.append(f"thumbnail artifact path changed after validation: {source}")
+        try:
+            metadata = _safe_regular_file(Path(artifact.path), output_dir)
+            expected = (artifact.size, artifact.mtime_ns, artifact.device, artifact.inode)
+            if _file_identity(metadata) != expected:
+                raise LifecycleError(f"retained artifact changed after validation: {artifact.path}")
+        except (LifecycleError, OSError) as exc:
+            errors.append(str(exc))
+
     claims_dir = output_dir / ".dcvc-shared-work" / "claims"
     try:
         active_claims = [entry for entry in claims_dir.iterdir() if (entry / "state.json").exists()]
@@ -738,9 +930,14 @@ def _write_archive_manifest(state: Dict, validation: ChannelValidation, output_d
         "channel_id": validation.channel_id,
         "encoder_config": state.get("encoder_config") or {},
         "source_count": len(validation.items),
-        "original_bytes": sum(item.source_size for item in validation.items),
+        "thumbnail_source_count": len(validation.thumbnails),
+        "original_bytes": (
+            sum(item.source_size for item in validation.items)
+            + sum(item.source_size for item in validation.thumbnails)
+        ),
         "retained_bytes": validation.retained_bytes,
         "items": [asdict(item) for item in validation.items],
+        "thumbnails": [asdict(item) for item in validation.thumbnails],
     }
     path = output_dir / ARCHIVE_MANIFEST_FILENAME
     _atomic_write_json(path, payload)
@@ -790,6 +987,7 @@ def cleanup_channel(
             "validation-snapshot-confirmed" if not validation_errors else "validation-snapshot-invalidated",
             channel_id=channel_id,
             sources=len(validation.items),
+            thumbnails=len(validation.thumbnails),
             errors=validation_errors,
         )
     if validation_errors:
@@ -813,7 +1011,7 @@ def cleanup_channel(
         actor=actor,
         dry_run=dry_run,
         manifest=str(manifest_path),
-        files=sum(not item.already_deleted for item in validation.items),
+        files=validation.delete_file_count,
         reclaimable_bytes=validation.reclaimable_bytes,
     )
     if dry_run:
@@ -835,7 +1033,8 @@ def cleanup_channel(
     deleted_files = 0
     reclaimed_bytes = 0
     deleted_before = _deleted_sources(output_dir)
-    for validated_item in validation.items:
+    validated_sources = [*validation.items, *validation.thumbnails]
+    for validated_item in validated_sources:
         if validated_item.already_deleted and validated_item.source_path not in deleted_before:
             _append_audit(
                 output_dir,
@@ -846,10 +1045,18 @@ def cleanup_channel(
                 actor="interrupted-cleanup-recovery",
             )
             deleted_before.add(validated_item.source_path)
-    item_by_path = {item.source_path: item for item in validation.items}
-    allowed = {str(value).lower() for value in state.get("source_extensions", [])}
+    item_by_path = {item.source_path: item for item in validated_sources}
+    video_allowed = {str(value).lower() for value in state.get("source_extensions", [])}
+    thumbnail_allowed = {
+        str(value).lower() for value in state.get("thumbnail_extensions", [])
+    }
     input_dir = Path(state["input_dir"])
-    for item_state in state.get("items") or []:
+    cleanup_inventory = [
+        (item, video_allowed) for item in state.get("items") or []
+    ] + [
+        (item, thumbnail_allowed) for item in state.get("thumbnails") or []
+    ]
+    for item_state, allowed in cleanup_inventory:
         source = Path(item_state["source_path"])
         source_string = str(source)
         if source_string in deleted_before:
@@ -915,8 +1122,8 @@ def cleanup_channel(
 
     state["cleanup_status"] = "deleted"
     state["updated_at"] = now_iso()
-    state["deleted_files"] = len(validation.items)
-    state["reclaimed_bytes"] = sum(item.source_size for item in validation.items)
+    state["deleted_files"] = len(validated_sources)
+    state["reclaimed_bytes"] = sum(item.source_size for item in validated_sources)
     _atomic_write_json(state_path, state)
     _append_audit(
         output_dir,
