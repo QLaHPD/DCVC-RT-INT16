@@ -17,7 +17,7 @@ from src.models.image_model import DMCI
 from src.models.video_model import DMC
 from src.training.checkpoint import load_initial_weights
 from src.training.config import TrainingConfig, StageConfig
-from src.training.data import TrainingDataset, atomic_json, read_manifest
+from src.training.data import TrainingDataset, atomic_json, read_manifest, frame_count
 from src.training.models import QP_OFFSETS, TrainingModel, distortion
 from src.training.ops import TrainingOps
 from src.utils.common import load_model_for_inference, set_torch_env
@@ -51,14 +51,14 @@ def validate_actual(config, stage, image_path, video_path=None, device="cuda:0",
     # Evaluate as many consecutive frames as each source actually has; a short
     # validation clip remains useful even when training uses a longer stage.
     candidates = [r for r in records if r["split"] == "validation"
-                  and (stage.model == "image" or r["kind"] == "video" and len(r["frames"]) >= 2)]
+                  and (stage.model == "image" or r["kind"] == "video" and frame_count(r) >= 2)]
     if not candidates:
         raise ValueError("no validation sources for deployment evaluation")
     results = []
     root = Path(artifact_root)
     root.mkdir(parents=True, exist_ok=True)
     for sample_index, record in enumerate(candidates[:config.validation.max_samples]):
-        length = 1 if stage.model == "image" else min(len(record["frames"]), config.validation.max_frames)
+        length = 1 if stage.model == "image" else min(frame_count(record), config.validation.max_frames)
         sample_stage = replace(validation_stage, sequence_length=length)
         frames = TrainingDataset([record], sample_stage, config.data, config.seed, "validation")[0]
         height, width = frames.shape[-2:]

@@ -1,6 +1,7 @@
 """One-time media preparation and deterministic, source-disjoint sampling."""
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from torch.nn import functional as F
 from torch.utils.data import Dataset
 
 from src.utils.transforms import rgb2ycbcr
+from src.training.video_data import check_source, index_video, load_video_clip
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
@@ -198,6 +200,24 @@ def _frame_sequences(root):
         yield directory, frames
 
 
+def frame_count(record):
+    return record["frame_count"] if record["format"] == "video_direct" else len(record["frames"])
+
+
+def _index_videos(root, short_edge):
+    def prepare(path):
+        try:
+            record = index_video(path, short_edge)
+            record.update(version=1, id=digest(["video", str(path)]), source_group=digest(str(path)),
+                          kind="video", format="video_direct", frames=[])
+            return path, record
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return path, exc
+    # map preserves source order and therefore split/validation ordering.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        yield from pool.map(prepare, _scan(root, VIDEO_EXTENSIONS))
+
+
 def prepare_data(config, emit=print):
     if not config.data.sources:
         raise ValueError("prepare-training-data requires data.sources")
@@ -207,12 +227,19 @@ def prepare_data(config, emit=print):
             candidates = ((path, [path]) for path in _scan(source.path, IMAGE_EXTENSIONS))
         elif source.type == "frame_sequences":
             candidates = _frame_sequences(source.path)
+        elif config.data.video_loading == "direct":
+            candidates = _index_videos(source.path, config.data.resize_short_edge)
         else:
             candidates = ((path, None) for path in _scan(source.path, VIDEO_EXTENSIONS))
         for path, frames in candidates:
             try:
                 if source.type == "videos":
-                    record = _extract_video(path, config.data.cache_root, config.data.resize_short_edge)
+                    if config.data.video_loading == "direct":
+                        if isinstance(frames, Exception):
+                            raise frames
+                        record = frames
+                    else:
+                        record = _extract_video(path, config.data.cache_root, config.data.resize_short_edge)
                 else:
                     kind = "image" if source.type == "images" else "video"
                     if kind == "video" and len(frames) < 2:
@@ -224,7 +251,8 @@ def prepare_data(config, emit=print):
                 record["split"] = source.split
                 record["resized"] = source.type == "videos" and config.data.resize_short_edge is not None
                 records.append(record)
-                emit(f"Prepared {path}: {len(record['frames'])} frames ({record['width']}x{record['height']})")
+                action = "Indexed" if record["format"] == "video_direct" else "Prepared"
+                emit(f"{action} {path}: {frame_count(record)} frames ({record['width']}x{record['height']})")
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 errors.append({"source": str(path), "error": str(exc)})
                 emit(f"Rejected {path}: {exc}")
@@ -279,7 +307,8 @@ def read_manifest(path):
                 raise ValueError(f"invalid training manifest record at line {lineno}")
             if record["split"] not in {"train", "validation"} or record["kind"] not in {"image", "video"}:
                 raise ValueError(f"invalid split/kind at manifest line {lineno}")
-            if record["format"] not in {"rgb", "yuv420_npz"} or not record["frames"]:
+            direct = record["format"] == "video_direct"
+            if record["format"] not in {"rgb", "yuv420_npz", "video_direct"} or (not direct and not record["frames"]):
                 raise ValueError(f"invalid frame format/list at manifest line {lineno}")
             group, split = record["source_group"], record["split"]
             if group in groups and groups[group] != split:
@@ -288,6 +317,17 @@ def read_manifest(path):
             if record["id"] in ids:
                 raise ValueError(f"duplicate manifest id: {record['id']}")
             ids.add(record["id"])
+            if direct:
+                required_video = {"source", "source_stat", "frame_count", "fps", "duration", "video_filters"}
+                if not required_video <= record.keys() or record["kind"] != "video" or record["frame_count"] < 2:
+                    raise ValueError(f"invalid direct video record at manifest line {lineno}")
+                source = Path(record["source"]).expanduser()
+                source = str((source if source.is_absolute() else path.parent / source).resolve())
+                record["source"] = source
+                if source in frame_groups and frame_groups[source] != split:
+                    raise ValueError(f"video leaks between splits: {source}")
+                frame_groups[source] = split
+                check_source(record)
             if "frame_stats" in record and len(record["frame_stats"]) != len(record["frames"]):
                 raise ValueError(f"frame identity count differs at manifest line {lineno}")
             for frame_index, frame in enumerate(record["frames"]):
@@ -308,6 +348,8 @@ def read_manifest(path):
 
 
 def load_frame(record, index):
+    if record["format"] == "video_direct":
+        return load_video_clip(record, index, 1)[0]
     path = record["frames"][index]
     if record["format"] == "rgb":
         with Image.open(path) as image:
@@ -329,7 +371,7 @@ class TrainingDataset(Dataset):
         self.epoch = 0
         self.records = [record for record in records if record["split"] == split
                         and (stage.model == "image" or record["kind"] == "video")
-                        and len(record["frames"]) >= stage.sequence_length]
+                        and frame_count(record) >= stage.sequence_length]
         if not self.records:
             raise ValueError(f"no {split} sources support {stage.name} ({stage.sequence_length} frames)")
         self.length = (stage.samples_per_epoch or len(self.records)) if split == "train" else len(self.records)
@@ -341,8 +383,11 @@ class TrainingDataset(Dataset):
         rng = random.Random(int(digest([self.seed, self.epoch, index, self.stage.name]), 16))
         record = self.records[index % len(self.records)]
         count = self.stage.sequence_length
-        start = rng.randrange(len(record["frames"]) - count + 1) if self.split == "train" else 0
-        frames = torch.stack([load_frame(record, start + offset) for offset in range(count)])
+        start = rng.randrange(frame_count(record) - count + 1) if self.split == "train" else 0
+        if record["format"] == "video_direct":
+            frames = load_video_clip(record, start, count)
+        else:
+            frames = torch.stack([load_frame(record, start + offset) for offset in range(count)])
         if self.data.resize_short_edge is not None and not record.get("resized", False):
             h, w = frames.shape[-2:]
             scale = self.data.resize_short_edge / min(h, w)

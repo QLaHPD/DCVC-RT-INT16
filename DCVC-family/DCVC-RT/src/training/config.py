@@ -55,8 +55,11 @@ class DataConfig:
     batch_per_gpu: int = 1
     resize_short_edge: Optional[int] = None
     horizontal_flip: bool = True
+    video_loading: str = "cache"
 
     def __post_init__(self):
+        if self.video_loading not in {"cache", "direct"}:
+            raise ValueError("data.video_loading must be cache or direct")
         self.sources = [s if isinstance(s, SourceConfig) else mapping(SourceConfig, s, "data.sources")
                         for s in self.sources]
         if not 0 < self.validation_fraction < 1:

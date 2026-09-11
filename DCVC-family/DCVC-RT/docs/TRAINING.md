@@ -111,9 +111,24 @@ by directory and sort numeric filenames naturally; the repository's
 have consistent dimensions. A stage uses only sequences long enough for its
 configured length. Long-clip stages therefore require actual long sequences.
 
-Original videos are decoded once by FFmpeg into cached YUV420 `.npz` frames.
+By default, original videos are decoded once by FFmpeg into cached YUV420 `.npz` frames.
 Frames retain their stored orientation; container rotation metadata is not applied.
-Preparation runs one decoder at a time, closes its streams, and publishes a
+Set `data.video_loading: direct` to index videos without extracting a frame cache.
+`prepare-training-data` then probes metadata in parallel and writes a small manifest;
+training and validation seek into the source videos and decode only the requested
+consecutive frames in DataLoader workers. `configs/train/tiny_vimeo.yaml` uses this
+mode. Source videos must remain available and unchanged throughout the run.
+The default `cache` mode retains the existing extracted-frame workflow.
+
+Direct sampling seeks by timestamp using average FPS and container frame counts
+(duration-derived counts when absent). Variable-rate media therefore uses approximate
+frame positions, without resampling or duplicating decoded frames. A short tail retries
+an earlier position and then the beginning deterministically; a video that cannot
+provide the requested clip fails explicitly. Spatial transforms are shared across
+the decoded clip. Direct mode trades disk space and upfront extraction time for
+repeated CPU decoding; `data.num_workers` controls prefetch workers per GPU.
+
+Cache preparation runs one decoder at a time, closes its streams, and publishes a
 completed cache atomically. Cache identity includes the source file identity
 and preprocessing dimensions. Completed caches are reused. Sources are retained.
 

@@ -1,0 +1,122 @@
+# Experimental tiny I/P pair trained from scratch on local source videos.
+# Sized initially for five 16 GB GPUs; measure memory with the long stage too.
+version: 1
+task: pair
+seed: 0
+device: cuda
+model:
+  image:
+    channels: 96
+    latent_channels: 64
+    hyper_channels: 64
+    encoder_blocks: 2
+    decoder_blocks: 4
+    fusion_blocks: 2
+    spatial_blocks: 2
+  video:
+    channels: 96
+    recon_channels: 96
+    latent_channels: 64
+    hyper_channels: 64
+    feature_blocks_1: 1
+    feature_blocks_2: 2
+    encoder_blocks: 1
+    decoder_blocks: 2
+    recon_blocks: 2
+    fusion_blocks: 2
+    spatial_blocks: 2
+data:
+  manifest: /mnt/raid0/PROJECTS/dcvc_training/vimeo_s320/direct-manifest.jsonl
+  video_loading: direct
+  cache_root: /mnt/raid0/PROJECTS/dcvc_training/vimeo_s320/cache
+  sources:
+    - type: videos
+      path: /mnt/raid0/PROJECTS/vimeo90K
+  validation_fraction: 0.05
+  resize_short_edge: 320
+  batch_per_gpu: 1
+  num_workers: 2
+optimizer:
+  accumulation_steps: 4
+  gradient_clip: 0.1
+  activation_checkpointing: true
+quantization:
+  feature_scale: 512
+  weight_scale: 8192
+  force_zero_thres: null
+loss:
+  image_lambdas: [10, 2048]
+  video_lambdas: [1, 768]
+  yuv_weight: 0.8
+stages:
+  - name: image_float
+    model: image
+    mode: float
+    epochs: 30
+    lr: 0.0002
+    min_lr: 0.00002
+    crop_size: [256, 256]
+    sequence_length: 1
+    temporal_gradient_length: 1
+    samples_per_epoch: 20000
+  - name: image_int16
+    model: image
+    mode: int16
+    epochs: 5
+    lr: 0.00001
+    min_lr: 0.000001
+    crop_size: [256, 256]
+    sequence_length: 1
+    temporal_gradient_length: 1
+    samples_per_epoch: 20000
+  - name: video_short
+    model: video
+    mode: float
+    epochs: 5
+    lr: 0.0001
+    min_lr: 0.00001
+    crop_size: [256, 256]
+    sequence_length: 2
+    temporal_gradient_length: 1
+    samples_per_epoch: 20000
+  - name: video_seven
+    model: video
+    mode: float
+    epochs: 20
+    lr: 0.0001
+    min_lr: 0.00001
+    crop_size: [256, 256]
+    sequence_length: 7
+    temporal_gradient_length: 3
+    samples_per_epoch: 20000
+  - name: video_int16
+    model: video
+    mode: int16
+    epochs: 5
+    lr: 0.00001
+    min_lr: 0.000001
+    crop_size: [256, 256]
+    sequence_length: 7
+    temporal_gradient_length: 3
+    samples_per_epoch: 20000
+  - name: video_long_int16
+    model: video
+    mode: int16
+    epochs: 3
+    lr: 0.000001
+    min_lr: 0.0000001
+    crop_size: [256, 256]
+    sequence_length: 65
+    temporal_gradient_length: 4
+    samples_per_epoch: 20000
+validation:
+  qps: [0, 21, 42, 63]
+  every_steps: 2000
+  max_samples: 16
+  max_frames: 65
+  actual_bitstreams: true
+  reset_interval: 32
+output:
+  root: ../../runs/tiny_vimeo
+  checkpoint_every_steps: 500
+  log_every_steps: 20
