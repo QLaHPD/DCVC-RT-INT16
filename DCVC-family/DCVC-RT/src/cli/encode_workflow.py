@@ -47,6 +47,8 @@ from src.models.video_model import DMC
 from src.utils.common import load_model_for_inference, set_torch_env
 from src.utils.stream_helper import SPSHelper, write_ip, write_sps
 from src.utils.transforms import ycbcr420_to_444_np
+from src.codec.frame_input import Int16FrameInput
+from src.layers.int16_inference import int16_inference_enabled
 
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -543,8 +545,12 @@ class NeuralEncoder:
         t_last = t0
         rolling_fps = RollingFrameRate(window_seconds=3.0, start_time=t0)
         frame_queue, prefetch_stop, reader_thread = self._start_ffmpeg_prefetch(ffmpeg_proc, width, height)
+        fast_input = None
 
         try:
+            if self.device.type == "cuda" and int16_inference_enabled() and \
+                    os.getenv("DCVC_INT16_FAST_INPUT", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                fast_input = Int16FrameInput(width, height, padding_r, padding_b, self.device)
             while not STOP_FLAG:
                 try:
                     frame = frame_queue.get(timeout=0.2)
@@ -557,15 +563,18 @@ class NeuralEncoder:
                 if isinstance(frame, Exception):
                     raise frame
 
-                y_np = np.frombuffer(frame.y, dtype=np.uint8).reshape(1, height, width)
-                uv_np = np.stack([
-                    np.frombuffer(frame.u, dtype=np.uint8).reshape(height // 2, width // 2),
-                    np.frombuffer(frame.v, dtype=np.uint8).reshape(height // 2, width // 2),
-                ])
-                x444 = ycbcr420_to_444_np(y_np, uv_np)
-                x = torch.from_numpy(x444).to(self.device, dtype=torch.float32) / 255.0
-                x = x.unsqueeze(0).half()
-                x_padded = replicate_pad(x, padding_b, padding_r).contiguous()
+                if fast_input is not None:
+                    x_padded = fast_input.prepare(frame.y, frame.u, frame.v)
+                else:
+                    y_np = np.frombuffer(frame.y, dtype=np.uint8).reshape(1, height, width)
+                    uv_np = np.stack([
+                        np.frombuffer(frame.u, dtype=np.uint8).reshape(height // 2, width // 2),
+                        np.frombuffer(frame.v, dtype=np.uint8).reshape(height // 2, width // 2),
+                    ])
+                    x444 = ycbcr420_to_444_np(y_np, uv_np)
+                    x = torch.from_numpy(x444).to(self.device, dtype=torch.float32) / 255.0
+                    x = x.unsqueeze(0).half()
+                    x_padded = replicate_pad(x, padding_b, padding_r).contiguous()
 
                 is_i = frame_idx == 0 or (
                     self.cfg.force_intra_period > 0 and frame_idx % self.cfg.force_intra_period == 0
@@ -614,6 +623,8 @@ class NeuralEncoder:
                 reader_thread.join(timeout=1.0)
             except Exception:
                 pass
+            if fast_input is not None:
+                fast_input.close()
 
         if STOP_FLAG:
             raise EncodeInterrupted("encode interrupted")

@@ -1,0 +1,162 @@
+diff --git a/DCVC-family/DCVC-RT/benchmarks/check_feature_graph.py b/DCVC-family/DCVC-RT/benchmarks/check_feature_graph.py
+index 4b55403..fb19c20 100644
+--- a/DCVC-family/DCVC-RT/benchmarks/check_feature_graph.py
++++ b/DCVC-family/DCVC-RT/benchmarks/check_feature_graph.py
+@@ -26,8 +26,9 @@ def main():
+     side = torch.cuda.Stream()
+     count = 0
+     with torch.no_grad():
+-        for mode in ("feature", "encoder"):
+-            function = model.feature_extractor if mode == "feature" else model._extract_and_encode
++        for mode in ("feature", "encoder", "full"):
++            function = {"feature": model.feature_extractor, "encoder": model._extract_and_encode,
++                        "full": model._encode_gpu}[mode]
+             for stream in (default, side, default):
+                 # Reuse one model/cache across boundaries, resolutions and streams.
+                 torch.cuda.synchronize()
+@@ -43,13 +44,18 @@ def main():
+                                 model, "q_feature", model.q_feature, qp, qp + 1, device
+                             )
+                             inputs = (feature, quant)
+-                            if mode == "encoder":
++                            if mode != "feature":
+                                 frame = torch.rand((1, 3, height * 8, width * 8),
+                                                    device=device).half()
+                                 q_encoder = get_prepared_feature_param_slice(
+                                     model, "q_encoder", model.q_encoder, qp, qp + 1, device
+                                 )
+                                 inputs += (frame, q_encoder)
++                                if mode == "full":
++                                    q_decoder = get_prepared_feature_param_slice(
++                                        model, "q_decoder", model.q_decoder, qp, qp + 1, device
++                                    )
++                                    inputs += (q_decoder,)
+                             expected = function(*inputs)
+                             actual = runner(function, *inputs)
+                             assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+@@ -64,17 +70,21 @@ def main():
+             frames = [torch.rand((1, 3, padded_h, padded_w), device=device).half()
+                       for _ in range(6)]
+             results = []
+-            for mode in ("off", "feature", "encoder"):
++            for mode in ("off", "feature", "encoder", "full"):
+                 model._encode_graph_mode = mode
+                 model.clear_dpb()
+                 model.set_curr_poc(0)
+                 model.add_ref_frame(None, torch.zeros_like(frames[0]))
+                 sequence = []
+                 last_qp = 0
++                held = None
+                 for index, (frame, qp) in enumerate(zip(frames, (0, 14, 22, 63, 71, 0))):
+                     if index == 3:
+                         model.prepare_feature_adaptor_i(last_qp)
+                     encoded = model.compress(frame, qp)
++                    if held is not None:
++                        assert torch.equal(held[0], held[1]), "saved DPB feature overwritten"
++                    held = (model.dpb[0].feature, model.dpb[0].feature.clone())
+                     sequence.append((encoded['bit_stream'], model.dpb[0].feature.cpu().clone()))
+                     last_qp = qp
+                 results.append(sequence)
+diff --git a/DCVC-family/DCVC-RT/src/models/video_model.py b/DCVC-family/DCVC-RT/src/models/video_model.py
+index 3689390..73200ac 100644
+--- a/DCVC-family/DCVC-RT/src/models/video_model.py
++++ b/DCVC-family/DCVC-RT/src/models/video_model.py
+@@ -299,20 +299,24 @@ class DMC(CompressionModel):
+         self.max_dpb_size = 1
+         self.curr_poc = 0
+         self._encode_graph = InferenceGraph()
++        self._tail_graph = InferenceGraph()
+         graph_setting = os.getenv("DCVC_INT16_CUDA_GRAPH", "0").strip().lower()
+         self._encode_graph_mode = "encoder" if graph_setting in {"1", "true", "yes", "on"} \
+-            else "feature" if graph_setting == "feature" else "off"
++            else graph_setting if graph_setting in {"feature", "full", "stages"} else "off"
+
+     def _apply(self, fn, recurse=True):
+         self._encode_graph.clear()
++        self._tail_graph.clear()
+         return super()._apply(fn, recurse)
+
+     def _load_from_state_dict(self, *args, **kwargs):
+         self._encode_graph.clear()
++        self._tail_graph.clear()
+         return super()._load_from_state_dict(*args, **kwargs)
+
+     def prepare_int16_inference(self):
+         self._encode_graph.clear()
++        self._tail_graph.clear()
+         self.encoder.fuse_conv1()
+         prepare_model_int16_convs(self)
+         prepare_feature_param_int16(self, "q_encoder", self.q_encoder)
+@@ -390,6 +394,22 @@ class DMC(CompressionModel):
+         y, z_hat, z_hat_write = self._encode_latents(x, ctx, q_encoder)
+         return ctx, ctx_t, y, z_hat, z_hat_write
+
++    def _encode_prior(self, y, z_hat, ctx_t):
++        params = self.res_prior_param_decoder(z_hat, ctx_t)
++        return self.compress_prior_2x(y, params, self.y_spatial_prior)
++
++    def _encode_gpu(self, feature, q_feature, x, q_encoder, q_decoder):
++        ctx, ctx_t, y, z_hat, z_hat_write = self._extract_and_encode(
++            feature, q_feature, x, q_encoder
++        )
++        y0, y1, s0, s1, y_hat = self._encode_prior(y, z_hat, ctx_t)
++        ref_feature = self.decoder(y_hat, ctx, q_decoder)
++        return z_hat_write, y0, y1, s0, s1, ref_feature
++
++    def _encode_tail(self, y, z_hat, ctx_t, ctx, q_decoder):
++        y0, y1, s0, s1, y_hat = self._encode_prior(y, z_hat, ctx_t)
++        return y0, y1, s0, s1, self.decoder(y_hat, ctx, q_decoder)
++
+     def compress(self, x, qp):
+         # pic_width and pic_height may be different from x's size. x here is after padding
+         # x_hat has the same size with x
+@@ -414,7 +434,17 @@ class DMC(CompressionModel):
+             not self.training and not torch.is_grad_enabled() and \
+             int16_inference_enabled() and feature.is_cuda and feature.dtype == torch.int16 and \
+             not torch.cuda.is_current_stream_capturing()
+-        if use_graph and self._encode_graph_mode == "encoder":
++        if use_graph and self._encode_graph_mode == "full":
++            z_hat_write, y_q_w_0, y_q_w_1, s_w_0, s_w_1, graph_feature = self._encode_graph(
++                self._encode_gpu, feature, q_feature, x, q_encoder, q_decoder
++            )
++            cuda_event_z_ready = torch.cuda.Event()
++            cuda_event_z_ready.record()
++            cuda_event_y_ready = cuda_event_z_ready
++            # The DPB owns its feature; graph replay must not overwrite a saved
++            # reference or a reference held by a caller across compress() calls.
++            feature = graph_feature.clone()
++        elif use_graph and self._encode_graph_mode in {"encoder", "stages"}:
+             ctx, ctx_t, y, z_hat, z_hat_write = self._encode_graph(
+                 self._extract_and_encode, feature, q_feature, x, q_encoder
+             )
+@@ -425,15 +455,21 @@ class DMC(CompressionModel):
+             ctx, ctx_t, y, z_hat, z_hat_write = self._extract_and_encode(
+                 feature, q_feature, x, q_encoder
+             )
+-        cuda_event_z_ready = torch.cuda.Event()
+-        cuda_event_z_ready.record()
+-        params = self.res_prior_param_decoder(z_hat, ctx_t)
+-        y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
+-            self.compress_prior_2x(y, params, self.y_spatial_prior)
+-
+-        cuda_event_y_ready = torch.cuda.Event()
+-        cuda_event_y_ready.record()
+-        feature = self.decoder(y_hat, ctx, q_decoder)
++        if not (use_graph and self._encode_graph_mode == "full"):
++            cuda_event_z_ready = torch.cuda.Event()
++            cuda_event_z_ready.record()
++            if use_graph and self._encode_graph_mode == "stages":
++                y_q_w_0, y_q_w_1, s_w_0, s_w_1, graph_feature = self._tail_graph(
++                    self._encode_tail, y, z_hat, ctx_t, ctx, q_decoder
++                )
++                cuda_event_y_ready = torch.cuda.Event()
++                cuda_event_y_ready.record()
++                feature = graph_feature.clone()
++            else:
++                y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = self._encode_prior(y, z_hat, ctx_t)
++                cuda_event_y_ready = torch.cuda.Event()
++                cuda_event_y_ready.record()
++                feature = self.decoder(y_hat, ctx, q_decoder)
+
+         cuda_stream = self.get_cuda_stream(device=device, priority=-1)
+         with torch.cuda.stream(cuda_stream):

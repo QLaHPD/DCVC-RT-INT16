@@ -1,0 +1,90 @@
+diff --git a/DCVC-family/DCVC-RT/src/models/entropy_models.py b/DCVC-family/DCVC-RT/src/models/entropy_models.py
+index cdc199e..631f0a1 100644
+--- a/DCVC-family/DCVC-RT/src/models/entropy_models.py
++++ b/DCVC-family/DCVC-RT/src/models/entropy_models.py
+@@ -1,4 +1,5 @@
+ import math
++import os
+
+ import torch
+ import numpy as np
+@@ -16,6 +17,45 @@ class EntropyCoder():
+         from MLCodec_extensions_cpp import RansEncoder, RansDecoder
+         self.encoder = RansEncoder()
+         self.decoder = RansDecoder()
++        self._async_transfers = int16_inference_enabled() and \
++            os.getenv("DCVC_INT16_ASYNC_ENTROPY", "0").lower() in {"1", "true", "yes", "on"}
++        self._host_buffers = []
++        self._pending_transfers = []
++        self._transfer_done = None
++        self._transfer_stream = None
++
++    def _queue_symbols(self, kind, symbols, params):
++        if self._pending_transfers and self._transfer_stream.device != symbols.device:
++            raise ValueError("One entropy transfer batch must use one CUDA device")
++        slot = len(self._pending_transfers)
++        if slot == len(self._host_buffers):
++            self._host_buffers.append(None)
++        host = self._host_buffers[slot]
++        if host is None or host.dtype != symbols.dtype or host.numel() < symbols.numel():
++            host = torch.empty(symbols.numel(), dtype=symbols.dtype, pin_memory=True)
++            self._host_buffers[slot] = host
++        host = host[:symbols.numel()]
++        stream = torch.cuda.current_stream(symbols.device)
++        if self._transfer_done is None or self._transfer_stream.device != symbols.device:
++            self._transfer_done = torch.cuda.Event()
++        if self._pending_transfers and stream != self._transfer_stream:
++            self._transfer_done.record(self._transfer_stream)
++            stream.wait_event(self._transfer_done)
++        host.copy_(symbols.reshape(-1), non_blocking=True)
++        self._transfer_stream = stream
++        # Retain the GPU source until DMA completes, including temporary Y indexes.
++        self._pending_transfers.append((kind, host, params, symbols))
++
++    def _finish_transfers(self):
++        if not self._pending_transfers:
++            return
++        self._transfer_done.record(self._transfer_stream)
++        self._transfer_done.synchronize()
++        for kind, host, params, _source in self._pending_transfers:
++            # Native enqueue copies into owned vectors before returning. The
++            # pinned arrays can therefore be reused after this frame's flush.
++            getattr(self.encoder, "encode_" + kind)(host.numpy(), *params)
++        self._pending_transfers.clear()
+
+     @staticmethod
+     def pmf_to_quantized_cdf(pmf, precision=16):
+@@ -35,6 +75,11 @@ class EntropyCoder():
+         return cdf
+
+     def reset(self):
++        if self._pending_transfers:
++            # Cancel an unfinished frame without reusing a buffer still in flight.
++            self._transfer_done.record(self._transfer_stream)
++            self._transfer_done.synchronize()
++            self._pending_transfers.clear()
+         self.encoder.reset()
+
+     def add_cdf(self, cdf, cdf_length, offset):
+@@ -46,13 +91,21 @@ class EntropyCoder():
+     def encode_y(self, symbols, cdf_group_index):
+         # symbols: int16, high 8 bits: int8 symbol to be encoded; low 8 bits: uint8 index to use
+         assert symbols.dtype == torch.int16
++        if self._async_transfers and symbols.is_cuda:
++            self._queue_symbols("y", symbols, (cdf_group_index,))
++            return
+         self.encoder.encode_y(symbols.cpu().numpy(), cdf_group_index)
+
+     def encode_z(self, symbols, cdf_group_index, start_offset, per_channel_size):
++        if self._async_transfers and symbols.is_cuda:
++            self._queue_symbols("z", symbols.to(torch.int8),
++                                (cdf_group_index, start_offset, per_channel_size))
++            return
+         self.encoder.encode_z(symbols.to(torch.int8).cpu().numpy(),
+                               cdf_group_index, start_offset, per_channel_size)
+
+     def flush(self):
++        self._finish_transfers()
+         self.encoder.flush()
+
+     def get_encoded_stream(self):

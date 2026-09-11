@@ -97,6 +97,16 @@ See [CUDA Graph measurements and checks](OPTIMIZATION_20260911.md) before enabli
 it on another GPU. Add `DCVC_INT16_CUDA_GRAPH=1` alongside your existing environment
 variables; no native extension rebuild is required for this change.
 
+Optional `DCVC_INT16_FAST_INPUT=1` speeds up frame preparation for INT16 `encode`
+and `stream`. It replaces CPU chroma interpolation and per-frame floating-point
+normalization with exact lookup-table conversion, nearest-neighbor chroma
+replication, and reusable pinned upload buffers. It preserves the existing
+float32-to-float16-to-INT16 rounding and edge padding. Add it alongside
+`DCVC_USE_INT16=1`; it works with or without CUDA Graphs and is off by default.
+The measured gain with the encoder graph enabled was **5.5%** on the longer Jetson
+pipeline benchmark. See [input, transfer, and graph experiments](PIPELINE_OPTIMIZATION_20260911.md)
+for measurements, exact-output checks, and the alternatives that were rejected.
+
 ### Multi-GPU execution
 
 Encoding and decoding use file-level data parallelism. Each worker owns a complete model instance, selects one logical CUDA device before loading that model, and processes a whole video on that device. Videos never migrate between GPUs, and the codec arithmetic and bitstream syntax are unchanged.
