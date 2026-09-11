@@ -34,10 +34,10 @@ data:
       path: /mnt/raid0/PROJECTS/vimeo90K
   validation_fraction: 0.05
   resize_short_edge: 320
-  batch_per_gpu: 1
-  num_workers: 2
+  batch_per_gpu: 8
+  num_workers: 8
 optimizer:
-  accumulation_steps: 4
+  accumulation_steps: 1
   gradient_clip: 0.1
   activation_checkpointing: true
 quantization:
@@ -117,6 +117,6 @@ validation:
   actual_bitstreams: true
   reset_interval: 32
 output:
-  root: ../../runs/tiny_vimeo
+  root: ../../runs/tiny_vimeo_b8
   checkpoint_every_steps: 500
   log_every_steps: 20
