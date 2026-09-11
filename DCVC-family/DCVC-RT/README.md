@@ -195,6 +195,15 @@ To compress every `.webp`, `.jpg`, `.jpeg`, and `.png` in each selected channel 
 
 Each image keeps its exact dimensions and is stored as `<original-name>_qI45.dcvci`, containing one SPS and one I-frame. The phase has its own resumable `.thumbnail-progress.jsonl`, commits outputs atomically, and round-trip decodes each result before it becomes eligible for cleanup. It loads only the image model and defaults to one thumbnail worker per selected GPU; use `--thumbnail_workers` to override that count. In the tested INT16 checkpoint, QP 45 is a practical default and quality degraded above QP 47, so higher values print a warning.
 
+With `DCVC_INT16_AUTOTUNE=1`, each thumbnail worker benchmarks new kernel shapes
+only while encoding and verifying its first image. Later images reuse cached
+tiles; unseen shapes use the default 32-column tile without timing trials. This
+avoids repeated tuning when thumbnails have different dimensions. Autotuning
+tests individual convolution kernels, not whole images or CUDA Graphs. A failed
+encoding attempt also ends that worker's tuning window; failures before image
+loading completes do not. Every image still receives its round-trip decode check,
+and video autotuning keeps its normal per-shape behavior.
+
 When this mode is active, validated original thumbnail files join the same cleanup approval as the source videos. `--keep-originals` retains both. Shared workers defer thumbnails; after every `--shared-work` peer exits, run one ordinary encode pass with the thumbnail options to encode them, build the final inventory, and offer cleanup.
 
 Decode one archived thumbnail to PNG:

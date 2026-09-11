@@ -17,6 +17,7 @@ from PIL import Image
 
 from src.cli.progress import append_progress_log
 from src.layers.cuda_inference import replicate_pad
+from src.layers.int16_inference import residual_autotune_scope
 from src.models.image_model import DMCI
 from src.utils.common import load_model_for_inference, set_torch_env
 from src.utils.stream_helper import (
@@ -371,19 +372,26 @@ def encode_thumbnail(task: ThumbnailTask, model: DMCI):
         {**_done_record(task), "status": "started", "recovered": False},
         THUMBNAIL_PROGRESS_FILENAME,
     )
-    data = _serialize_intra(model, task, _load_image_tensor(task, next(model.parameters()).device))
-    temporary = Path(task.output_path).with_name(f".{Path(task.output_path).name}.verify.{os.getpid()}")
-    try:
-        _atomic_write(temporary, data)
-        _round_trip_verify(model, temporary, task)
-        if _source_identity(source) != expected:
-            raise RuntimeError(f"thumbnail changed during encoding: {source}")
-        os.replace(temporary, task.output_path)
-    finally:
+    x = _load_image_tensor(task, next(model.parameters()).device)
+    # Each worker retains its model across images/channels. Only its first image
+    # may benchmark new shapes, including shapes used by round-trip verification.
+    # A failed encode attempt also consumes this opportunity to avoid repeated
+    # tuning spikes on a sequence of failures. Pre-load/source failures do not.
+    with residual_autotune_scope(not getattr(model, "_thumbnail_autotune_started", False)):
+        model._thumbnail_autotune_started = True
+        data = _serialize_intra(model, task, x)
+        temporary = Path(task.output_path).with_name(f".{Path(task.output_path).name}.verify.{os.getpid()}")
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+            _atomic_write(temporary, data)
+            _round_trip_verify(model, temporary, task)
+            if _source_identity(source) != expected:
+                raise RuntimeError(f"thumbnail changed during encoding: {source}")
+            os.replace(temporary, task.output_path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
     append_progress_log(output_dir, _done_record(task), THUMBNAIL_PROGRESS_FILENAME)
 
 

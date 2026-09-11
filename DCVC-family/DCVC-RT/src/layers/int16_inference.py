@@ -1,4 +1,6 @@
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional
 
 import torch
@@ -51,6 +53,7 @@ except Exception:  # pylint: disable=W0718
 _BOOL_TRUE = {"1", "true", "yes", "on"}
 _AUTOTUNE_RESIDUAL = os.getenv("DCVC_INT16_AUTOTUNE", "0").strip().lower() in _BOOL_TRUE
 _RESIDUAL_TILES = {}
+_ALLOW_RESIDUAL_AUTOTUNE = ContextVar("allow_residual_autotune", default=True)
 _WSILU_LUTS = {}
 _PRIOR_LUTS = {}
 _SCALE_INDEX_LUTS = {}
@@ -325,12 +328,27 @@ def conv2d_residual_module_int16(x, conv, residual):
     return add_tensors_int16(conv2d_module_int16(x, conv), residual)
 
 
+@contextmanager
+def residual_autotune_scope(allow_new_shapes):
+    """Reuse cached tiles while optionally suppressing measurements of new shapes."""
+    token = _ALLOW_RESIDUAL_AUTOTUNE.set(
+        _ALLOW_RESIDUAL_AUTOTUNE.get() and allow_new_shapes
+    )
+    try:
+        yield
+    finally:
+        _ALLOW_RESIDUAL_AUTOTUNE.reset(token)
+
+
 def _residual_tile(x, weight, bias, residual):
     # Timing choices affect scheduling only. Every tile executes the same exact
     # integer arithmetic, including convolution saturation before residual add.
     key = (x.device, tuple(x.shape), tuple(weight.shape), bias is not None)
     if key in _RESIDUAL_TILES:
         return _RESIDUAL_TILES[key]
+    if not _ALLOW_RESIDUAL_AUTOTUNE.get():
+        # Do not cache this fallback: a later video may still tune the shape.
+        return 32
     with torch.cuda.device(x.device):
         if torch.cuda.is_current_stream_capturing():
             return 32
