@@ -1,11 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from .common_model import CompressionModel
+from ..layers.cuda_graph import InferenceGraph
 from ..layers.layers import SubpelConv2x, DepthConvBlock, \
     ResidualBlockUpsample, ResidualBlockWithStride2
 from ..layers.cuda_inference import CUSTOMIZED_CUDA_INFERENCE, round_and_to_int8, \
@@ -295,8 +298,20 @@ class DMC(CompressionModel):
         self.dpb = []
         self.max_dpb_size = 1
         self.curr_poc = 0
+        self._feature_graph = InferenceGraph()
+        self._use_feature_graph = os.getenv("DCVC_INT16_CUDA_GRAPH", "0").strip().lower() in \
+            {"1", "true", "yes", "on"}
+
+    def _apply(self, fn, recurse=True):
+        self._feature_graph.clear()
+        return super()._apply(fn, recurse)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._feature_graph.clear()
+        return super()._load_from_state_dict(*args, **kwargs)
 
     def prepare_int16_inference(self):
+        self._feature_graph.clear()
         self.encoder.fuse_conv1()
         prepare_model_int16_convs(self)
         prepare_feature_param_int16(self, "q_encoder", self.q_encoder)
@@ -381,7 +396,12 @@ class DMC(CompressionModel):
             q_feature = self.q_feature[qp:qp+1, :, :, :]
 
         feature = self.apply_feature_adaptor()
-        ctx, ctx_t = self.feature_extractor(feature, q_feature)
+        if self._use_feature_graph and not self.training and not torch.is_grad_enabled() and \
+                int16_inference_enabled() and feature.is_cuda and feature.dtype == torch.int16 and \
+                not torch.cuda.is_current_stream_capturing():
+            ctx, ctx_t = self._feature_graph(self.feature_extractor, feature, q_feature)
+        else:
+            ctx, ctx_t = self.feature_extractor(feature, q_feature)
         y = self.encoder(x, ctx, q_encoder)
 
         hyper_inp = self.pad_for_y(y)

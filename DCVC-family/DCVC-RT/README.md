@@ -82,6 +82,18 @@ default instead of running timing operations. Set the variable alongside
 See [residual fusion measurements](OPTIMIZATION_20260907.md) for validation,
 tile benchmarks, and CUDA Graph evaluation.
 
+Optional `DCVC_INT16_CUDA_GRAPH=1` replays P-frame feature extraction as a CUDA
+Graph when encoding with `DCVC_USE_INT16=1`. It works with both `encode` and
+`stream`, including multiple GPU workers. Each worker keeps one graph for the
+current feature shape and CUDA stream, copies the current reference features and
+QP scale into it, and rebuilds it when the shape changes. First use adds warmup
+and capture overhead; retained graph buffers also use GPU memory. The default is
+off. Decoding and the bitstream format are unchanged, so decoders need no new flag.
+
+See [CUDA Graph measurements and checks](OPTIMIZATION_20260911.md) before enabling
+it on another GPU. Add `DCVC_INT16_CUDA_GRAPH=1` alongside your existing environment
+variables; no native extension rebuild is required for this change.
+
 ### Multi-GPU execution
 
 Encoding and decoding use file-level data parallelism. Each worker owns a complete model instance, selects one logical CUDA device before loading that model, and processes a whole video on that device. Videos never migrate between GPUs, and the codec arithmetic and bitstream syntax are unchanged.
