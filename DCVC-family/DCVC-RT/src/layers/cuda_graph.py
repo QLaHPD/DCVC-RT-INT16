@@ -6,9 +6,10 @@ import torch
 class InferenceGraph:
     """Keep one shape/stream graph; returned tensors live until the next call.
 
-    The caller must consume outputs on the calling stream before replaying and
-    clear this cache when replacing model weights. No CPU work or model state
-    updates may be performed by the captured function.
+    The caller must consume outputs on the calling stream before replaying, and
+    finish any other-stream consumers before the next call or clear. Clear this
+    cache when replacing model weights. No CPU work or model state updates may
+    be performed by the captured function.
     """
 
     def __init__(self):

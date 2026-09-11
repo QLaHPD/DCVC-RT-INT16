@@ -298,20 +298,21 @@ class DMC(CompressionModel):
         self.dpb = []
         self.max_dpb_size = 1
         self.curr_poc = 0
-        self._feature_graph = InferenceGraph()
-        self._use_feature_graph = os.getenv("DCVC_INT16_CUDA_GRAPH", "0").strip().lower() in \
-            {"1", "true", "yes", "on"}
+        self._encode_graph = InferenceGraph()
+        graph_setting = os.getenv("DCVC_INT16_CUDA_GRAPH", "0").strip().lower()
+        self._encode_graph_mode = "encoder" if graph_setting in {"1", "true", "yes", "on"} \
+            else "feature" if graph_setting == "feature" else "off"
 
     def _apply(self, fn, recurse=True):
-        self._feature_graph.clear()
+        self._encode_graph.clear()
         return super()._apply(fn, recurse)
 
     def _load_from_state_dict(self, *args, **kwargs):
-        self._feature_graph.clear()
+        self._encode_graph.clear()
         return super()._load_from_state_dict(*args, **kwargs)
 
     def prepare_int16_inference(self):
-        self._feature_graph.clear()
+        self._encode_graph.clear()
         self.encoder.fuse_conv1()
         prepare_model_int16_convs(self)
         prepare_feature_param_int16(self, "q_encoder", self.q_encoder)
@@ -376,6 +377,19 @@ class DMC(CompressionModel):
             self.dpb[0].frame = frame if frame.dtype == torch.int16 else frame.clamp_(0, 1)
             self.reset_ref_feature()
 
+    def _encode_latents(self, x, ctx, q_encoder):
+        y = self.encoder(x, ctx, q_encoder)
+        z = self.hyper_encoder(self.pad_for_y(y))
+        z_hat, z_hat_write = round_and_to_int8(z)
+        return y, z_hat, z_hat_write
+
+    def _extract_and_encode(self, feature, q_feature, x, q_encoder):
+        # Pure GPU stage. QP scales and the current frame are graph inputs, not
+        # captured constants; DPB mutation and entropy transfers remain outside.
+        ctx, ctx_t = self.feature_extractor(feature, q_feature)
+        y, z_hat, z_hat_write = self._encode_latents(x, ctx, q_encoder)
+        return ctx, ctx_t, y, z_hat, z_hat_write
+
     def compress(self, x, qp):
         # pic_width and pic_height may be different from x's size. x here is after padding
         # x_hat has the same size with x
@@ -396,18 +410,21 @@ class DMC(CompressionModel):
             q_feature = self.q_feature[qp:qp+1, :, :, :]
 
         feature = self.apply_feature_adaptor()
-        if self._use_feature_graph and not self.training and not torch.is_grad_enabled() and \
-                int16_inference_enabled() and feature.is_cuda and feature.dtype == torch.int16 and \
-                not torch.cuda.is_current_stream_capturing():
-            ctx, ctx_t = self._feature_graph(self.feature_extractor, feature, q_feature)
+        use_graph = self._encode_graph_mode != "off" and \
+            not self.training and not torch.is_grad_enabled() and \
+            int16_inference_enabled() and feature.is_cuda and feature.dtype == torch.int16 and \
+            not torch.cuda.is_current_stream_capturing()
+        if use_graph and self._encode_graph_mode == "encoder":
+            ctx, ctx_t, y, z_hat, z_hat_write = self._encode_graph(
+                self._extract_and_encode, feature, q_feature, x, q_encoder
+            )
+        elif use_graph:
+            ctx, ctx_t = self._encode_graph(self.feature_extractor, feature, q_feature)
+            y, z_hat, z_hat_write = self._encode_latents(x, ctx, q_encoder)
         else:
-            ctx, ctx_t = self.feature_extractor(feature, q_feature)
-        y = self.encoder(x, ctx, q_encoder)
-
-        hyper_inp = self.pad_for_y(y)
-
-        z = self.hyper_encoder(hyper_inp)
-        z_hat, z_hat_write = round_and_to_int8(z)
+            ctx, ctx_t, y, z_hat, z_hat_write = self._extract_and_encode(
+                feature, q_feature, x, q_encoder
+            )
         cuda_event_z_ready = torch.cuda.Event()
         cuda_event_z_ready.record()
         params = self.res_prior_param_decoder(z_hat, ctx_t)
@@ -434,6 +451,8 @@ class DMC(CompressionModel):
         # frame's feature adaptor is therefore ordered after this decoder work
         # without a device-wide host barrier.  Entropy work is already complete
         # here because get_encoded_stream() follows its blocking CPU transfers.
+        # This also finishes the entropy stream's use of graph-owned Z symbols
+        # before the next compress() can overwrite or release graph buffers.
         self.add_ref_frame(feature, None)
         return {
             'bit_stream': bit_stream,
