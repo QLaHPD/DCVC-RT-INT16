@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .common_model import CompressionModel
+from .architecture import VideoArchitecture
 from ..layers.cuda_graph import InferenceGraph
 from ..layers.layers import SubpelConv2x, DepthConvBlock, \
     ResidualBlockUpsample, ResidualBlockWithStride2
@@ -31,17 +32,16 @@ g_ch_d = 256
 
 
 class FeatureExtractor(nn.Module):
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        config = VideoArchitecture.from_dict(config)
+        g_ch_d, g_ch_y = config.channels, config.latent_channels
+        g_ch_z, g_ch_recon = config.hyper_channels, config.recon_channels
         self.conv1 = nn.Sequential(
-            DepthConvBlock(g_ch_d, g_ch_d),
-            DepthConvBlock(g_ch_d, g_ch_d),
+            *[DepthConvBlock(g_ch_d, g_ch_d) for _ in range(config.feature_blocks_1)],
         )
         self.conv2 = nn.Sequential(
-            DepthConvBlock(g_ch_d, g_ch_d),
-            DepthConvBlock(g_ch_d, g_ch_d),
-            DepthConvBlock(g_ch_d, g_ch_d),
-            DepthConvBlock(g_ch_d, g_ch_d),
+            *[DepthConvBlock(g_ch_d, g_ch_d) for _ in range(config.feature_blocks_2)],
         )
 
     def forward(self, x, quant):
@@ -63,19 +63,24 @@ class FeatureExtractor(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        config = VideoArchitecture.from_dict(config)
+        g_ch_d, g_ch_y = config.channels, config.latent_channels
+        g_ch_z, g_ch_recon = config.hyper_channels, config.recon_channels
         self.conv1 = nn.Conv2d(g_ch_src_d, g_ch_d, 1)
         self.conv2 = nn.Sequential(
             DepthConvBlock(g_ch_d * 2, g_ch_d),
-            DepthConvBlock(g_ch_d, g_ch_d),
+            *[DepthConvBlock(g_ch_d, g_ch_d) for _ in range(config.encoder_blocks - 1)],
         )
         self.conv3 = DepthConvBlock(g_ch_d, g_ch_d)
         self.down = nn.Conv2d(g_ch_d, g_ch_y, 3, stride=2, padding=1)
 
+        self.channels = g_ch_d
         self.fuse_conv1_flag = False
 
     def fuse_conv1(self):
+        g_ch_d = self.channels
         if self.fuse_conv1_flag:
             return
         fuse_weight1 = torch.matmul(
@@ -124,13 +129,15 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        config = VideoArchitecture.from_dict(config)
+        g_ch_d, g_ch_y = config.channels, config.latent_channels
+        g_ch_z, g_ch_recon = config.hyper_channels, config.recon_channels
         self.up = SubpelConv2x(g_ch_y, g_ch_d, 3, padding=1)
         self.conv1 = nn.Sequential(
             DepthConvBlock(g_ch_d * 2, g_ch_d),
-            DepthConvBlock(g_ch_d, g_ch_d),
-            DepthConvBlock(g_ch_d, g_ch_d),
+            *[DepthConvBlock(g_ch_d, g_ch_d) for _ in range(config.decoder_blocks - 1)],
         )
         self.conv2 = nn.Conv2d(g_ch_d, g_ch_d, 1)
 
@@ -164,13 +171,14 @@ class Decoder(nn.Module):
 
 
 class ReconGeneration(nn.Module):
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        config = VideoArchitecture.from_dict(config)
+        g_ch_d, g_ch_y = config.channels, config.latent_channels
+        g_ch_z, g_ch_recon = config.hyper_channels, config.recon_channels
         self.conv = nn.Sequential(
             DepthConvBlock(g_ch_d,     g_ch_recon),
-            DepthConvBlock(g_ch_recon, g_ch_recon),
-            DepthConvBlock(g_ch_recon, g_ch_recon),
-            DepthConvBlock(g_ch_recon, g_ch_recon),
+            *[DepthConvBlock(g_ch_recon, g_ch_recon) for _ in range(config.recon_blocks - 1)],
         )
         self.head = nn.Conv2d(g_ch_recon, g_ch_src_d, 1)
 
@@ -191,10 +199,10 @@ class ReconGeneration(nn.Module):
         return out
 
     def forward_cuda(self, x, quant_step):
-        out = self.conv[0](x)
-        out = self.conv[1](out)
-        out = self.conv[2](out)
-        out = self.conv[3](out, quant_step=quant_step)
+        out = x
+        for block in self.conv[:-1]:
+            out = block(out)
+        out = self.conv[-1](out, quant_step=quant_step)
         out = F.conv2d(out, self.head.weight)
         return bias_pixel_shuffle_8(out, self.head.bias)
 
@@ -205,8 +213,11 @@ class ReconGeneration(nn.Module):
 
 
 class HyperEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        config = VideoArchitecture.from_dict(config)
+        g_ch_d, g_ch_y = config.channels, config.latent_channels
+        g_ch_z, g_ch_recon = config.hyper_channels, config.recon_channels
         self.conv = nn.Sequential(
             DepthConvBlock(g_ch_y, g_ch_z),
             ResidualBlockWithStride2(g_ch_z, g_ch_z),
@@ -220,8 +231,11 @@ class HyperEncoder(nn.Module):
 
 
 class HyperDecoder(nn.Module):
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        config = VideoArchitecture.from_dict(config)
+        g_ch_d, g_ch_y = config.channels, config.latent_channels
+        g_ch_z, g_ch_recon = config.hyper_channels, config.recon_channels
         self.conv = nn.Sequential(
             ResidualBlockUpsample(g_ch_z, g_ch_z),
             ResidualBlockUpsample(g_ch_z, g_ch_z),
@@ -235,12 +249,13 @@ class HyperDecoder(nn.Module):
 
 
 class PriorFusion(nn.Module):
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        config = VideoArchitecture.from_dict(config)
+        g_ch_d, g_ch_y = config.channels, config.latent_channels
+        g_ch_z, g_ch_recon = config.hyper_channels, config.recon_channels
         self.conv = nn.Sequential(
-            DepthConvBlock(g_ch_y * 3, g_ch_y * 3),
-            DepthConvBlock(g_ch_y * 3, g_ch_y * 3),
-            DepthConvBlock(g_ch_y * 3, g_ch_y * 3),
+            *[DepthConvBlock(g_ch_y * 3, g_ch_y * 3) for _ in range(config.fusion_blocks)],
             nn.Conv2d(g_ch_y * 3, g_ch_y * 3, 1),
         )
 
@@ -251,11 +266,14 @@ class PriorFusion(nn.Module):
 
 
 class SpatialPrior(nn.Module):
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        config = VideoArchitecture.from_dict(config)
+        g_ch_d, g_ch_y = config.channels, config.latent_channels
+        g_ch_z, g_ch_recon = config.hyper_channels, config.recon_channels
         self.conv = nn.Sequential(
             DepthConvBlock(g_ch_y * 4, g_ch_y * 3),
-            DepthConvBlock(g_ch_y * 3, g_ch_y * 3),
+            *[DepthConvBlock(g_ch_y * 3, g_ch_y * 3) for _ in range(config.spatial_blocks - 1)],
             nn.Conv2d(g_ch_y * 3, g_ch_y * 2, 1),
         )
 
@@ -273,22 +291,26 @@ class RefFrame():
 
 
 class DMC(CompressionModel):
-    def __init__(self):
+    def __init__(self, config=None):
+        config = VideoArchitecture.from_dict(config)
+        g_ch_d, g_ch_y = config.channels, config.latent_channels
+        g_ch_z, g_ch_recon = config.hyper_channels, config.recon_channels
         super().__init__(z_channel=g_ch_z, extra_qp=extra_qp)
+        self.architecture = config
         self.qp_shift = qp_shift
 
         self.feature_adaptor_i = DepthConvBlock(g_ch_src_d, g_ch_d)
         self.feature_adaptor_p = nn.Conv2d(g_ch_d, g_ch_d, 1)
-        self.feature_extractor = FeatureExtractor()
+        self.feature_extractor = FeatureExtractor(config)
 
-        self.encoder = Encoder()
-        self.hyper_encoder = HyperEncoder()
-        self.hyper_decoder = HyperDecoder()
+        self.encoder = Encoder(config)
+        self.hyper_encoder = HyperEncoder(config)
+        self.hyper_decoder = HyperDecoder(config)
         self.temporal_prior_encoder = ResidualBlockWithStride2(g_ch_d, g_ch_y * 2)
-        self.y_prior_fusion = PriorFusion()
-        self.y_spatial_prior = SpatialPrior()
-        self.decoder = Decoder()
-        self.recon_generation_net = ReconGeneration()
+        self.y_prior_fusion = PriorFusion(config)
+        self.y_spatial_prior = SpatialPrior(config)
+        self.decoder = Decoder(config)
+        self.recon_generation_net = ReconGeneration(config)
 
         self.q_encoder = nn.Parameter(torch.ones((self.get_qp_num() + extra_qp, g_ch_d, 1, 1)))
         self.q_decoder = nn.Parameter(torch.ones((self.get_qp_num() + extra_qp, g_ch_d, 1, 1)))

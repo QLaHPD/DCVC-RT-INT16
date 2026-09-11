@@ -32,3 +32,5 @@ DCVC-family/DCVC-RT/benchmarks/optimization_*/
 DCVC-family/DCVC-RT/benchmarks/fixtures/
 DCVC-family/DCVC-RT/benchmarks/results/
 DCVC-family/DCVC-RT/benchmarks/pipeline_recheck*/
+DCVC-family/DCVC-RT/runs/
+DCVC-family/DCVC-RT/data/training/

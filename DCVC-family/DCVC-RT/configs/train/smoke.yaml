@@ -1,0 +1,91 @@
+# Small CUDA correctness run; this does not produce a useful compression model.
+version: 1
+task: pair
+seed: 0
+device: cuda
+model:
+  image:
+    channels: 16
+    latent_channels: 16
+    hyper_channels: 16
+    encoder_blocks: 1
+    decoder_blocks: 1
+    fusion_blocks: 1
+    spatial_blocks: 1
+  video:
+    channels: 16
+    recon_channels: 16
+    latent_channels: 16
+    hyper_channels: 16
+    feature_blocks_1: 1
+    feature_blocks_2: 1
+    encoder_blocks: 1
+    decoder_blocks: 1
+    recon_blocks: 1
+    fusion_blocks: 1
+    spatial_blocks: 1
+data:
+  manifest: ../../data/training/manifest.jsonl
+  cache_root: ../../data/training/cache
+  sources:
+  - type: frame_sequences
+    path: /path/to/at-least-two/frame-sequences
+  validation_fraction: 0.1
+  batch_per_gpu: 1
+  num_workers: 2
+optimizer:
+  accumulation_steps: 1
+  gradient_clip: 0.1
+  activation_checkpointing: false
+quantization:
+  feature_scale: 512
+  weight_scale: 8192
+  force_zero_thres: null
+loss:
+  image_lambdas:
+  - 10
+  - 2048
+  video_lambdas:
+  - 1
+  - 768
+  yuv_weight: 0.8
+stages:
+- name: image_smoke
+  model: image
+  mode: int16
+  epochs: 1
+  lr: 0.0001
+  min_lr: 1.0e-05
+  crop_size:
+  - 64
+  - 64
+  sequence_length: 1
+  temporal_gradient_length: 1
+  samples_per_epoch: 10
+  max_steps: 2
+- name: video_smoke
+  model: video
+  mode: int16
+  epochs: 1
+  lr: 0.0001
+  min_lr: 1.0e-05
+  crop_size:
+  - 64
+  - 64
+  sequence_length: 4
+  temporal_gradient_length: 2
+  samples_per_epoch: 10
+  max_steps: 2
+validation:
+  qps:
+  - 0
+  - 63
+  every_steps: 2
+  max_samples: 1
+  max_frames: 6
+  actual_bitstreams: true
+  reset_interval: 3
+output:
+  root: ../../runs/smoke
+  checkpoint_every_steps: 1
+  log_every_steps: 1

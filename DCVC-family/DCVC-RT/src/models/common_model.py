@@ -151,7 +151,7 @@ class CompressionModel(nn.Module):
         return mask
 
     def get_mask_4x(self, batch, channel, height, width, dtype, device):
-        curr_mask_str = f"{batch}_{channel}_{width}_{height}_4x"
+        curr_mask_str = f"{batch}_{channel}_{width}_{height}_{dtype}_{device}_4x"
         with torch.no_grad():
             if curr_mask_str not in self.masks:
                 assert channel % 4 == 0
@@ -170,7 +170,7 @@ class CompressionModel(nn.Module):
         return self.masks[curr_mask_str]
 
     def get_mask_2x(self, batch, channel, height, width, dtype, device):
-        curr_mask_str = f"{batch}_{channel}_{width}_{height}_2x"
+        curr_mask_str = f"{batch}_{channel}_{width}_{height}_{dtype}_{device}_2x"
         with torch.no_grad():
             if curr_mask_str not in self.masks:
                 assert channel % 2 == 0

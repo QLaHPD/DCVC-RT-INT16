@@ -139,9 +139,9 @@ def load_decoder_models(
 ) -> DecoderModels:
     set_torch_env()
     device = torch.device(device)
-    i_frame_net = load_model_for_inference(DMCI(), model_path_i, device, force_zero_thres)
+    i_frame_net = load_model_for_inference(DMCI, model_path_i, device, force_zero_thres)
     p_frame_net = (
-        load_model_for_inference(DMC(), model_path_p, device, force_zero_thres)
+        load_model_for_inference(DMC, model_path_p, device, force_zero_thres)
         if load_p_model else None
     )
     return DecoderModels(i_frame_net=i_frame_net, p_frame_net=p_frame_net, device=device)

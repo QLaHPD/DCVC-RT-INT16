@@ -64,6 +64,19 @@ def build_parser() -> argparse.ArgumentParser:
     configure_cleanup_parser(cleanup_parser)
     cleanup_parser.set_defaults(handler=run_cleanup)
 
+    from src.cli.training_workflow import (
+        configure_train_parser, configure_data_parser, configure_export_parser,
+        run_train, run_data, run_export,
+    )
+    for command, help_text, configure, handler in (
+        ("train", "Train or fine-tune configurable DCVC-RT models", configure_train_parser, run_train),
+        ("prepare-training-data", "Index source-disjoint datasets and cache original video frames", configure_data_parser, run_data),
+        ("export-model", "Export models and reproducible prepared INT16 state", configure_export_parser, run_export),
+    ):
+        subparser = subparsers.add_parser(command, help=help_text)
+        configure(subparser)
+        subparser.set_defaults(handler=handler)
+
     return parser
 
 

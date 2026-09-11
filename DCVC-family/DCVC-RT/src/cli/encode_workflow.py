@@ -455,8 +455,8 @@ class NeuralEncoder:
         set_torch_env()
         self.device = device
         self.cfg = cfg
-        self.i_net = load_model_for_inference(DMCI(), model_i_path, device, cfg.force_zero_thres)
-        self.p_net = load_model_for_inference(DMC(), model_p_path, device, cfg.force_zero_thres)
+        self.i_net = load_model_for_inference(DMCI, model_i_path, device, cfg.force_zero_thres)
+        self.p_net = load_model_for_inference(DMC, model_p_path, device, cfg.force_zero_thres)
 
     @staticmethod
     def _black_frame_yuv420p(width: int, height: int) -> Tuple[bytes, bytes, bytes]:

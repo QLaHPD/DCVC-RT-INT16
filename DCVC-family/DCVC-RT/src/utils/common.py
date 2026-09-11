@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 
 import json
+import hashlib
 import os
 import threading
 from unittest.mock import patch
@@ -44,14 +45,29 @@ def create_folder(path, print_if_create=False):
             print(f"created folder: {path}")
 
 
-def get_state_dict(ckpt_path):
-    ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=True)
+def checkpoint_state_dict(ckpt):
     if "state_dict" in ckpt:
         ckpt = ckpt['state_dict']
     if "net" in ckpt:
         ckpt = ckpt["net"]
     consume_prefix_in_state_dict_if_present(ckpt, prefix="module.")
     return ckpt
+
+
+def get_state_dict(ckpt_path):
+    return checkpoint_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+
+
+def checkpoint_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def architecture_sha256(metadata):
+    return hashlib.sha256(json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def get_int16_prep_path(ckpt_path):
@@ -87,13 +103,31 @@ def save_int16_prep_state(ckpt_path, prep_state):
 
 
 def load_model_for_inference(model, ckpt_path, device, force_zero_thres=None):
-    state_dict = get_state_dict(ckpt_path)
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    metadata = checkpoint.get("architecture")
+    # Accept a class to avoid constructing a full default model before reading
+    # a smaller checkpoint. Existing callers passing an instance still work.
+    if isinstance(model, type) or metadata is not None:
+        from ..models.architecture import model_from_metadata
+        name = model.__name__ if isinstance(model, type) else type(model).__name__
+        if name not in {"DMCI", "DMC"}:
+            raise ValueError(f"architecture metadata is not supported for {name}")
+        model = model_from_metadata(metadata, "image" if name == "DMCI" else "video")
+    state_dict = checkpoint_state_dict(checkpoint)
+    binding = None if metadata is None else {
+        "checkpoint_sha256": checkpoint_sha256(ckpt_path),
+        "architecture_sha256": architecture_sha256(metadata),
+    }
     if int16_inference_enabled() and torch.device(device).type == "cuda":
         model = model.eval().float()
         model.load_state_dict(state_dict)
         if hasattr(model, "prepare_int16_inference"):
             model.prepare_int16_inference()
         prep_state = load_int16_prep_state(ckpt_path)
+        if binding is not None and (prep_state is None or prep_state.get("binding") != binding):
+            # Metadata-bearing exports may never consume unbound/old weights.
+            # Rebuild deterministically from the checkpoint on cache mismatch.
+            prep_state = None
         prep_state_is_current = prep_state is not None and prep_state.get("version", 0) >= INT16_PREP_VERSION
         if prep_state_is_current:
             if "int16_luts" in prep_state:
@@ -107,7 +141,10 @@ def load_model_for_inference(model, ckpt_path, device, force_zero_thres=None):
         needs_save = prep_state is None or prep_state.get("version", 0) < INT16_PREP_VERSION or \
             "int16_model_state" not in prep_state or "int16_luts" not in prep_state
         if needs_save and hasattr(model, "export_int16_prep"):
-            save_int16_prep_state(ckpt_path, model.export_int16_prep())
+            prepared = model.export_int16_prep()
+            if binding is not None:
+                prepared.update(version=4, binding=binding)
+            save_int16_prep_state(ckpt_path, prepared)
         return model.to(device).eval()
 
     device = torch.device(device)

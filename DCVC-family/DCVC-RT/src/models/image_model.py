@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 
 from .common_model import CompressionModel
+from .architecture import ImageArchitecture
 from ..layers.layers import DepthConvBlock, ResidualBlockUpsample, ResidualBlockWithStride2
 from ..layers.cuda_inference import CUSTOMIZED_CUDA_INFERENCE, round_and_to_int8
 from ..layers.int16_inference import FEATURE_SCALE, apply_module_int16, feature_to_float, \
@@ -18,17 +19,14 @@ g_ch_enc_dec = 368
 
 
 class IntraEncoder(nn.Module):
-    def __init__(self, N):
+    def __init__(self, N, config=None):
         super().__init__()
+        config = ImageArchitecture.from_dict(config)
+        g_ch_enc_dec = config.channels
 
         self.enc_1 = DepthConvBlock(g_ch_src, g_ch_enc_dec)
         self.enc_2 = nn.Sequential(
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
+            *[DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec) for _ in range(config.encoder_blocks)],
             nn.Conv2d(g_ch_enc_dec, N, 3, stride=2, padding=1),
         )
 
@@ -58,23 +56,14 @@ class IntraEncoder(nn.Module):
 
 
 class IntraDecoder(nn.Module):
-    def __init__(self, N):
+    def __init__(self, N, config=None):
         super().__init__()
+        config = ImageArchitecture.from_dict(config)
+        g_ch_enc_dec = config.channels
 
         self.dec_1 = nn.Sequential(
             ResidualBlockUpsample(N, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
-            DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec),
+            *[DepthConvBlock(g_ch_enc_dec, g_ch_enc_dec) for _ in range(config.decoder_blocks)],
         )
         self.dec_2 = DepthConvBlock(g_ch_enc_dec, g_ch_src)
 
@@ -94,19 +83,10 @@ class IntraDecoder(nn.Module):
         return out
 
     def forward_cuda(self, x, quant_step):
-        out = self.dec_1[0](x)
-        out = self.dec_1[1](out)
-        out = self.dec_1[2](out)
-        out = self.dec_1[3](out)
-        out = self.dec_1[4](out)
-        out = self.dec_1[5](out)
-        out = self.dec_1[6](out)
-        out = self.dec_1[7](out)
-        out = self.dec_1[8](out)
-        out = self.dec_1[9](out)
-        out = self.dec_1[10](out)
-        out = self.dec_1[11](out)
-        out = self.dec_1[12](out, quant_step=quant_step)
+        out = x
+        for block in self.dec_1[:-1]:
+            out = block(out)
+        out = self.dec_1[-1](out, quant_step=quant_step)
         out = self.dec_2(out)
         out = F.pixel_shuffle(out, 8)
         return out
@@ -120,10 +100,18 @@ class IntraDecoder(nn.Module):
 
 
 class DMCI(CompressionModel):
-    def __init__(self, N=256, z_channel=128):
+    def __init__(self, N=None, z_channel=None, config=None):
+        config = ImageArchitecture.from_dict(config)
+        if N is not None or z_channel is not None:
+            from dataclasses import replace
+            config = replace(config,
+                             latent_channels=config.latent_channels if N is None else N,
+                             hyper_channels=config.hyper_channels if z_channel is None else z_channel)
+        N, z_channel, g_ch_enc_dec = config.latent_channels, config.hyper_channels, config.channels
         super().__init__(z_channel=z_channel)
+        self.architecture = config
 
-        self.enc = IntraEncoder(N)
+        self.enc = IntraEncoder(N, config)
 
         self.hyper_enc = nn.Sequential(
             DepthConvBlock(N, z_channel),
@@ -139,8 +127,7 @@ class DMCI(CompressionModel):
 
         self.y_prior_fusion = nn.Sequential(
             DepthConvBlock(N, N * 2),
-            DepthConvBlock(N * 2, N * 2),
-            DepthConvBlock(N * 2, N * 2),
+            *[DepthConvBlock(N * 2, N * 2) for _ in range(config.fusion_blocks - 1)],
             nn.Conv2d(N * 2, N * 2 + 2, 1),
         )
 
@@ -149,13 +136,11 @@ class DMCI(CompressionModel):
         self.y_spatial_prior_adaptor_2 = DepthConvBlock(N * 2, N * 2, force_adaptor=True)
         self.y_spatial_prior_adaptor_3 = DepthConvBlock(N * 2, N * 2, force_adaptor=True)
         self.y_spatial_prior = nn.Sequential(
-            DepthConvBlock(N * 2, N * 2),
-            DepthConvBlock(N * 2, N * 2),
-            DepthConvBlock(N * 2, N * 2),
+            *[DepthConvBlock(N * 2, N * 2) for _ in range(config.spatial_blocks)],
             nn.Conv2d(N * 2, N * 2, 1),
         )
 
-        self.dec = IntraDecoder(N)
+        self.dec = IntraDecoder(N, config)
 
         self.q_scale_enc = nn.Parameter(torch.ones((self.get_qp_num(), g_ch_enc_dec, 1, 1)))
         self.q_scale_dec = nn.Parameter(torch.ones((self.get_qp_num(), g_ch_enc_dec, 1, 1)))

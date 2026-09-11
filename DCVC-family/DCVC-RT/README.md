@@ -6,6 +6,15 @@ It is intended for long-running, headless video compression where encoded video,
 
 ## Main modifications
 
+### Configurable model training
+
+`main.py train --config configs/train/base.yaml` trains configurable image/I-frame
+and video/P-frame models, including exact INT16 forward computation with
+surrogate gradients. Configs control widths, block counts, datasets and staged
+schedules. Prepared datasets, resumable training, single-node DDP, real-bitstream
+validation and model export use the same CLI. See [training instructions](docs/TRAINING.md)
+and the short [CUDA smoke recipe](configs/train/smoke.yaml).
+
 ### Deterministic INT16 execution
 
 Set `DCVC_USE_INT16=1` to enable the integer runtime:
@@ -143,7 +152,7 @@ See [docs/MANAGED_ARCHIVE.md](docs/MANAGED_ARCHIVE.md) for operating details.
 
 The [DCVC-RT paper](https://openaccess.thecvf.com/content/CVPR2025/html/Jia_Towards_Practical_Real-Time_Neural_Video_Compression_CVPR_2025_paper.html) introduces the neural architecture, implicit temporal modeling, low-resolution latent representation, module-bank rate control, and training-free 16-bit model integerization. This fork retains those upstream models and checkpoints.
 
-The fork does **not** retrain the network or claim a new rate-distortion result. Its integer scales follow the paper's integerization design, while the concrete PyTorch conversion/cache code, CUDA arithmetic, extension loader, fused operations, exact-output tests, FFmpeg/Opus frontend, TUI, and archival lifecycle are implementation and deployment work beyond what the paper specifies.
+The existing pretrained checkpoints remain the inference defaults; this fork does not claim a new rate-distortion result. Optional training now supports configurable architectures and INT16-aware fine-tuning. Its integer scales follow the paper's integerization design, while the training implementation, PyTorch conversion/cache code, CUDA arithmetic, extension loader, fused operations, exact-output tests, FFmpeg/Opus frontend, TUI, and archival lifecycle extend what the paper specifies.
 
 Important compatibility distinction:
 

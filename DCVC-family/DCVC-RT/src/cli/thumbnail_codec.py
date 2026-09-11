@@ -422,7 +422,7 @@ def thumbnail_worker_entry(
         device = torch.device(f"cuda:{index}")
     else:
         device = torch.device("cpu")
-    model = load_model_for_inference(DMCI(), model_path_i, device, force_zero_thres)
+    model = load_model_for_inference(DMCI, model_path_i, device, force_zero_thres)
     progress_queue.put({"type": "worker_hello", "wid": wid, "pid": os.getpid(), "device": str(device)})
 
     while not stop_event.is_set() and not STOP_FLAG:

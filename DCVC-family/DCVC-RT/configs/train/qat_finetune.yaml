@@ -1,0 +1,106 @@
+# Fine-tune matching pretrained I/P checkpoints with exact INT16 forward values.
+version: 1
+task: pair
+seed: 0
+device: cuda
+model:
+  image:
+    channels: 368
+    latent_channels: 256
+    hyper_channels: 128
+    encoder_blocks: 6
+    decoder_blocks: 12
+    fusion_blocks: 3
+    spatial_blocks: 3
+  video:
+    channels: 256
+    recon_channels: 320
+    latent_channels: 128
+    hyper_channels: 128
+    feature_blocks_1: 2
+    feature_blocks_2: 4
+    encoder_blocks: 2
+    decoder_blocks: 3
+    recon_blocks: 4
+    fusion_blocks: 3
+    spatial_blocks: 2
+  init_image: ../../checkpoints/cvpr2025_image.pth.tar
+  init_video: ../../checkpoints/cvpr2025_video.pth.tar
+data:
+  manifest: ../../data/training/manifest.jsonl
+  cache_root: ../../data/training/cache
+  sources:
+  - type: images
+    path: /path/to/training/images
+  - type: frame_sequences
+    path: /path/to/vimeo/sequences
+  - type: frame_sequences
+    path: /path/to/long/sequences
+  validation_fraction: 0.1
+  batch_per_gpu: 1
+  num_workers: 2
+optimizer:
+  accumulation_steps: 4
+  gradient_clip: 0.1
+  activation_checkpointing: true
+quantization:
+  feature_scale: 512
+  weight_scale: 8192
+  force_zero_thres: null
+loss:
+  image_lambdas:
+  - 10
+  - 2048
+  video_lambdas:
+  - 1
+  - 768
+  yuv_weight: 0.8
+stages:
+- name: image_int16
+  model: image
+  mode: int16
+  epochs: 5
+  lr: 1.0e-05
+  min_lr: 1.0000000000000002e-06
+  crop_size:
+  - 256
+  - 256
+  sequence_length: 1
+  temporal_gradient_length: 1
+- name: video_int16
+  model: video
+  mode: int16
+  epochs: 5
+  lr: 1.0e-05
+  min_lr: 1.0000000000000002e-06
+  crop_size:
+  - 256
+  - 256
+  sequence_length: 7
+  temporal_gradient_length: 6
+- name: video_long_int16
+  model: video
+  mode: int16
+  epochs: 2
+  lr: 1.0e-06
+  min_lr: 1.0e-07
+  crop_size:
+  - 256
+  - 256
+  sequence_length: 65
+  temporal_gradient_length: 8
+validation:
+  qps:
+  - 0
+  - 21
+  - 42
+  - 63
+  every_steps: 500
+  max_samples: 8
+  max_frames: 65
+  actual_bitstreams: true
+  reset_interval: 32
+output:
+  root: ../../runs/qat_finetune
+  checkpoint_every_steps: 100
+  log_every_steps: 10
