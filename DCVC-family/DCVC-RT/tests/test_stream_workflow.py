@@ -5,12 +5,14 @@ import os
 import queue
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
+import src.cli.encode_workflow as encode_core
 from src.cli.encode_workflow import EncoderCfg, append_progress_log, write_bytes_final
 from src.cli.stream_workflow import (
     RemoteMedia,
@@ -74,6 +76,29 @@ class FakeNeuralEncoder:
 
 
 class StreamWorkflowTests(unittest.TestCase):
+    def test_completed_subprocesses_release_pipes_and_tracking(self):
+        tracked_before = list(encode_core.CHILD_PROCS)
+        fd_directory = Path("/proc/self/fd")
+        descriptors_before = len(list(fd_directory.iterdir())) if fd_directory.is_dir() else None
+
+        for _ in range(64):
+            proc = encode_core.popen_command(
+                [sys.executable, "-c", "pass"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            proc.wait()
+            encode_core.kill_popen(proc)
+            self.assertTrue(proc.stdin.closed)
+            self.assertTrue(proc.stdout.closed)
+            self.assertTrue(proc.stderr.closed)
+
+        self.assertEqual(encode_core.CHILD_PROCS, tracked_before)
+        if descriptors_before is not None:
+            descriptors_after = len(list(fd_directory.iterdir()))
+            self.assertLessEqual(descriptors_after, descriptors_before + 2)
+
     def test_mixed_channel_ids_and_id_files_preserve_order_and_deduplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

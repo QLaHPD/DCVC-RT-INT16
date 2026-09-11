@@ -55,6 +55,7 @@ os.environ.setdefault("PYTHONWARNINGS", "ignore")
 
 
 CHILD_PROCS: List[subprocess.Popen] = []
+CHILD_PROCS_LOCK = threading.Lock()
 TMP_RAM_PATHS: List[Path] = []
 STOP_FLAG = False
 SHARED_ARTIFACT_REFRESH_SECONDS = 300.0
@@ -132,19 +133,44 @@ def safe_unlink(path: Path):
 
 
 def kill_popen(proc: Optional[subprocess.Popen]):
+    if proc is None:
+        return
     try:
-        if proc and proc.poll() is None:
+        if proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(timeout=1.0)
             except Exception:
                 proc.kill()
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
     except Exception:
         pass
+    finally:
+        closed = set()
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(proc, stream_name, None)
+            if stream is None or id(stream) in closed:
+                continue
+            closed.add(id(stream))
+            try:
+                stream.close()
+            except Exception:
+                pass
+        with CHILD_PROCS_LOCK:
+            try:
+                CHILD_PROCS.remove(proc)
+            except ValueError:
+                pass
 
 
 def kill_all_children():
-    for proc in CHILD_PROCS:
+    with CHILD_PROCS_LOCK:
+        processes = list(CHILD_PROCS)
+        CHILD_PROCS.clear()
+    for proc in processes:
         kill_popen(proc)
 
 
@@ -203,15 +229,18 @@ def shared_stage_path(channel_out: Path, video_id: str, token: str, suffix: str)
 
 
 def run_command(cmd: List[str]) -> Tuple[int, str, str]:
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    CHILD_PROCS.append(proc)
-    out, err = proc.communicate()
-    return proc.returncode, out, err
+    proc = popen_command(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = proc.communicate()
+        return proc.returncode, out, err
+    finally:
+        kill_popen(proc)
 
 
 def popen_command(cmd: List[str], **kwargs) -> subprocess.Popen:
     proc = subprocess.Popen(cmd, **kwargs)
-    CHILD_PROCS.append(proc)
+    with CHILD_PROCS_LOCK:
+        CHILD_PROCS.append(proc)
     return proc
 
 
@@ -265,7 +294,10 @@ def encode_audio_opus_from_file_to_temp(video_path: str, tmp_out_file: Path, bit
         str(tmp_out_file),
     ]
     proc = popen_command(ff, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    rc = proc.wait()
+    try:
+        rc = proc.wait()
+    finally:
+        kill_popen(proc)
     if rc != 0:
         safe_unlink(tmp_out_file)
         raise RuntimeError(f"ffmpeg opus failed rc={rc}")

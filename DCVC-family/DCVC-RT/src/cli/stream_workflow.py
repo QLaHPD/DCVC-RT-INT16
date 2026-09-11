@@ -153,8 +153,11 @@ def _run_ytdlp(executable: str, arguments: Sequence[str]) -> Tuple[int, str, str
         stderr=subprocess.PIPE,
         text=True,
     )
-    stdout, stderr = proc.communicate()
-    return proc.returncode, stdout, stderr
+    try:
+        stdout, stderr = proc.communicate()
+        return proc.returncode, stdout, stderr
+    finally:
+        encode_core.kill_popen(proc)
 
 
 def _entry_webpage_url(entry: Dict, source_url: str) -> Optional[str]:
