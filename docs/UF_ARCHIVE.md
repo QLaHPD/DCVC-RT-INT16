@@ -30,7 +30,10 @@ two simultaneous HT-S workers exceeded its RAM during validation, even at 144p.
 Failed jobs retain their originals and can be retried with fewer workers.
 `--qp_i` and `--qp_p` are aliases for `--qi` and `--qp`.
 
-INT16 input decoding uses `--input_threads 2` and `--prefetch_frames 8` by default.
+INT16 input decoding defaults to up to four threads per worker and
+`--prefetch_frames 8`. The thread budget uses the process's available CPUs,
+divides them among `--procs`, reserves one CPU per worker for neural dispatch,
+and clamps decoder threads to 1–4. An explicit `--input_threads` overrides it.
 FP16 retains its previous defaults of one decoder thread and no read-ahead.
 The bounded read-ahead queue overlaps CPU input decoding with neural encoding.
 Queued YUV444 arrays are capped at 8 MiB, or one frame if a single frame exceeds

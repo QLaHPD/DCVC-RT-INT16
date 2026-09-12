@@ -36,6 +36,8 @@ class IntegerModel:
                                values[f'tables.{kind}_lengths'].numpy(), index)
         if not hasattr(self.coder.decoder, 'get_decoded_tensor'):
             raise RuntimeError('Rebuild UF entropy extension: integer decoder needs get_decoded_tensor')
+        self._position_shape = None
+        self._positions = None
         self.clear_dpb()
 
     def clear_dpb(self):
@@ -64,6 +66,17 @@ class IntegerModel:
     def _indexes(self, scales):
         return ops.lookup(scales, self.layers.values['tables.scale_index'])
 
+    def _mask_positions(self, shape):
+        if self._position_shape != tuple(shape):
+            m = self.model
+            masks = (m.get_mask_2x(*shape, self.device) if self.variant == 'ld'
+                     else m.get_mask_4x(*shape, self.device))
+            # Boolean indexing resolves nonzero positions and synchronizes on
+            # every use. Retain only one shape's ordered flat indexes.
+            self._positions = tuple(mask.reshape(-1).nonzero().flatten() for mask in masks)
+            self._position_shape = tuple(shape)
+        return self._positions
+
     def _prior(self, y, params, qp, image, encode):
         m, run = self.model, self.layers
         if image:
@@ -76,12 +89,11 @@ class IntegerModel:
         if encode:
             y = ops.multiply(y, q_enc)
         shape = scales.shape
-        masks = (m.get_mask_2x(*shape, self.device) if self.variant == 'ld'
-                 else m.get_mask_4x(*shape, self.device))
+        positions = self._mask_positions(shape)
         reduced = run(m.y_spatial_prior_reduction, params) if self.variant != 'ld' else None
         restored = torch.zeros(shape, dtype=torch.int16, device=self.device)
         pending = []
-        for part, mask in enumerate(masks):
+        for part, position in enumerate(positions):
             if part:
                 if self.variant == 'ld':
                     means = run(m.y_spatial_prior, restored, params)
@@ -92,16 +104,18 @@ class IntegerModel:
                         scales, means = next_params.chunk(2, dim=1)
                     else:
                         means = run(m.y_spatial_prior, run(adaptor, restored, reduced))
-            index = self._indexes(scales[mask])
+            index = self._indexes(scales.reshape(-1).index_select(0, position))
+            selected_means = means.reshape(-1).index_select(0, position).long()
             if encode:
-                residual = y[mask].long() - means[mask].long()
+                residual = y.reshape(-1).index_select(0, position).long() - selected_means
                 symbols = ops.divide_round(residual, ops.FEATURE_SCALE).clamp(-128, 127).to(torch.int8)
                 packed = (symbols.to(torch.int16) << 8) | index.to(torch.int16)
                 pending.append(packed.cpu().numpy().copy())
             else:
                 self.coder.decoder.decode_y(index.cpu().numpy())
                 symbols = torch.from_numpy(self.coder.decoder.get_decoded_tensor()).to(self.device)
-            restored[mask] = ops.saturate(symbols.long()*ops.FEATURE_SCALE + means[mask].long())
+            restored.view(-1).index_copy_(0, position,
+                ops.saturate(symbols.long()*ops.FEATURE_SCALE + selected_means))
         return ops.multiply(restored, q_dec), pending
 
     def _params(self, z, qp, height, width):

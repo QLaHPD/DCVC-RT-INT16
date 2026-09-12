@@ -1,6 +1,7 @@
 """Bounded FFmpeg pipes and metadata helpers for UF archive inputs."""
 
 import json
+import os
 from fractions import Fraction
 from pathlib import Path
 import subprocess
@@ -12,6 +13,15 @@ import numpy as np
 
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.ts'}
+
+
+def decoder_thread_budget(workers=1):
+    """Leave a CPU per worker for neural dispatch; cap FFmpeg at four threads."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    return max(1, min(4, cpus // max(1, workers) - 1))
 
 
 def probe(path):

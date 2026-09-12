@@ -11,7 +11,8 @@ import sys
 import tempfile
 import time
 
-from src.archive.media import VIDEO_EXTENSIONS, FrameReader, dimensions, encode_audio, probe, verify_audio
+from src.archive.media import (VIDEO_EXTENSIONS, FrameReader, decoder_thread_budget,
+                               dimensions, encode_audio, probe, verify_audio)
 from src.archive.storage import (SharedWorkPool, Heartbeat, atomic_json, bundle_path, event,
                                  identity, load_bundle, sha256, sync_directory)
 
@@ -95,12 +96,17 @@ def discover(args):
     output = Path(args.output_root).resolve()
     jobs = []
     integer = getattr(args, 'runtime', 'fp16') == 'int16'
+    input_threads = getattr(args, 'input_threads', None)
+    if input_threads is None:
+        input_threads = decoder_thread_budget(getattr(args, 'procs', 1)) if integer else 1
+    prefetch_frames = getattr(args, 'prefetch_frames', None)
+    if prefetch_frames is None:
+        prefetch_frames = 8 if integer else 0
     for source in sorted(set(sources)):
         relative = source.relative_to(base)
         final = output / relative.parent / (source.name + '.uf')
         jobs.append({'source': str(source), 'relative': str(relative), 'final': str(final),
-                     'input_threads': getattr(args, 'input_threads', 2 if integer else 1),
-                     'prefetch_frames': getattr(args, 'prefetch_frames', 8 if integer else 0)})
+                     'input_threads': input_threads, 'prefetch_frames': prefetch_frames})
     return jobs
 
 

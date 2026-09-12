@@ -58,6 +58,7 @@ __global__ void general(int16_t* out, const int16_t* x, const int16_t* weight,
     out[index]=finish(sum,bias?bias[oc]:0);
 }
 
+template<int A_PADDING=0, int TILE_N=32, int TILE_K=32>
 static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tensor& weights,
     const c10::optional<torch::Tensor>& bias, int sh,int sw,int ph,int pw,int groups,bool use_mma) {
     TORCH_CHECK(input.is_cuda() && weights.device()==input.device(), "CUDA device mismatch");
@@ -86,12 +87,12 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
     bool point=kh==1 && kw==1 && sh==1 && sw==1 && ph==0 && pw==0;
     int64_t reduction=static_cast<int64_t>(ci)*kh*kw;
     if(use_mma && groups==1 && reduction<=32768) {
-        dim3 grid((oh*ow+31)/32,(co+63)/64,x.size(0));
+        dim3 grid((oh*ow+TILE_N-1)/TILE_N,(co+63)/64,x.size(0));
         if(point)
-            uf_mma_conv<true><<<grid,128,0,stream>>>(out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),
+            uf_mma_conv<true,A_PADDING,TILE_N,TILE_K><<<grid,128,0,stream>>>(out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),
                 weight.data_ptr<int16_t>(),ptr,co,oh*ow,reduction,h,w,ow,kh,kw,sh,sw,ph,pw);
         else
-            uf_mma_conv<false><<<grid,128,0,stream>>>(out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),
+            uf_mma_conv<false,A_PADDING,TILE_N,TILE_K><<<grid,128,0,stream>>>(out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),
                 weight.data_ptr<int16_t>(),ptr,co,oh*ow,reduction,h,w,ow,kh,kw,sh,sw,ph,pw);
     } else if(point && groups==1)
         pointwise<<<dim3((h*w+15)/16,(co+15)/16,x.size(0)),dim3(16,16),0,stream>>>(
@@ -105,9 +106,22 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
 
 torch::Tensor uf_conv(const torch::Tensor& x,const torch::Tensor& w,
     const c10::optional<torch::Tensor>& b,int sh,int sw,int ph,int pw,int g) {
+    if(x.dim()==4 && w.dim()==4 && w.size(2)==1 && w.size(3)==1 &&
+       sh==1 && sw==1 && ph==0 && pw==0 && g==1) {
+        // Wider spatial tiles reuse weights on large, exactly tiled planes.
+        // Otherwise reduce barrier frequency with 64-element K tiles.
+        const int64_t spatial=x.size(2)*x.size(3);
+        if(spatial>=256 && spatial%64==0 && x.size(1)<=1024 && w.size(0)<=x.size(1))
+            return uf_conv_impl<16,64,32>(x,w,b,sh,sw,ph,pw,g,true);
+        return uf_conv_impl<16,32,64>(x,w,b,sh,sw,ph,pw,g,true);
+    }
     return uf_conv_impl(x,w,b,sh,sw,ph,pw,g,true);
 }
 torch::Tensor uf_conv_generic(const torch::Tensor& x,const torch::Tensor& w,
     const c10::optional<torch::Tensor>& b,int sh,int sw,int ph,int pw,int g) {
     return uf_conv_impl(x,w,b,sh,sw,ph,pw,g,false);
+}
+torch::Tensor uf_conv_baseline(const torch::Tensor& x,const torch::Tensor& w,
+    const c10::optional<torch::Tensor>& b,int sh,int sw,int ph,int pw,int g) {
+    return uf_conv_impl(x,w,b,sh,sw,ph,pw,g,true);
 }

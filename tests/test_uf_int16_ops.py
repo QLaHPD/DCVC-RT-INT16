@@ -112,6 +112,22 @@ class CudaIntegerTests(unittest.TestCase):
             self.assertTrue(torch.equal(reference, native.conv2d(*args).cpu()))
             self.assertTrue(torch.equal(reference, native.conv2d_generic(*args).cpu()))
 
+    def test_tiled_pointwise_matches_cpu_and_original_mma(self):
+        import uf_int16_cuda as native
+        torch.manual_seed(91)
+        # Exercise both spatial tiling and deeper K tiling, with partial K/M
+        # tiles, odd spatial tails and two batches.
+        for shape, co in (((1,35,16,16),19), ((2,35,16,16),19),
+                          ((1,67,3,7),71), ((1,128,1,1),17)):
+            for bound in (90,32768):
+                x=torch.randint(-bound,bound,shape,dtype=torch.int16)
+                w=torch.randint(-bound,bound,(co,shape[1],1,1),dtype=torch.int16)
+                b=torch.arange(co,dtype=torch.int16)
+                reference=ops.conv2d_reference(x,w,b)
+                args=(x.cuda(),w.cuda(),b.cuda(),1,1,0,0,1)
+                self.assertTrue(torch.equal(reference,native.conv2d(*args).cpu()))
+                self.assertTrue(torch.equal(reference,native.conv2d_baseline(*args).cpu()))
+
 
 if __name__ == '__main__':
     unittest.main()

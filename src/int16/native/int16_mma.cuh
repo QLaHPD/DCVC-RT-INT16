@@ -37,13 +37,13 @@ __device__ int16_t uf_mma_input(const int16_t* x,int batch,int k,int n,int K,
     return x[((static_cast<int64_t>(batch)*(K/area)+k/area)*H+y)*W+col];
 }
 
-template<bool POINTWISE>
+template<bool POINTWISE, int A_PADDING=0, int TILE_N=32, int TILE_K=32>
 __global__ __launch_bounds__(128) void uf_mma_conv(int16_t* out,const int16_t* x,
     const int16_t* weight,const int16_t* bias,int M,int N,int K,int H,int W,int OW,
     int KH,int KW,int SH,int SW,int PH,int PW) {
-    constexpr int BM=64, BN=32, BK=32;
+    constexpr int BM=64, BN=TILE_N, BK=TILE_K;
 #if __CUDA_ARCH__ >= 800
-    __shared__ __align__(4) int16_t a_tile[BM][BK];
+    __shared__ __align__(4) int16_t a_tile[BM][BK+A_PADDING];
     __shared__ __align__(4) int16_t b_tile[BN][BK+2];
     const int tid=threadIdx.x,warp=tid/32,lane=tid%32;
     const int group=lane/4,quad=lane%4,m0=blockIdx.y*BM,n0=blockIdx.x*BN;
@@ -60,19 +60,22 @@ __global__ __launch_bounds__(128) void uf_mma_conv(int16_t* out,const int16_t* x
             b_tile[i%BN][i/BN]=(k<K && n<N)?uf_mma_input<POINTWISE>(x,blockIdx.z,k,n,K,H,W,OW,KH,KW,SH,SW,PH,PW):0;
         }
         __syncthreads();
+        #pragma unroll
+        for(int slice=0;slice<BK;slice+=32) {
         uint32_t al[4],ah[4];
         #pragma unroll
         for(int r=0;r<4;++r)
-            uf_split(&a_tile[warp*16+group+(r%2)*8][quad*4+(r/2)*16],al[r],ah[r]);
+            uf_split(&a_tile[warp*16+group+(r%2)*8][slice+quad*4+(r/2)*16],al[r],ah[r]);
         #pragma unroll
         for(int tile=0;tile<BN/8;++tile) {
             uint32_t bl[2],bh[2];
             #pragma unroll
-            for(int r=0;r<2;++r) uf_split(&b_tile[tile*8+group][quad*4+r*16],bl[r],bh[r]);
+            for(int r=0;r<2;++r) uf_split(&b_tile[tile*8+group][slice+quad*4+r*16],bl[r],bh[r]);
             uf_mma_bytes<false,false>(ll[tile],al,bl);
             uf_mma_bytes<true,false>(cross[tile],ah,bl);
             uf_mma_bytes<false,true>(cross[tile],al,bh);
             uf_mma_bytes<true,true>(hh[tile],ah,bh);
+        }
         }
         __syncthreads();
     }

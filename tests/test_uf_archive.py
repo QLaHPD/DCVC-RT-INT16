@@ -10,7 +10,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from src.archive.media import FrameReader, dimensions, probe
+from src.archive.media import FrameReader, decoder_thread_budget, dimensions, probe
 from src.archive.storage import SharedWorkPool, load_bundle, sha256
 from src.archive.workflow import discover, encode_job, run_cleanup
 
@@ -118,7 +118,8 @@ class ArchiveTests(unittest.TestCase):
 
     def test_input_defaults_preserve_fp16_and_allow_explicit_limits(self):
         import main
-        cases = [('fp16', [], (1, 0)), ('int16', [], (2, 8)),
+        cases = [('fp16', [], (1, 0)), ('int16', [], (4, 8)),
+                 ('int16', ['--procs', '3'], (1, 8)),
                  ('int16', ['--input_threads', '1', '--prefetch_frames', '0'], (1, 0))]
         for runtime, extra, expected in cases:
             captured = []
@@ -127,9 +128,18 @@ class ArchiveTests(unittest.TestCase):
                 return 0
             argv = ['main.py', 'encode', '--input_file', str(self.source),
                     '--output_root', str(self.root/'output'), '--runtime', runtime, *extra]
-            with patch('main.run_encode', run), patch('sys.argv', argv):
+            with patch('main.run_encode', run), patch('sys.argv', argv), \
+                 patch('src.archive.media.os.sched_getaffinity', return_value=set(range(6)), create=True):
                 self.assertEqual(main.main(), 0)
             self.assertEqual(captured, [expected])
+
+    def test_decoder_budget_respects_available_cpus_and_workers(self):
+        for cpus, workers, expected in ((6, 1, 4), (6, 3, 1), (32, 5, 4), (2, 1, 1), (1, 8, 1)):
+            with patch('src.archive.media.os.sched_getaffinity', return_value=set(range(cpus)), create=True):
+                self.assertEqual(decoder_thread_budget(workers), expected)
+        with patch('src.archive.media.os.sched_getaffinity', side_effect=OSError, create=True), \
+             patch('src.archive.media.os.cpu_count', return_value=None):
+            self.assertEqual(decoder_thread_budget(), 1)
 
     def test_failure_never_publishes_or_deletes_input(self):
         with patch.object(FakeCodec, 'decode', side_effect=ValueError('bad stream')):

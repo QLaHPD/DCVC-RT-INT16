@@ -38,7 +38,7 @@ def build_parser():
     encode.add_argument('--prepared_p', help='Prepared integer video model/table file')
     encode.add_argument('--procs', type=int, default=1)
     encode.add_argument('--input_threads', type=int,
-                        help='FFmpeg decoder threads per worker (default: INT16 2, FP16 1)')
+                        help='FFmpeg decoder threads per worker (default: INT16 CPU budget, up to 4; FP16 1)')
     encode.add_argument('--prefetch_frames', type=int,
                         help='Read ahead frames (default: INT16 8, FP16 0); queue capped at 8 MiB or one frame')
     encode.add_argument('--cuda_idx', type=int, nargs='+', default=[0])
@@ -84,7 +84,8 @@ def main():
     args = parser.parse_args()
     if args.command == 'encode':
         if args.input_threads is None:
-            args.input_threads = 2 if args.runtime == 'int16' else 1
+            from src.archive.media import decoder_thread_budget
+            args.input_threads = decoder_thread_budget(args.procs) if args.runtime == 'int16' else 1
         if args.prefetch_frames is None:
             args.prefetch_frames = 8 if args.runtime == 'int16' else 0
         if args.device == 'cpu' and args.runtime != 'int16':

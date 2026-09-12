@@ -55,13 +55,14 @@ def main():
             raise RuntimeError(f'integer extension outside UF environment: {origin}')
         if getattr(integer, 'arithmetic_id', None) != ARITHMETIC_ID:
             raise RuntimeError('integer arithmetic version mismatch; rebuild extension')
-        for symbol in ('conv2d', 'conv2d_generic', 'add', 'multiply', 'lookup', 'from_bytes', 'wsilu4'):
+        for symbol in ('conv2d', 'conv2d_generic', 'conv2d_baseline', 'add', 'multiply', 'lookup', 'from_bytes', 'wsilu4'):
             if not hasattr(integer, symbol):
                 raise RuntimeError(f'missing integer API: {symbol}')
         entropy = importlib.import_module('MLCodec_extensions_cpp')
         if not hasattr(entropy.RansDecoder, 'get_decoded_tensor'):
             raise RuntimeError('rebuild entropy extension for integer decoder API')
         print(f'uf_int16_cuda: OK ({origin}); {ARITHMETIC_ID}')
+        print(f'Integer kernel revision: {getattr(integer, "kernel_revision", "legacy")}')
     except (ImportError, RuntimeError, OSError) as exc:
         integer_ready = False
         print(f'uf_int16_cuda: NOT READY ({exc})')

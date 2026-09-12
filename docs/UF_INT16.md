@@ -11,6 +11,21 @@ continue to reconstruct every frame. This optimization preserves prepared
 identities, arithmetic and bitstream bytes. HT-L performance measurements are in
 [the validation report](UF_INT16_VALIDATION.md).
 
+The prior caches ordered tensor positions for the current shape, avoiding
+repeated boolean-index synchronization. Pointwise integer CUDA convolutions
+use wider spatial tiles or deeper reduction tiles to reuse data and reduce
+barriers. Both preserve exact integer arithmetic and existing prepared files.
+After updating from the earlier kernel, rebuild it in the UF environment:
+
+```bash
+MAX_JOBS=1 ./scripts/uf-python -m pip install --no-build-isolation ./src/int16/native
+./scripts/uf-python scripts/check_uf_setup.py
+```
+
+The setup check reports kernel revision `tiled-v2`. No model re-preparation is
+needed. Tile selection was measured on Jetson Orin; its speed benefit on other
+CUDA GPUs remains to be measured.
+
 ## Commands
 
 Build the entropy extension and `src/int16/native` as described in

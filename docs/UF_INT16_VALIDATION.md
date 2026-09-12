@@ -1,6 +1,52 @@
 # UF integer validation on Jetson Orin
 
-## HT-L 144p optimization — 2026-09-12
+## HT-L 144p indexing and CUDA tiles — 2026-09-12
+
+Compared with `07ffd08` using the same initialized HT-L model, QI36/QP30,
+256×144, 300 Bunny frames and one worker. Three runs per mode alternated;
+each encoded bitstream matched the original baseline byte for byte.
+
+| Measurement | Previous code | Cached positions and tiled kernels |
+|---|---:|---:|
+| Full input/encoding pipeline, median FPS | 55.61 | **65.91** |
+| Preloaded input, median codec FPS | 64.50 | **72.23** |
+
+The full pipeline improves by **18.5%** and the preloaded codec by **12.0%**.
+Full-pipeline defaults use two decoder threads in the previous version and
+four here on this six-CPU Jetson; both use eight-frame bounded prefetch.
+The new default divides available CPUs among workers, reserves one CPU per
+worker for neural dispatch, and limits input decoder threads to 1–4.
+Explicit `--input_threads` overrides this. FP16 defaults remain unchanged.
+Encoding FPS excludes model loading and the subsequent validation decode.
+
+The prior caches ordered flat mask positions for one shape, replacing repeated
+boolean indexing with indexed gathers. Pointwise CUDA integer convolutions use
+64-element reduction tiles or wider spatial tiles selected by shape. Generic
+and non-pointwise paths retain their original behavior. Arithmetic, prepared
+identities, artifact naming and entropy-symbol order are unchanged. The final
+300-frame decode matches the original YUV hash below.
+
+A separate CLI run using the new defaults encoded all 300 frames at 64.09 FPS
+and passed full validation with identical compressed bytes and decoded pixels.
+All 23 unit tests passed, including both tile paths, odd reduction tails,
+multi-batch tensors, accumulator limits, mask partition order and CPU budgets.
+HT-L, HT-S and LD passed CPU/CUDA checks against their earlier reference
+reports, including reset states and feature-only encoder parity.
+A 17-frame 720p HT-L CLI run with resets and I-frames every eight frames also
+encoded and validated with the exact earlier bitstream and reconstruction
+hashes. It emitted Jetson NvMap allocation warnings but completed successfully;
+this short test does not establish memory headroom for multiple workers.
+
+Rebuild `src/int16/native` after updating; the setup checker reports `tiled-v2`.
+Existing prepared model files are reused. The indexing and input changes are
+portable; tile heuristics were measured only on this Jetson Orin. Other GPUs
+need their own performance and cross-device consistency checks.
+
+CUDA graph prototypes added cold-start cost and memory pressure for a small
+warm-run gain. An exact four-way INT8 BLAS decomposition was substantially
+slower than the custom kernel. Neither prototype is part of the runtime.
+
+## Earlier HT-L 144p optimization (`07ffd08`) — 2026-09-12
 
 Same Bunny source, INT16 HT-L, QI36/QP30, 256×144 at 30 FPS, all 300 frames,
 one process. Prepared model and arithmetic identities are unchanged.
@@ -15,7 +61,7 @@ same initialized model. Individual optimized runs measured 55.89–56.35 FPS.
 Encoding FPS excludes model loading and the subsequent validation decode. The
 earlier standalone CLI baseline measured 28.85 FPS; the optimized standalone CLI
 measured 55.35 FPS. Four input threads with prefetch measured 57.79 FPS in one
-separate run; two remain the default to limit per-worker CPU usage.
+separate run; that version used two by default to limit per-worker CPU usage.
 
 Measurements separating the causes:
 
