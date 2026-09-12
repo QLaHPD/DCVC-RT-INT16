@@ -12,13 +12,14 @@ import subprocess
 import tempfile
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import torch
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 
 from src.utils.transforms import rgb2ycbcr
 from src.training.video_data import check_source, index_video, load_video_clip
+from src.training.aspect_ratio import nearest_bucket
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
@@ -51,6 +52,9 @@ def atomic_json(path, value):
 def _image_size(path):
     with Image.open(path) as image:
         size = image.size
+        if image.getexif().get(274) in {5, 6, 7, 8}:
+            size = size[::-1]
+    with Image.open(path) as image:
         image.verify()
     if min(size) <= 0:
         raise ValueError(f"invalid image dimensions: {path}")
@@ -353,7 +357,7 @@ def load_frame(record, index):
     path = record["frames"][index]
     if record["format"] == "rgb":
         with Image.open(path) as image:
-            array = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)
+            array = np.array(ImageOps.exif_transpose(image).convert("RGB"), dtype=np.uint8, copy=True)
         rgb = torch.from_numpy(array).permute(2, 0, 1).float().div_(255)
         return rgb2ycbcr(rgb)
     with np.load(path, allow_pickle=False) as values:
@@ -380,8 +384,12 @@ class TrainingDataset(Dataset):
         return self.length
 
     def __getitem__(self, index):
+        if isinstance(index, tuple):
+            index, record_index, bucket = index
+        else:
+            record_index, bucket = index % len(self.records), None
         rng = random.Random(int(digest([self.seed, self.epoch, index, self.stage.name]), 16))
-        record = self.records[index % len(self.records)]
+        record = self.records[record_index]
         count = self.stage.sequence_length
         start = rng.randrange(frame_count(record) - count + 1) if self.split == "train" else 0
         if record["format"] == "video_direct":
@@ -395,6 +403,18 @@ class TrainingDataset(Dataset):
             if target != (h, w):
                 frames = F.interpolate(frames, size=target, mode="bilinear", align_corners=False).clamp(0, 1)
         h, w = self.stage.crop_size
+        if self.stage.crop_buckets is not None:
+            if bucket is None:
+                bucket = nearest_bucket(record["height"], record["width"], self.stage.crop_buckets)
+            h, w = self.stage.crop_buckets[bucket]
+            # Preserve geometry while ensuring the crop is covered. Buckets
+            # replace the legacy edge-padding behavior for undersized images.
+            ih, iw = frames.shape[-2:]
+            scale = max(h / ih, w / iw)
+            target = (max(h, round(ih * scale)), max(w, round(iw * scale)))
+            if target != (ih, iw):
+                frames = F.interpolate(frames, size=target, mode="bilinear", align_corners=False,
+                                       antialias=True).clamp(0, 1)
         # Edge padding matches inference; it never stretches smaller sources.
         frames = F.pad(frames, (0, max(0, w - frames.shape[-1]), 0, max(0, h - frames.shape[-2])),
                        mode="replicate")

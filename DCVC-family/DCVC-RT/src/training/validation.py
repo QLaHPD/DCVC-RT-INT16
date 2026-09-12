@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import torch
+from torch.nn import functional as F
 
 from src.codec.frame_decoder import BitstreamFrameSource, DecoderModels
 from src.models.architecture import create_model
@@ -17,7 +18,7 @@ from src.models.image_model import DMCI
 from src.models.video_model import DMC
 from src.training.checkpoint import load_initial_weights
 from src.training.config import TrainingConfig, StageConfig
-from src.training.data import TrainingDataset, atomic_json, read_manifest, frame_count
+from src.training.data import TrainingDataset, atomic_json, read_manifest, frame_count, load_frame
 from src.training.models import QP_OFFSETS, TrainingModel, distortion
 from src.training.ops import TrainingOps
 from src.utils.common import load_model_for_inference, set_torch_env
@@ -29,6 +30,38 @@ def _shadow(kind, config, path, device):
     load_initial_weights(model, path)
     return TrainingModel(model.to(device).float(), "int16",
                          force_zero_thres=config.quantization.force_zero_thres).eval()
+
+
+def validation_frames(record, stage, config):
+    """Return the scored image region, before codec padding is applied."""
+    if stage.model == "image" and config.validation.image_mode == "full":
+        frames = load_frame(record, 0).unsqueeze(0)
+        h, w = frames.shape[-2:]
+        limit = config.validation.image_max_side
+        if limit is not None and max(h, w) > limit:
+            scale = limit / max(h, w)
+            frames = F.interpolate(frames, size=(max(1, round(h * scale)), max(1, round(w * scale))),
+                                   mode="bilinear", align_corners=False, antialias=True).clamp(0, 1)
+        return frames
+    return TrainingDataset([record], stage, config.data, config.seed, "validation")[0]
+
+
+def pad_for_codec(frames):
+    h, w = frames.shape[-2:]
+    return F.pad(frames, (0, (-w) % 16, 0, (-h) % 16), mode="replicate")
+
+
+def summarize_qps(results):
+    summary = {}
+    for qp in sorted({r["qp"] for r in results}):
+        samples = [r for r in results if r["qp"] == qp]
+        pixels = sum(r["pixel_count"] for r in samples)
+        mse = sum(r["mse"] * r["pixel_count"] for r in samples) / pixels
+        summary[str(qp)] = {"samples": len(samples),
+                            "mean_psnr": sum(r["psnr"] for r in samples) / len(samples),
+                            "pooled_psnr": -10 * math.log10(max(mse, 1e-12)),
+                            "actual_bpp": sum(r["actual_bpp"] * r["pixel_count"] for r in samples) / pixels}
+    return summary
 
 
 @torch.no_grad()
@@ -60,8 +93,9 @@ def validate_actual(config, stage, image_path, video_path=None, device="cuda:0",
     for sample_index, record in enumerate(candidates[:config.validation.max_samples]):
         length = 1 if stage.model == "image" else min(frame_count(record), config.validation.max_frames)
         sample_stage = replace(validation_stage, sequence_length=length)
-        frames = TrainingDataset([record], sample_stage, config.data, config.seed, "validation")[0]
-        height, width = frames.shape[-2:]
+        target_frames = validation_frames(record, sample_stage, config)
+        height, width = target_frames.shape[-2:]
+        frames = pad_for_codec(target_frames)
         for qp in config.validation.qps:
             extension = ".dcvci" if stage.model == "image" else ".bin"
             path = root / f"sample-{sample_index:04d}-q{qp}{extension}"
@@ -84,12 +118,12 @@ def validate_actual(config, stage, image_path, video_path=None, device="cuda:0",
                     shadow = shadow_i if is_i else shadow_p
                     shadow.ops = TrainingOps("int16", force_zero_thres=thres)
                     simulated = shadow(x, current_qp, reference, refresh)
-                    expected.append(simulated["x_hat"].cpu())
+                    expected.append(simulated["x_hat"][..., :height, :width].cpu())
                     estimates.append(float((simulated["bits_y"] + simulated["bits_z"]).sum()))
                     reference = {"x_hat": simulated["x_hat"], "feature": simulated["feature"]}
                     shadow.ops = TrainingOps("float", force_zero_thres=thres)
                     float_result = shadow(x, current_qp, float_reference, refresh)
-                    floating.append(float_result["x_hat"].cpu())
+                    floating.append(float_result["x_hat"][..., :height, :width].cpu())
                     float_reference = {"x_hat": float_result["x_hat"], "feature": float_result["feature"]}
                     if is_i:
                         encoded = native_i.compress(x.half(), current_qp)
@@ -126,19 +160,21 @@ def validate_actual(config, stage, image_path, video_path=None, device="cuda:0",
                     reconstructed.append(image)
             if len(reconstructed) != length:
                 raise RuntimeError("deployment validation decoded the wrong number of frames")
-            target, reconstructed = frames, torch.cat(reconstructed, dim=0)
+            target, reconstructed = target_frames, torch.cat(reconstructed, dim=0)
             mse = float((target - reconstructed).square().mean())
             d = float(distortion(target, reconstructed, config.loss).mean())
             actual_bpp = 8 * path.stat().st_size / (height * width * length)
             endpoints = config.loss.image_lambdas if stage.model == "image" else config.loss.video_lambdas
             lam = math.exp(math.log(endpoints[0]) + qp / 63 * math.log(endpoints[1] / endpoints[0]))
             results.append({"source_id": record["id"], "qp": qp, "frames": length,
+                            "width": width, "height": height, "pixel_count": height * width * length, "mse": mse,
                             "actual_bpp": actual_bpp, "estimated_bpp": sum(estimates) / (height * width * length),
                             "psnr": -10 * math.log10(max(mse, 1e-12)), "distortion": d,
                             "float_to_int16_mse": float((torch.cat(floating) - reconstructed).square().mean()),
                             "rd": actual_bpp + lam * d, "bitstream": str(path)})
     return {"kind": "actual_int16", "score": sum(r["rd"] for r in results) / len(results),
-            "qat_parity": True, "round_trip_exact": True, "results": results}
+            "qat_parity": True, "round_trip_exact": True, "results": results,
+            "per_qp": summarize_qps(results)}
 
 
 @torch.no_grad()
@@ -148,6 +184,17 @@ def validate_estimated(primary, image, config, stage, records, device):
     window = TrainingWindow(primary, stage, config, image).eval()
     dataset = TrainingDataset(records, stage, config.data, config.seed, "validation")
     values = []
+    if stage.model == "image" and config.validation.image_mode == "full":
+        from src.training.models import rd_loss
+        for record in dataset.records[:config.validation.max_samples]:
+            target = validation_frames(record, stage, config).to(device)
+            h, w = target.shape[-2:]
+            for qp in config.validation.qps:
+                result = window.primary(pad_for_codec(target), qp)
+                result["x_hat"] = result["x_hat"][..., :h, :w]
+                loss, _ = rd_loss(target, result, qp, "image", config.loss)
+                values.append(float(loss))
+        return {"kind": "estimated", "score": sum(values) / len(values), "samples": len(values)}
     for index in range(min(len(dataset), config.validation.max_samples)):
         frames = dataset[index].unsqueeze(0).to(device)
         for qp in config.validation.qps:

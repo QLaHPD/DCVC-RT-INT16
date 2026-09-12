@@ -25,6 +25,8 @@ from src.training.checkpoint import (atomic_save, cpu_tree, load_initial_weights
 from src.training.data import TrainingDataset, atomic_json, digest, read_manifest
 from src.training.sequence import TrainingWindow, temporal_windows
 from src.training.validation import run_isolated, validate_estimated
+from src.training.aspect_ratio import AspectRatioBatchSampler
+from src.training.config import TrainingConfig
 
 
 class RemainingBatches:
@@ -39,7 +41,8 @@ class RemainingBatches:
 
 
 def _comparable_config(config):
-    config = dict(config)
+    # Fill newly introduced optional defaults for older checkpoints too.
+    config = TrainingConfig(**config).to_dict()
     # Reporting destinations/frequency may change when resuming. Optimization,
     # source inventory and schedules may not silently change underneath a run.
     config.pop("output", None)
@@ -292,12 +295,16 @@ class Trainer:
         dataset = TrainingDataset(self.records, stage, self.config.data, self.config.seed)
         dataset.epoch = epoch
         generator = torch.Generator().manual_seed(self.config.seed + epoch)
-        if self.distributed:
+        if stage.crop_buckets is not None:
+            batches = AspectRatioBatchSampler(dataset, self.config.data.batch_per_gpu,
+                                               self.world_size, self.rank)
+        elif self.distributed:
             sampler = DistributedSampler(dataset, self.world_size, self.rank, seed=self.config.seed, drop_last=False)
             sampler.set_epoch(epoch)
+            batches = BatchSampler(sampler, self.config.data.batch_per_gpu, drop_last=True)
         else:
             sampler = RandomSampler(dataset, generator=generator)
-        batches = BatchSampler(sampler, self.config.data.batch_per_gpu, drop_last=True)
+            batches = BatchSampler(sampler, self.config.data.batch_per_gpu, drop_last=True)
         total_batches = len(batches)
         if not total_batches:
             raise ValueError("not enough samples for batch_per_gpu; increase stage.samples_per_epoch")

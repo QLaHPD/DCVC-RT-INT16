@@ -97,6 +97,7 @@ class StageConfig:
     temporal_gradient_length: int = 1
     samples_per_epoch: Optional[int] = None
     max_steps: Optional[int] = None
+    crop_buckets: Optional[list] = None
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name:
@@ -114,6 +115,18 @@ class StageConfig:
             positive(size, "stage.crop_size", integer=True)
             if size % 16:
                 raise ValueError("training crop dimensions must be divisible by 16")
+        if self.crop_buckets is not None:
+            if self.model != "image" or not isinstance(self.crop_buckets, list) or not self.crop_buckets:
+                raise ValueError("stage.crop_buckets requires a nonempty list for an image stage")
+            for shape in self.crop_buckets:
+                if not isinstance(shape, (list, tuple)) or len(shape) != 2:
+                    raise ValueError("each crop bucket must be [height, width]")
+                for size in shape:
+                    positive(size, "stage.crop_buckets", integer=True)
+                    if size % 16:
+                        raise ValueError("crop bucket dimensions must be divisible by 16")
+            if len({tuple(shape) for shape in self.crop_buckets}) != len(self.crop_buckets):
+                raise ValueError("crop buckets must be unique")
         positive(self.sequence_length, "stage.sequence_length", integer=True)
         positive(self.temporal_gradient_length, "stage.temporal_gradient_length", integer=True)
         if self.model == "image" and self.sequence_length != 1:
@@ -193,8 +206,16 @@ class ValidationConfig:
     max_frames: int = 65
     actual_bitstreams: bool = True
     reset_interval: int = 32
+    image_mode: str = "crop"
+    image_max_side: Optional[int] = None
 
     def __post_init__(self):
+        if self.image_mode not in {"crop", "full"}:
+            raise ValueError("validation.image_mode must be crop or full")
+        if self.image_max_side is not None:
+            positive(self.image_max_side, "validation.image_max_side", integer=True)
+            if self.image_mode != "full":
+                raise ValueError("validation.image_max_side requires image_mode: full")
         if not self.qps or any(type(q) is not int or not 0 <= q <= 63 for q in self.qps):
             raise ValueError("validation.qps must contain integers in [0, 63]")
         for name in ("every_steps", "max_samples", "max_frames"):

@@ -1,0 +1,63 @@
+# Experimental tiny I-model recipe. Set the image folder before preparing data.
+# A directory is scanned recursively for PNG, JPG/JPEG, WebP, BMP and TIFF.
+version: 1
+task: image
+seed: 0
+device: cuda
+model:
+  image:
+    channels: 96
+    latent_channels: 64
+    hyper_channels: 64
+    encoder_blocks: 2
+    decoder_blocks: 4
+    fusion_blocks: 2
+    spatial_blocks: 2
+data:
+  manifest: ../../data/training/images/manifest.jsonl
+  sources:
+    - type: images
+      path: /path/to/image-dataset
+  validation_fraction: 0.05
+  batch_per_gpu: 8
+  num_workers: 8
+optimizer:
+  accumulation_steps: 1
+  gradient_clip: 0.1
+  activation_checkpointing: true
+loss:
+  image_lambdas: [10, 2048]
+  yuv_weight: 0.8
+stages:
+  - name: image_float
+    model: image
+    mode: float
+    epochs: 30
+    lr: 0.0002
+    min_lr: 0.00002
+    crop_buckets: &image_buckets
+      - [256, 256]  # square
+      - [192, 384]  # 2:1
+      - [224, 304]  # approximately 4:3
+      - [192, 336]  # approximately 16:9
+      - [336, 192]  # approximately 9:16
+    samples_per_epoch: 100000
+  - name: image_int16
+    model: image
+    mode: int16
+    epochs: 5
+    lr: 0.00001
+    min_lr: 0.000001
+    crop_buckets: *image_buckets
+    samples_per_epoch: 100000
+validation:
+  image_mode: full
+  image_max_side: 1024  # proportional downsize only; omit for original resolution
+  qps: [0, 21, 42, 63]
+  every_steps: 2000
+  max_samples: 32
+  actual_bitstreams: true
+output:
+  root: ../../runs/tiny_images
+  checkpoint_every_steps: 500
+  log_every_steps: 20
