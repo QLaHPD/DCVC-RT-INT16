@@ -30,6 +30,15 @@ two simultaneous HT-S workers exceeded its RAM during validation, even at 144p.
 Failed jobs retain their originals and can be retried with fewer workers.
 `--qp_i` and `--qp_p` are aliases for `--qi` and `--qp`.
 
+INT16 input decoding uses `--input_threads 2` and `--prefetch_frames 8` by default.
+FP16 retains its previous defaults of one decoder thread and no read-ahead.
+The bounded read-ahead queue overlaps CPU input decoding with neural encoding.
+Queued YUV444 arrays are capped at 8 MiB, or one frame if a single frame exceeds
+that budget; a producer may hold one additional frame. The encoder's own chunk
+buffers and FFmpeg buffers are separate. Use `--input_threads 1
+--prefetch_frames 0` to minimize input CPU/memory use. These performance settings
+do not change archive compatibility or force re-encoding of completed videos.
+
 `--model_structure hts|htl|ld` selects the model. Checkpoints default to
 `checkpoints/cvpr2026_image.pth.tar` and the corresponding video checkpoint.
 `--model_path_i` and `--model_path_p` override them.

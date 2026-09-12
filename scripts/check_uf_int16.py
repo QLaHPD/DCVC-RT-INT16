@@ -87,6 +87,25 @@ def main():
             packets.append((False, reset, result['bit_stream']))
     del image, video, result
     torch.cuda.empty_cache()
+    # The archive encoder skips P-frame pixels. Compare that actual fast path
+    # against the fully reconstructed encoder before checking fresh decoders.
+    generator.manual_seed(437)
+    image = IntegerModel(data[0], device)
+    video = IntegerModel(data[1], device, reconstruct_on_encode=False)
+    with IntegerOnly():
+        result = image.compress(source(3), 36, 0, 0)
+        if state_record(image, result['x_hat'], result['bit_stream']) != records[0]:
+            raise AssertionError('Feature-only encoder diverged at I-frame')
+        video.add_ref_feature_from_frame(result['x_hat'])
+        for index, reset in enumerate((False, True, False), 1):
+            result = video.compress(source(3 if args.variant=='ld' else 24), 30, reset, 0, 0)
+            actual = state_record(video, result['x_hat'], result['bit_stream'])
+            if result['x_hat'] is not None or any(actual[key] != records[index][key]
+                                                for key in ('bitstream', 'bytes', 'state')):
+                raise AssertionError(f'Feature-only encoder diverged at packet {index}')
+            print(f'feature-only encode: packet {index}, reset={reset}, bytes/state match', flush=True)
+    del image, video, result
+    torch.cuda.empty_cache()
     for backend in ([device, 'cpu'] if args.cpu_reference else [device]):
         image, video = IntegerModel(data[0], backend), IntegerModel(data[1], backend)
         with IntegerOnly():

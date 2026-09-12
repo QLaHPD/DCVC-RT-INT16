@@ -21,9 +21,10 @@ def pad_right_bottom(x, multiple):
 
 
 class IntegerModel:
-    def __init__(self, prepared, device='cuda:0'):
+    def __init__(self, prepared, device='cuda:0', reconstruct_on_encode=True):
         from src.models.entropy_models import EntropyCoder
         self.variant = prepared['variant']
+        self.reconstruct_on_encode = reconstruct_on_encode
         self.device = torch.device(device)
         self.model = make_model(self.variant, meta=True)
         self.layers = Layers(self.model, prepared, self.device)
@@ -116,12 +117,14 @@ class IntegerModel:
         temporal = run(m.temporal_prior_encoder, self.memory, quant)
         return run(m.y_prior_fusion, hyper, temporal)
 
-    def _reconstruct(self, y_hat, qp, reset):
+    def _reconstruct(self, y_hat, qp, reset, output_pixels=True):
         m, run = self.model, self.layers
         if self.variant == 'image':
             return run(m.dec, y_hat, run.parameter('q_scale_dec', qp))
         feature = run(m.decoder, y_hat, self.context, run.parameter('q_decoder', qp))
-        frames = run(m.recon_head, feature)
+        # P-frame encoding only needs decoded features for its next context.
+        # A reset additionally needs the final frame in unshuffled form.
+        frames = run(m.recon_head, feature) if output_pixels else None
         self.reference = feature
         if reset:
             reference = run(m.recon_head, feature, for_reset=True)
@@ -152,7 +155,7 @@ class IntegerModel:
                                     qp*m.z_channel, m.z_channel)
         self.coder.encoder.flush()
         bits = self.coder.encoder.get_encoded_stream().tobytes()
-        frames = self._reconstruct(y_hat, qp, reset)
+        frames = self._reconstruct(y_hat, qp, reset, self.reconstruct_on_encode)
         return {'bit_stream': bits, 'x_hat': frames, 'ec_parallel': 1}
 
     @torch.no_grad()

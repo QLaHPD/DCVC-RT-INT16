@@ -37,6 +37,10 @@ def build_parser():
     encode.add_argument('--prepared_i', help='Prepared integer image model/table file')
     encode.add_argument('--prepared_p', help='Prepared integer video model/table file')
     encode.add_argument('--procs', type=int, default=1)
+    encode.add_argument('--input_threads', type=int,
+                        help='FFmpeg decoder threads per worker (default: INT16 2, FP16 1)')
+    encode.add_argument('--prefetch_frames', type=int,
+                        help='Read ahead frames (default: INT16 8, FP16 0); queue capped at 8 MiB or one frame')
     encode.add_argument('--cuda_idx', type=int, nargs='+', default=[0])
     encode.add_argument('--reset_interval', type=int, default=32)
     encode.add_argument('--intra_period', '--force_intra_period', type=int, default=-1)
@@ -79,13 +83,19 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     if args.command == 'encode':
+        if args.input_threads is None:
+            args.input_threads = 2 if args.runtime == 'int16' else 1
+        if args.prefetch_frames is None:
+            args.prefetch_frames = 8 if args.runtime == 'int16' else 0
         if args.device == 'cpu' and args.runtime != 'int16':
             parser.error('--device cpu requires --runtime int16')
-        for name in ('resolution', 'max_frames', 'procs'):
+        for name in ('resolution', 'max_frames', 'procs', 'input_threads'):
             if getattr(args, name) is not None and getattr(args, name) <= 0:
                 parser.error(f'--{name} must be positive')
         if any(index < 0 for index in args.cuda_idx):
             parser.error('--cuda_idx must be nonnegative')
+        if args.prefetch_frames < 0:
+            parser.error('--prefetch_frames must be nonnegative')
         if args.intra_period == 0 or args.intra_period < -1:
             parser.error('--intra_period must be -1 or positive')
         if args.reset_interval < -1:

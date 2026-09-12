@@ -5,6 +5,8 @@ from fractions import Fraction
 from pathlib import Path
 import subprocess
 import tempfile
+import queue
+import threading
 
 import numpy as np
 
@@ -35,23 +37,78 @@ def dimensions(width, height, resolution):
 
 
 class FrameReader:
-    def __init__(self, source, width, height, original, fps=None):
+    def __init__(self, source, width, height, original, fps=None, decoder_threads=1,
+                 prefetch_frames=0):
+        if not isinstance(decoder_threads, int) or decoder_threads < 1:
+            raise ValueError('decoder_threads must be a positive integer')
+        if not isinstance(prefetch_frames, int) or prefetch_frames < 0:
+            raise ValueError('prefetch_frames must be a nonnegative integer')
+        if width < 2 or height < 2 or width % 2 or height % 2:
+            raise ValueError('YUV420 input dimensions must be positive and even')
         self.width, self.height = width, height
         filters = []
         if (width, height) != (original['width'], original['height']):
             filters.append(f'scale={width}:{height}:flags=bicubic')
         if fps is not None:
             filters.append(f'fps={fps}')
-        command = ['ffmpeg', '-v', 'error', '-nostdin', '-threads', '1', '-noautorotate',
+        command = ['ffmpeg', '-v', 'error', '-nostdin', '-threads', str(decoder_threads), '-noautorotate',
                    '-i', str(source), '-map', '0:v:0', '-an', '-sn', '-dn']
         if filters:
             command += ['-vf', ','.join(filters)]
         command += ['-pix_fmt', 'yuv420p', '-vsync', '0', '-f', 'rawvideo', 'pipe:1']
         self.errors = tempfile.TemporaryFile()
-        self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=self.errors)
+        try:
+            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=self.errors)
+        except BaseException:
+            self.errors.close()
+            raise
         self.ended = False
+        self._closed = self._prefetch_done = False
+        self._stop = threading.Event()
+        self._thread = self._queue = None
+        if prefetch_frames:
+            # Bound queued YUV444 arrays to 8 MiB, or one frame for large inputs.
+            capacity = min(prefetch_frames, max(1, (8*1024*1024)//(width*height*3)))
+            self._queue = queue.Queue(maxsize=capacity)
+            self._thread = threading.Thread(target=self._prefetch, name='uf-input', daemon=True)
+            try:
+                self._thread.start()
+            except BaseException:
+                self._thread = None
+                self.close()
+                raise
 
     def read(self):
+        if self._closed:
+            raise ValueError('Frame reader is closed')
+        if self._queue is None:
+            return self._read_frame()
+        if self._prefetch_done:
+            return None
+        frame, error = self._queue.get()
+        if error is not None:
+            self._prefetch_done = True
+            raise error
+        if frame is None:
+            self._prefetch_done = True
+        return frame
+
+    def _prefetch(self):
+        while not self._stop.is_set():
+            try:
+                frame, error = self._read_frame(), None
+            except Exception as exc:
+                frame, error = None, exc
+            while not self._stop.is_set():
+                try:
+                    self._queue.put((frame, error), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            if frame is None or error is not None:
+                return
+
+    def _read_frame(self):
         size = self.width * self.height * 3 // 2
         blocks, remaining = [], size
         while remaining:
@@ -75,15 +132,21 @@ class FrameReader:
         return np.stack((y, u.repeat(2, 0).repeat(2, 1), v.repeat(2, 0).repeat(2, 1)))
 
     def close(self):
-        # Release a producer blocked writing its next frame before waiting for it.
-        self.process.stdout.close()
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        # This child only reads input and writes our pipe. Stop it immediately
+        # when abandoning input: SIGTERM may wait forever flushing a full pipe.
+        # Closing buffered stdout first could block on the reader's stream lock.
         if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+            self.process.kill()
+            self.process.wait()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                raise RuntimeError('Input prefetch thread did not stop')
+        self.process.stdout.close()
         self.errors.close()
 
     def __enter__(self):

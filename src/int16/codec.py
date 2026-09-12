@@ -38,7 +38,7 @@ class IntegerCodec(Codec):
         self.variant = variant
         self.chunk_size = 1 if variant == 'ld' else 8
         self.image = IntegerModel(loaded[0], self.device)
-        self.video = IntegerModel(loaded[1], self.device)
+        self.video = IntegerModel(loaded[1], self.device, reconstruct_on_encode=False)
 
     def tensor(self, frames):
         values = torch.from_numpy(np.concatenate(frames, axis=0)).unsqueeze(0).to(self.device)

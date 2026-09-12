@@ -5,6 +5,12 @@ HT-L and LD. It quantizes the released checkpoints; no retraining is required.
 This is a local arithmetic design, not a specification from the UF paper.
 FP16 remains the default; select integer encoding with `--runtime int16`.
 
+The archive encoder retains decoded P-frame features without rendering pixels
+it will not use. It still reconstructs the required reset frame. Decode/view
+continue to reconstruct every frame. This optimization preserves prepared
+identities, arithmetic and bitstream bytes. HT-L performance measurements are in
+[the validation report](UF_INT16_VALIDATION.md).
+
 ## Commands
 
 Build the entropy extension and `src/int16/native` as described in

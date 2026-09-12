@@ -94,10 +94,13 @@ def discover(args):
                         and not any(part.startswith('.') or part.endswith('.uf') for part in p.relative_to(base).parts)]
     output = Path(args.output_root).resolve()
     jobs = []
+    integer = getattr(args, 'runtime', 'fp16') == 'int16'
     for source in sorted(set(sources)):
         relative = source.relative_to(base)
         final = output / relative.parent / (source.name + '.uf')
-        jobs.append({'source': str(source), 'relative': str(relative), 'final': str(final)})
+        jobs.append({'source': str(source), 'relative': str(relative), 'final': str(final),
+                     'input_threads': getattr(args, 'input_threads', 2 if integer else 1),
+                     'prefetch_frames': getattr(args, 'prefetch_frames', 8 if integer else 0)})
     return jobs
 
 
@@ -136,6 +139,8 @@ def encode_job(job, config, paths, device, instance):
             if not fps or fps <= 0:
                 raise ValueError('Cannot determine a positive frame rate; pass --fps')
             event('encode_started', source=str(source), device=device,
+                  input_threads=job.get('input_threads', 1),
+                  prefetch_frames=job.get('prefetch_frames', 0),
                   runtime=config.get('runtime', 'fp16'),
                   resolution=f"{original['width']}x{original['height']} -> {width}x{height}", fps=fps,
                   variant=config['variant'], qi=config['qp_i'], qp=config['qp_p'])
@@ -148,7 +153,9 @@ def encode_job(job, config, paths, device, instance):
                     event('encode_progress', source=source.name, **values)
                     last[0] = now
                     pulse.check()
-            with FrameReader(source, width, height, original, fps) as reader:
+            with FrameReader(source, width, height, original, fps,
+                             decoder_threads=job.get('input_threads', 1),
+                             prefetch_frames=job.get('prefetch_frames', 0)) as reader:
                 result = codec.encode(reader, stage / 'video.bin', config['qp_i'], config['qp_p'],
                                       config['reset_interval'], config['intra_period'], config['max_frames'], progress)
             result.update(width=width, height=height, fps=fps)

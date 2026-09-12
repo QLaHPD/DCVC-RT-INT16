@@ -1,5 +1,65 @@
 # UF integer validation on Jetson Orin
 
+## HT-L 144p optimization — 2026-09-12
+
+Same Bunny source, INT16 HT-L, QI36/QP30, 256×144 at 30 FPS, all 300 frames,
+one process. Prepared model and arithmetic identities are unchanged.
+
+| Full input/encoding pipeline | Median encode FPS (3 runs) |
+|---|---:|
+| Previous behavior: full P reconstruction, one input thread, no prefetch | 29.44 |
+| Optimized defaults: required features/reset only, two input threads, bounded prefetch | **55.95** |
+
+This is about **1.90× faster** in a six-run alternating comparison using the
+same initialized model. Individual optimized runs measured 55.89–56.35 FPS.
+Encoding FPS excludes model loading and the subsequent validation decode. The
+earlier standalone CLI baseline measured 28.85 FPS; the optimized standalone CLI
+measured 55.35 FPS. Four input threads with prefetch measured 57.79 FPS in one
+separate run; two remain the default to limit per-worker CPU usage.
+
+Measurements separating the causes:
+
+- With all input frames preloaded, skipping unused P-frame pixel reconstruction
+  raised median codec throughput from 49.67 to 64.53 FPS (three runs per mode).
+- Reading/resizing the input alone improved from 38.38 to 59.81 FPS with two
+  decoder threads. Pixel hashes matched across tested decoder/filter settings.
+- Bounded read-ahead then overlaps input work with GPU encoding. All generated
+  full-video bitstreams match the original HT-L baseline exactly:
+  `42e73b602cfc44fe5311224d119d043ed0bb6148d36b3021c5b581fa404cfbb1`.
+- Full decoded YUV remains
+  `5fca3d1b3961f2ca3678dc704f0e34e23c228dcb5f792c6cb32c90123de4444c`.
+
+The default archive command enables these changes automatically:
+
+```bash
+./scripts/uf-python main.py encode --input_file Big_Buck_Bunny_720_10s_30MB.mp4 --output_root runs/optimized-htl --runtime int16 --model_structure htl --resolution 144 --qi 36 --qp 30 --procs 1
+```
+
+The arithmetic checker now compares feature-only encoding against full
+reconstruction, including encoded bytes and reference/memory/context at resets.
+Input tests cover frame order/content, repeated EOF, decoder failure, closing a
+full prefetch queue, and resuming with changed performance settings. The changes
+use standard CPU threading and skip unnecessary neural work; they are not
+Jetson-specific, although these throughput measurements are from Jetson Orin.
+
+FP16 keeps its original input defaults (one decoder thread, no prefetch). A
+720p FP16 test with the larger input buffers exhausted this Jetson's memory;
+with the original settings, all 300 frames encoded and validated with the exact
+original FP16 bitstream. Faster input defaults therefore apply automatically
+only to INT16. Early input cancellation stops the owned read-only FFmpeg child
+immediately, avoiding its SIGTERM flush delay when the pipe is full.
+
+Final validation: all 20 unit tests passed; HT-S, HT-L and LD passed CPU/CUDA
+state checks against pre-optimization reference reports. A partial 17-frame
+720p HT-L archive with resets, periodic I-frames and a padded final chunk also
+encoded and validated successfully. Fixing early shutdown preserved its exact
+bytes and pixels while removing the observed 10-second input-close delay.
+The Bunny source remained unchanged. No native rebuild or model re-preparation
+is needed for these optimizations.
+
+The following baseline sections describe code before these optimizations
+(published at `a938b27`).
+
 ## HT-L 144p baseline — 2026-09-12
 
 HT-L is the focus for subsequent optimization. This run used INT16 Tensor Core

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -67,11 +68,68 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(metadata['source']['sha256'], original)
         self.assertIn('audio.opus', metadata['artifacts'])
         self.assertEqual(sha256(self.source), original)
+        self.job.update(input_threads=2, prefetch_frames=8)
         self.assertEqual(self.encode(), 'resumed')
         (self.final / 'video.bin').write_bytes(b'corrupt')
         self.assertEqual(self.encode(), 'failed')
         self.assertEqual((self.final / 'video.bin').read_bytes(), b'corrupt')
         self.assertTrue(self.source.exists())
+
+    def test_threaded_input_preserves_frames(self):
+        media = probe(self.source)
+        decoded = []
+        for threads, prefetch in ((1, 0), (2, 0), (2, 8)):
+            frames = []
+            with FrameReader(self.source, 48, 32, media, decoder_threads=threads,
+                             prefetch_frames=prefetch) as reader:
+                while (frame := reader.read()) is not None:
+                    frames.append(frame.tobytes())
+                self.assertIsNone(reader.read())
+            decoded.append(frames)
+        self.assertEqual(len(decoded[0]), 4)
+        self.assertEqual(decoded[0], decoded[1])
+        self.assertEqual(decoded[0], decoded[2])
+        with self.assertRaisesRegex(ValueError, 'positive integer'):
+            FrameReader(self.source, 48, 32, media, decoder_threads=0)
+
+    def test_prefetch_early_stop_and_decoder_failure_release_resources(self):
+        media = probe(self.source)
+        # Frames larger than the OS pipe ensure an abandoned producer cannot
+        # finish just by flushing its remaining video into that pipe.
+        reader = FrameReader(self.source, 1024, 768, media, prefetch_frames=1)
+        self.addCleanup(reader.close)
+        deadline = time.monotonic() + 5
+        while not reader._queue.full() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(reader._queue.full(), 'Producer did not fill the bounded queue')
+        started = time.monotonic()
+        reader.close()
+        self.assertLess(time.monotonic() - started, 5, 'Input cancellation waited for a full pipe')
+        reader.close()
+        self.assertFalse(reader._thread.is_alive())
+        self.assertIsNotNone(reader.process.poll())
+        self.assertTrue(reader.process.stdout.closed)
+        self.assertTrue(reader.errors.closed)
+        with FrameReader(self.root/'absent.mkv', 48, 32, media, prefetch_frames=1) as failed:
+            with self.assertRaises(RuntimeError):
+                failed.read()
+        self.assertFalse(failed._thread.is_alive())
+        self.assertIsNotNone(failed.process.poll())
+
+    def test_input_defaults_preserve_fp16_and_allow_explicit_limits(self):
+        import main
+        cases = [('fp16', [], (1, 0)), ('int16', [], (2, 8)),
+                 ('int16', ['--input_threads', '1', '--prefetch_frames', '0'], (1, 0))]
+        for runtime, extra, expected in cases:
+            captured = []
+            def run(args):
+                captured.append((args.input_threads, args.prefetch_frames))
+                return 0
+            argv = ['main.py', 'encode', '--input_file', str(self.source),
+                    '--output_root', str(self.root/'output'), '--runtime', runtime, *extra]
+            with patch('main.run_encode', run), patch('sys.argv', argv):
+                self.assertEqual(main.main(), 0)
+            self.assertEqual(captured, [expected])
 
     def test_failure_never_publishes_or_deletes_input(self):
         with patch.object(FakeCodec, 'decode', side_effect=ValueError('bad stream')):
