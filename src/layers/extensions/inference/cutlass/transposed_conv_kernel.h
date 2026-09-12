@@ -75,7 +75,7 @@ at::Tensor transposed_conv_generic_cutlass(at::Tensor& out_buf, const at::Tensor
         return at::Tensor();
     }
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     status = implicit_gemm_op(args, nullptr, stream);
     if (status != cutlass::Status::kSuccess) {
         std::cerr << "Failed to run convolution operation." << std::endl;

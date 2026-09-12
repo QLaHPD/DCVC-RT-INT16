@@ -191,7 +191,7 @@ class DMCI(CompressionModel):
             'bits_z': bits_z,
         }
 
-    def compress(self, x, qp, padding_b, padding_r):
+    def prepare_inference(self):
         if self.proxy is None:
             try:
                 from inference_extensions_cuda import DMCIProxy
@@ -204,6 +204,9 @@ class DMCI(CompressionModel):
             state_dict = self.add_cdf_to_state_dict(state_dict)
             self.proxy = DMCIProxy()
             self.proxy.set_param(state_dict, self.gaussian_encoder.skip_thres)
+
+    def compress(self, x, qp, padding_b, padding_r):
+        self.prepare_inference()
         bit_stream, x_hat, ec_parallel = self.proxy.compress(x, qp, padding_b, padding_r)
         return {
             'bit_stream': bit_stream.tobytes(),
@@ -212,6 +215,7 @@ class DMCI(CompressionModel):
         }
 
     def decompress(self, bit_stream, sps, qp, ec_part):
+        self.prepare_inference()
         x_hat = self.proxy.decompress(
             np.frombuffer(bit_stream, dtype=np.uint8), qp, sps['height'], sps['width'], ec_part)
         return {'x_hat': x_hat}

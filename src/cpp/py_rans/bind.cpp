@@ -31,6 +31,7 @@ PYBIND11_MODULE(MLCodec_extensions_cpp, m)
         .def("set_stream", py::overload_cast<const py::array_t<uint8_t>&>(&RansDecoder::set_stream))
         .def("decode_y", py::overload_cast<const py::array_t<uint8_t>&>(&RansDecoder::decode_y))
         .def("decode_z", &RansDecoder::decode_z)
+        .def("get_decoded_tensor", &RansDecoder::get_decoded_tensor)
         .def("set_cdf",
              py::overload_cast<const py::array_t<int32_t>&, const py::array_t<int32_t>&, const int>(
                  &RansDecoder::set_cdf))

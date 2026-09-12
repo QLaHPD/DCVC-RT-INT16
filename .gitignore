@@ -28,9 +28,23 @@ __pycache__/
 *.pth
 *.ckpt
 *.safetensors
+/.local/
+/third_party/cutlass/
+/papers/*.pdf
+/checkpoints/*
+!/checkpoints/.gitkeep
+!/checkpoints/README.md
+/out_bin/
+/runs/
+/data/
 DCVC-family/DCVC-RT/benchmarks/optimization_*/
 DCVC-family/DCVC-RT/benchmarks/fixtures/
 DCVC-family/DCVC-RT/benchmarks/results/
 DCVC-family/DCVC-RT/benchmarks/pipeline_recheck*/
 DCVC-family/DCVC-RT/runs/
 DCVC-family/DCVC-RT/data/training/
+
+# UF archive output and coordination state
+*.uf/
+.dcvc-uf-shared-work/
+.uf-progress.jsonl

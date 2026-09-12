@@ -297,7 +297,7 @@ conditional_index_part1_cuda(const at::Tensor& x, const at::Tensor& m, at::Tenso
     config1.gridDim = block_num;
     config1.blockDim = COND_KERNEL_THREAD_NUM1;
     config1.dynamicSmemBytes = 0;
-    config1.stream = at::cuda::getCurrentCUDAStream();
+    config1.stream = c10::cuda::getCurrentCUDAStream();
     auto attr = get_cuda_launch_attribute();
     config1.attrs = &attr;
     config1.numAttrs = 1;
@@ -306,7 +306,7 @@ conditional_index_part1_cuda(const at::Tensor& x, const at::Tensor& m, at::Tenso
     config2.gridDim = 1;
     config2.blockDim = COND_KERNEL_THREAD_NUM2;
     config2.dynamicSmemBytes = 0;
-    config2.stream = at::cuda::getCurrentCUDAStream();
+    config2.stream = c10::cuda::getCurrentCUDAStream();
     config2.attrs = &attr;
     config2.numAttrs = 1;
 
@@ -341,7 +341,7 @@ conditional_index_part1_cuda(const at::Tensor& x, const at::Tensor& m, at::Tenso
 
 at::Tensor conditional_index_part2_cuda(const at::Tensor& x, const at::Tensor& s, int* size_ptr)
 {
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     if (size_ptr == nullptr) {
         int s_cpu;
         CUDA_CHECK(cudaMemcpyAsync(&s_cpu, s.data_ptr<int>(), sizeof(int), cudaMemcpyDeviceToHost,
@@ -397,7 +397,7 @@ at::Tensor conditional_recover_with_type_conversion_cuda(const at::Tensor& x, co
     config1.gridDim = block_num;
     config1.blockDim = COND_KERNEL_THREAD_NUM1;
     config1.dynamicSmemBytes = 0;
-    config1.stream = at::cuda::getCurrentCUDAStream();
+    config1.stream = c10::cuda::getCurrentCUDAStream();
     auto attr = get_cuda_launch_attribute();
     config1.attrs = &attr;
     config1.numAttrs = 1;
@@ -531,7 +531,7 @@ at::Tensor multiply_with_broadcast_cuda(const at::Tensor& a, const at::Tensor& b
     config.gridDim = gridDim;
     config.blockDim = blockDim;
     config.dynamicSmemBytes = 0;
-    config.stream = at::cuda::getCurrentCUDAStream();
+    config.stream = c10::cuda::getCurrentCUDAStream();
     config.attrs = &attr;
     config.numAttrs = 1;
 

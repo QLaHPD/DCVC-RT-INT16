@@ -62,6 +62,7 @@ public:
     // otherwise, ch is per channel element number
     void decode_z(const int total_size, const int cdf_offset, const int ch);
     std::shared_ptr<std::vector<int8_t>> get_decoded_tensor_cpp();
+    py::array_t<int8_t> get_decoded_tensor();
     void set_cdf(const std::shared_ptr<std::vector<int32_t>>& cdfs,
                  const std::shared_ptr<std::vector<int32_t>>& cdfs_sizes, const int index);
     void set_cdf(const py::array_t<int32_t>& cdfs, const py::array_t<int32_t>& cdfs_sizes,

@@ -299,7 +299,7 @@ py::tuple DMCIProxy::compress(const at::Tensor& x, const int qp, const int paddi
     m_result_ready = false;
     m_qp = qp;
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
 
     // must NOT use cuda graph because x.data_ptr() is non-const
     m_enc_unshuffle_out = pad_and_unshuffle_8_cuda(x, padding_b, padding_r, m_enc_unshuffle_out);
@@ -433,7 +433,7 @@ at::Tensor DMCIProxy::decompress(const py::array_t<uint8_t>& bit_stream, const i
     m_z_width = (width + 63) / 64;
     m_qp = qp;
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
 
     // Signal worker to decode Z
     {
@@ -803,8 +803,8 @@ void DMCIProxy::pre_allocate_tensors(const int height, const int width)
 
 void DMCIProxy::worker()
 {
-    at::cuda::CUDAStream high_priority_stream = at::cuda::getStreamFromPool(true);
-    at::cuda::CUDAStreamGuard guard(high_priority_stream);
+    c10::cuda::CUDAStream high_priority_stream = c10::cuda::getStreamFromPool(true);
+    c10::cuda::CUDAStreamGuard guard(high_priority_stream);
 
     while (!m_finish) {
         std::unique_lock<std::mutex> lk(m_mutex_pending);
@@ -817,7 +817,7 @@ void DMCIProxy::worker()
 
         if (m_pending_work == DMCWorkType::Encode) {
             m_entropy_encoder.reset();
-            CUDA_CHECK(cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream(), m_event_y));
+            CUDA_CHECK(cudaStreamWaitEvent(c10::cuda::getCurrentCUDAStream(), m_event_y));
 
             // build_index_enc and conditional_index for each of the 4 mask steps
             // Process in reverse order (3,2,1,0) to match Python encode order
@@ -828,9 +828,9 @@ void DMCIProxy::worker()
                 total_symbol_count += *m_size_ptr;
                 CUDA_CHECK(cudaMemcpyAsync(m_y_to_encode[i]->data(), out.data_ptr<int16_t>(),
                                            (*m_size_ptr) * sizeof(int16_t), cudaMemcpyDeviceToHost,
-                                           at::cuda::getCurrentCUDAStream()));
+                                           c10::cuda::getCurrentCUDAStream()));
             }
-            CUDA_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream()));
+            CUDA_CHECK(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream()));
 
             m_entropy_coder_parallel = compute_ec_parallel(total_symbol_count);
             m_entropy_encoder.set_entropy_coder_parallel(m_entropy_coder_parallel);
@@ -852,23 +852,23 @@ void DMCIProxy::worker()
             auto z_cpu = m_entropy_decoder.get_decoded_tensor_cpp();
             CUDA_CHECK(cudaMemcpyAsync(m_z_hat_io.data_ptr<int8_t>(), z_cpu->data(),
                                        z_num * sizeof(int8_t), cudaMemcpyHostToDevice,
-                                       at::cuda::getCurrentCUDAStream()));
-            CUDA_CHECK(cudaEventRecord(m_event_z_ready, at::cuda::getCurrentCUDAStream()));
+                                       c10::cuda::getCurrentCUDAStream()));
+            CUDA_CHECK(cudaEventRecord(m_event_z_ready, c10::cuda::getCurrentCUDAStream()));
         } else if (m_pending_work == DMCWorkType::DecodeY) {
-            CUDA_CHECK(cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream(), m_event_y));
+            CUDA_CHECK(cudaStreamWaitEvent(c10::cuda::getCurrentCUDAStream(), m_event_y));
             auto out = conditional_index_part2_cuda(m_y_indexes, m_y_indexes_size, m_size_ptr);
             const int y_num = *m_size_ptr;
             CUDA_CHECK(cudaMemcpyAsync(m_y_to_decode->data(), out.data_ptr<uint8_t>(),
                                        y_num * sizeof(uint8_t), cudaMemcpyDeviceToHost,
-                                       at::cuda::getCurrentCUDAStream()));
+                                       c10::cuda::getCurrentCUDAStream()));
 
             m_entropy_decoder.decode_y(m_y_to_decode, y_num);
 
             auto y_cpu = m_entropy_decoder.get_decoded_tensor_cpp();
             CUDA_CHECK(cudaMemcpyAsync(m_y_decoded.data_ptr<int8_t>(), y_cpu->data(),
                                        y_num * sizeof(int8_t), cudaMemcpyHostToDevice,
-                                       at::cuda::getCurrentCUDAStream()));
-            CUDA_CHECK(cudaEventRecord(m_event_y_ready, at::cuda::getCurrentCUDAStream()));
+                                       c10::cuda::getCurrentCUDAStream()));
+            CUDA_CHECK(cudaEventRecord(m_event_y_ready, c10::cuda::getCurrentCUDAStream()));
         } else {
             assert(false);
         }

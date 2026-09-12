@@ -3,7 +3,8 @@
 
 #pragma once
 
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
@@ -47,8 +48,8 @@ public:
         auto vec = std::make_shared<std::vector<T>>(x.numel());
         if constexpr (is_gpu) {
             CUDA_CHECK(cudaMemcpyAsync(vec->data(), x.data_ptr<T>(), x.numel() * sizeof(T),
-                                       cudaMemcpyDeviceToHost, at::cuda::getCurrentCUDAStream()));
-            CUDA_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream()));
+                                       cudaMemcpyDeviceToHost, c10::cuda::getCurrentCUDAStream()));
+            CUDA_CHECK(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream()));
         } else {
             memcpy(vec->data(), x.data_ptr<T>(), x.numel() * sizeof(T));
         }

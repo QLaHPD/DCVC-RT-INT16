@@ -45,7 +45,7 @@ __forceinline__ std::tuple<cudaLaunchConfig_t, int> get_kernel_config_1D(const a
     config.gridDim = gridDim;
     config.blockDim = blockDim;
     config.dynamicSmemBytes = 0;
-    config.stream = at::cuda::getCurrentCUDAStream();
+    config.stream = c10::cuda::getCurrentCUDAStream();
     config.attrs = &attrs;
     config.numAttrs = 1;
 
@@ -66,7 +66,7 @@ __forceinline__ std::tuple<cudaLaunchConfig_t, CudaCHW> get_kernel_config_4D(con
     config.gridDim = gridDim;
     config.blockDim = blockDim;
     config.dynamicSmemBytes = 0;
-    config.stream = at::cuda::getCurrentCUDAStream();
+    config.stream = c10::cuda::getCurrentCUDAStream();
     config.attrs = &attrs;
     config.numAttrs = 1;
     return { config, { C / factor, H, W } };

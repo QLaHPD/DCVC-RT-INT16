@@ -91,8 +91,8 @@ def train_one_epoch(i_net, dataloader, optimizer, epoch, rank):
             print(
                 f'Time: {t1-t0:.3f} seconds, Train epoch {epoch}:'
                 f' [{numer} / {denom} ({100. * numer / denom:.0f}%)]'
-                f' MSE: {info['mse']} | Bpp y: {info['bpp_y']} | Bpp z: {info['bpp_z']} |'
-                f' Losses: {info['losses']} | lr: {optimizer.param_groups[0]['lr']:.1e}'
+                f" MSE: {info['mse']} | Bpp y: {info['bpp_y']} | Bpp z: {info['bpp_z']} |"
+                f" Losses: {info['losses']} | lr: {optimizer.param_groups[0]['lr']:.1e}"
             )
             t0 = t1
 

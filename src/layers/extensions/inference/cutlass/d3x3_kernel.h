@@ -91,7 +91,7 @@ at::Tensor d3x3_cutlass(const at::Tensor& feature, const at::Tensor& weight, con
         return at::Tensor();
     }
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     status = direct2dconv_op(args, nullptr, stream);
     if (status != cutlass::Status::kSuccess) {
         std::cerr << "Failed to run convolution operation." << std::endl;
@@ -189,7 +189,7 @@ __forceinline__ auto d3x3_launch(const at::Tensor& feature, const at::Tensor& we
     config.gridDim = gridDim;
     config.blockDim = blockDim;
     config.dynamicSmemBytes = 0;
-    config.stream = at::cuda::getCurrentCUDAStream();
+    config.stream = c10::cuda::getCurrentCUDAStream();
     auto attr = get_cuda_launch_attribute();
     config.attrs = &attr;
     config.numAttrs = 1;

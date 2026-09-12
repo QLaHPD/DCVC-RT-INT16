@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Run from any working directory, using this checkout's isolated environment.
+set -euo pipefail
+uf_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${UF_PYTHON:-}" ]]; then
+    uf_python="$UF_PYTHON"
+elif [[ -f "$uf_root/.local/python" ]]; then
+    IFS= read -r uf_python < "$uf_root/.local/python"
+else
+    echo 'Set UF_PYTHON to the dedicated UF environment python executable.' >&2
+    exit 2
+fi
+if [[ ! -x "$uf_python" ]]; then
+    echo "UF Python is not executable: $uf_python" >&2
+    exit 2
+fi
+cd -- "$uf_root"
+unset PYTHONPATH PYTHONHOME DCVC_USE_INT16
+while IFS= read -r uf_variable; do
+    unset "$uf_variable"
+done < <(compgen -A variable DCVC_INT16_ || true)
+export PYTHONNOUSERSITE=1
+export TORCH_EXTENSIONS_DIR="$uf_root/.local/cache/torch_extensions"
+export CUDA_CACHE_PATH="$uf_root/.local/cache/cuda"
+export TRITON_CACHE_DIR="$uf_root/.local/cache/triton"
+export TMPDIR="$uf_root/.local/tmp"
+mkdir -p "$TORCH_EXTENSIONS_DIR" "$CUDA_CACHE_PATH" "$TRITON_CACHE_DIR" "$TMPDIR"
+exec "$uf_python" "$@"

@@ -3,7 +3,8 @@
 
 #pragma once
 
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/core/Device.h>
 #include <c10/util/SmallVector.h>
 #include <cuda_runtime.h>

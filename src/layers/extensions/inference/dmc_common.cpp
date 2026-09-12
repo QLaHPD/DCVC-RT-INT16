@@ -84,7 +84,7 @@ at::Tensor DMCCommon::pad_for_y(const at::Tensor& y, at::Tensor& y_pad)
 
 void DMCCommon::run(const std::function<void()>& lambda, cudaGraphExec_t& gexec)
 {
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     if (gexec == nullptr) {
         capture_cuda_graph(gexec, stream, lambda);
     }
@@ -95,7 +95,7 @@ void DMCCommon::run(const std::function<void()>& lambda, cudaGraphExec_t& gexec)
 void DMCCommon::run(const std::function<void(int)>& lambda, cudaGraphExec_t (&gexec)[g_qp_num],
                     const int qp)
 {
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     if (gexec[0] == nullptr) {
         for (int i = 0; i < g_qp_num; ++i) {
             capture_cuda_graph(gexec[i], stream, [&]() { lambda(i); });
@@ -108,7 +108,7 @@ void DMCCommon::run(const std::function<void(int)>& lambda, cudaGraphExec_t (&ge
 void DMCCommon::run(const std::function<void(bool)>& lambda, cudaGraphExec_t (&gexec)[2],
                     const bool bvalue)
 {
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     if (gexec[0] == nullptr) {
         for (int i = 0; i < 2; ++i) {
             capture_cuda_graph(gexec[i], stream, [&]() { lambda(static_cast<bool>(i)); });
@@ -121,7 +121,7 @@ void DMCCommon::run(const std::function<void(bool)>& lambda, cudaGraphExec_t (&g
 void DMCCommon::run(const std::function<void(int, bool)>& lambda,
                     cudaGraphExec_t (&gexec)[g_qp_num][2], const int qp, const bool bvalue)
 {
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     if (gexec[0][0] == nullptr) {
         for (int i = 0; i < g_qp_num; ++i) {
             for (int j = 0; j < 2; ++j) {

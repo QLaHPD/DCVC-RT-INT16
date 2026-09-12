@@ -52,10 +52,10 @@ py_rans_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
 
 mem = psutil.virtual_memory()
 mem_gb = mem.available / 1024**3
-if mem_gb < 32:
-    os.environ['MAX_JOBS'] = '8'
-elif mem_gb < 64:
-    os.environ['MAX_JOBS'] = '16'
+if 'MAX_JOBS' not in os.environ:
+    # Do not override an explicitly bounded build on memory-limited devices.
+    jobs_by_memory = max(1, int(mem_gb // 4))
+    os.environ['MAX_JOBS'] = str(min(cpu_count, jobs_by_memory, 16))
 
 setup(
     name='inference_extensions_cuda',

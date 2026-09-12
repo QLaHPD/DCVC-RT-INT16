@@ -1,37 +1,49 @@
-# DCVC-RT INT16 Managed
+# DCVC-UF INT16 development
 
-This is a fork of [Microsoft/DCVC](https://github.com/microsoft/DCVC) focused on a deterministic INT16 runtime, bit-exact CUDA kernel optimizations, and a production-oriented video archive pipeline for DCVC-RT.
+Local development branch for integer inference and portable decoding in
+[Microsoft's DCVC-UF](https://github.com/microsoft/DCVC).
 
-The maintained implementation is in **[DCVC-family/DCVC-RT](DCVC-family/DCVC-RT/README.md)**.
+**Current status:** the archive CLI supports FP16 (default) and a prepared INT16
+runtime selected with `--runtime int16`. Both have completed a full 720p Bunny
+encode/decode validation on Jetson. Integer arithmetic also has an independent
+CPU reference; additional physical GPU models still need validation.
+See [integer runtime and portability](docs/UF_INT16.md),
+[archive commands](docs/UF_ARCHIVE.md), and [FP16 baseline](docs/UF_BUNNY_VALIDATION.md).
 
-Highlights:
+## Local workspace
 
-- INT16 feature and weight execution designed for deterministic cross-device coding
-- Optimized bit-exact CUDA convolution kernels
-- File-level multi-GPU encoding and decoding with one independent worker per GPU
-- Direct yt-dlp/FFmpeg streaming without storing source video containers
-- Unified encode, decode, viewer, and validated-cleanup CLI
-- Multi-channel scheduling with a tmux-friendly terminal dashboard
-- Non-blocking cleanup approvals and optional `--auto-delete`
-- Persistent archive manifests, SHA-256 hashes, and restart-safe deletion auditing
-- Portable native-extension build script for each target computer
+- Checkout: `/mnt/to_storage/TOOLS/DCVC-UF-INT16`
+- Branch: `uf-int16-managed`
+- Dedicated environment: `dcvc-uf-int16`
+- Models: **[checkpoints/](checkpoints/README.md)**
+- Setup instructions and compatibility status: **[docs/UF_LOCAL_SETUP.md](docs/UF_LOCAL_SETUP.md)**
 
-## Blender Bunny configuration sweep
+```bash
+./scripts/uf-python scripts/check_uf_setup.py
+./scripts/uf-python test_video.py --help
+```
 
-This exploratory rate-distortion sweep records an earlier search for the best encoder configurations on the Blender Bunny test video rendered at 144p (256×144). It compares 1,803 configurations over 300 frames and identifies 116 Pareto-optimal results. Lower file size and higher PSNR are preferred; open the standalone SVG to inspect each point's QP, intra-period, and reset-interval settings.
+The launcher selects the dedicated local interpreter and cache directories. It
+removes inherited RT INT16 flags and Python import-path overrides for its child
+process. No checkpoints are downloaded automatically.
 
-[![Pareto frontier of file size versus PSNR for the Blender Bunny 256×144 test](DCVC-family/DCVC-RT/docs/assets/pareto_frontier_blender_bunny_256x144.svg)](DCVC-family/DCVC-RT/docs/assets/pareto_frontier_blender_bunny_256x144.svg)
+## Source layout
 
-The rest of the repository is retained from upstream so its history, license, and the other DCVC-family implementations remain intact. The original upstream root README is preserved as [UPSTREAM_ROOT_README.md](UPSTREAM_ROOT_README.md).
+| Location | Purpose |
+|---|---|
+| `src/models/image_model.py` | UF intra-frame model |
+| `src/models/video_model_ht.py` | UF HT-S / HT-L models |
+| `src/models/video_model_ld.py` | UF low-delay model |
+| `src/int16/` | Prepared integer models, CPU reference and integer CUDA kernels |
+| `main.py`, `src/archive/` | Archive CLI, runtime selection and storage workflow |
+| `test_video.py` | Upstream UF evaluation and bitstream coding interface |
+| `train_image.py`, `train_video.py`, `training.md` | Upstream UF float training |
+| `DCVC-family/DCVC-RT/` | Inherited RT implementation, maintained separately |
 
-## Attribution
+Development starts from RT branch commit `468bd15`. This is a separate Git
+worktree with its own branch and working files; it shares Git history with the RT
+checkout. UF development is published on `uf-int16-managed`; RT development
+remains on `int16-managed`.
 
-- **Original DCVC/DCVC-RT research and implementation:** Microsoft Research and the authors listed in the [DCVC-RT paper](https://openaccess.thecvf.com/content/CVPR2025/html/Jia_Towards_Practical_Real-Time_Neural_Video_Compression_CVPR_2025_paper.html).
-- **Fork owner and maintainer:** [Salatiel Jordão (@QLaHPD)](https://github.com/QLaHPD).
-- **Primary implementation contributor for this fork:** **OpenAI Codex**, operating as an AI coding agent under the direction and review of the repository owner.
-
-Codex is credited transparently as an implementation contributor; it is not represented as a GitHub account, legal copyright holder, or independent project maintainer. This fork is not affiliated with or endorsed by Microsoft or OpenAI.
-
-## License
-
-The upstream project is distributed under the [MIT License](LICENSE.txt). Existing file-level notices remain in place. Contributions in this fork are distributed under the same repository license.
+Keep model files, native binaries, caches, datasets and outputs out of Git. The
+existing RT runtime and its prepared INT16 files remain in their original location.

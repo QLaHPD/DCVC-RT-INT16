@@ -145,7 +145,7 @@ at::Tensor conv1x1_bias_generic_cutlass2(at::Tensor& out_buf, const at::Tensor& 
         return at::Tensor();
     }
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     status = gemm_op(args, nullptr, stream);
     if (status != cutlass::Status::kSuccess) {
         std::cerr << "GEMM failed: " << cutlass::cutlassGetStatusString(status) << std::endl;
@@ -376,7 +376,7 @@ at::Tensor conv1x1_bias_generic_cutlass3(at::Tensor& out_buf, const at::Tensor& 
         return at::Tensor();
     }
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     status = gemm_op(args, nullptr, stream, /* cuda_adapter */ nullptr, /* launch_with_pdl */ true);
     if (status != cutlass::Status::kSuccess) {
         std::cerr << "GEMM failed: " << cutlass::cutlassGetStatusString(status) << std::endl;
