@@ -43,6 +43,8 @@ def pipeline(args):
             'reset_interval': args.reset_interval, 'intra_period': args.intra_period,
             'max_frames': args.max_frames, 'audio': args.audio,
             'opus_channels': args.opus_channels, 'opus_bitrate': args.opus_bitrate}
+    if getattr(args, 'skip_thres', 0):
+        config['skip_threshold'] = args.skip_thres
     if config['runtime'] == 'int16':
         config['integer'] = {'arithmetic': ARITHMETIC_ID, 'image': data_i['identity'], 'video': data_p['identity']}
         paths += (str(prepared_i), str(prepared_p))
@@ -59,11 +61,13 @@ def make_codec(config, paths, device):
         return IntegerCodec(*paths[:2], variant=config['variant'], device=device,
                             prepared_i=paths[2], prepared_p=paths[3],
                             identities=(config['integer']['image'], config['integer']['video']),
-                            source_hashes=(config['image_sha256'], config['video_sha256']))
+                            source_hashes=(config['image_sha256'], config['video_sha256']),
+                            skip_threshold=config.get('skip_threshold', 0))
     if config.get('runtime', 'fp16') != 'fp16' or device == 'cpu':
         raise ValueError('FP16 decoding requires CUDA; CPU is available for the INT16 reference runtime')
     from src.archive.codec import Codec
-    return Codec(*paths[:2], variant=config['variant'], device=device)
+    return Codec(*paths[:2], variant=config['variant'], device=device,
+                 skip_threshold=config.get('skip_threshold', 0))
 
 
 def run_prepare(args):

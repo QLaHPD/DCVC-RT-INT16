@@ -29,6 +29,13 @@ are retained under `--output_root`. `--procs` controls parallel videos;
 two simultaneous HT-S workers exceeded its RAM during validation, even at 144p.
 Failed jobs retain their originals and can be retried with fewer workers.
 `--qp_i` and `--qp_p` are aliases for `--qi` and `--qp`.
+`--skip_thres` defaults to zero. A positive value forces latent residuals with
+predicted scale at or below the threshold to zero and omits them from entropy
+coding. This can reduce size and change reconstruction quality. The value is
+stored in the archive pipeline so decode and verification use the same setting.
+HT-S and HT-L process temporal chunks of eight frames, so their positive
+`--intra_period` must be `1` or a multiple of eight; LD accepts any positive
+period.
 
 INT16 input decoding defaults to up to four threads per worker and
 `--prefetch_frames 8`. The thread budget uses the process's available CPUs,

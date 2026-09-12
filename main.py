@@ -6,12 +6,27 @@ import math
 import sys
 
 from src.archive.workflow import run_encode, run_decode, run_cleanup, run_prepare
+from src.archive.pareto import run_pareto_search
 
 
 def positive(value):
     value = float(value)
     if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError('must be positive and finite')
+    return value
+
+
+def nonnegative(value):
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError('must be nonnegative and finite')
+    return value
+
+
+def skip_threshold(value):
+    value = nonnegative(value)
+    if value > 16:
+        raise argparse.ArgumentTypeError('must be between 0 and 16')
     return value
 
 
@@ -44,6 +59,8 @@ def build_parser():
     encode.add_argument('--cuda_idx', type=int, nargs='+', default=[0])
     encode.add_argument('--reset_interval', type=int, default=32)
     encode.add_argument('--intra_period', '--force_intra_period', type=int, default=-1)
+    encode.add_argument('--skip_thres', type=skip_threshold, default=0,
+                        help='Do not code latent residuals whose predicted scale is at or below this value')
     encode.add_argument('--max_frames', type=int)
     encode.add_argument('--audio', choices=('opus', 'none'), default='opus')
     encode.add_argument('--opus_channels', choices=('mono', 'stereo'), default='mono')
@@ -52,6 +69,24 @@ def build_parser():
     encode.add_argument('--shared-instance')
     encode.add_argument('--ui', choices=('auto', 'plain'), default='auto', help='Timestamped events, also persisted beside archives')
     encode.set_defaults(handler=run_encode)
+    pareto = commands.add_parser('pareto-search', help='Find size/PSNR Pareto configurations for one video')
+    pareto.add_argument('--input_file', '--input-file', required=True)
+    pareto.add_argument('--output_json', required=True)
+    pareto.add_argument('--resolution', type=int, default=144)
+    pareto.add_argument('--model_structure', choices=('hts', 'htl', 'ld'), default='htl')
+    pareto.add_argument('--model_path_i')
+    pareto.add_argument('--model_path_p')
+    pareto.add_argument('--prepared_i')
+    pareto.add_argument('--prepared_p')
+    pareto.add_argument('--cuda_idx', type=int, default=0)
+    pareto.add_argument('--trials', type=int, default=2000)
+    pareto.add_argument('--initial_samples', type=int, default=800)
+    pareto.add_argument('--seed', type=int, default=20260912)
+    pareto.add_argument('--input_threads', type=int)
+    pareto.add_argument('--skip_thresholds', type=skip_threshold, nargs='+',
+                        default=(0, 0.05, 0.10, 0.15, 0.20))
+    pareto.add_argument('--resume', action=argparse.BooleanOptionalAction, default=True)
+    pareto.set_defaults(handler=run_pareto_search)
     prepare = commands.add_parser('prepare-int16', help='Prepare portable integer model weights and entropy tables')
     prepare.add_argument('--model_structure', choices=('hts', 'htl', 'ld'), default='hts')
     prepare.add_argument('--model_path_i')
@@ -99,8 +134,19 @@ def main():
             parser.error('--prefetch_frames must be nonnegative')
         if args.intra_period == 0 or args.intra_period < -1:
             parser.error('--intra_period must be -1 or positive')
+        if args.model_structure != 'ld' and args.intra_period > 1 and args.intra_period % 8:
+            parser.error('--intra_period for HT-S/HT-L must be 1 or a multiple of 8')
         if args.reset_interval < -1:
             parser.error('--reset_interval must be -1, 0 or positive')
+    elif args.command == 'pareto-search':
+        for name in ('resolution', 'trials', 'initial_samples', 'input_threads'):
+            value = getattr(args, name, None)
+            if value is not None and value <= 0:
+                parser.error(f'--{name} must be positive')
+        if args.initial_samples > args.trials:
+            parser.error('--initial_samples cannot exceed --trials')
+        if args.cuda_idx < 0:
+            parser.error('--cuda_idx must be nonnegative')
     elif getattr(args, 'cuda_idx', 0) < 0:
         parser.error('--cuda_idx must be nonnegative')
     try:

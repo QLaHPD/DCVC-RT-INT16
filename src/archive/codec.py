@@ -16,7 +16,7 @@ from src.utils.transforms import yuv_444_to_420
 
 
 class Codec:
-    def __init__(self, image_path, video_path, variant='hts', device=0):
+    def __init__(self, image_path, video_path, variant='hts', device=0, skip_threshold=0):
         set_torch_env()
         self.device = torch.device(f'cuda:{device}')
         torch.cuda.set_device(self.device)
@@ -26,7 +26,7 @@ class Codec:
         self.chunk_size = 1 if variant == 'ld' else 8
         self.image = DMCI().eval()
         self.image.load_state_dict(get_state_dict(image_path), strict=True)
-        self.image.update(0)
+        self.image.update(skip_threshold)
         self.image.half().to(self.device, memory_format=torch.channels_last)
         if variant == 'ld':
             from src.models.video_model_ld import DMC
@@ -35,7 +35,7 @@ class Codec:
             from src.models.video_model_ht import DMC
             self.video = DMC(model_structure=ModelStructure(variant)).eval()
         self.video.load_state_dict(get_state_dict(video_path), strict=True)
-        self.video.update(0)
+        self.video.update(skip_threshold)
         self.video.half().to(self.device, memory_format=torch.channels_last)
 
     def tensor(self, frames):

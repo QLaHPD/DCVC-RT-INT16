@@ -9,6 +9,8 @@ encode/decode validation on Jetson. Integer arithmetic also has an independent
 CPU reference; additional physical GPU models still need validation.
 See [integer runtime and portability](docs/UF_INT16.md),
 [archive commands](docs/UF_ARCHIVE.md), and [FP16 baseline](docs/UF_BUNNY_VALIDATION.md).
+The [Pareto search](docs/UF_PARETO.md) finds nondominated size/PSNR settings
+without retaining its temporary bitstreams.
 
 ## Local workspace
 

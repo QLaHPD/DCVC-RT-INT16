@@ -38,6 +38,7 @@ class IntegerModel:
             raise RuntimeError('Rebuild UF entropy extension: integer decoder needs get_decoded_tensor')
         self._position_shape = None
         self._positions = None
+        self.skip_threshold = 0
         self.clear_dpb()
 
     def clear_dpb(self):
@@ -104,16 +105,36 @@ class IntegerModel:
                         scales, means = next_params.chunk(2, dim=1)
                     else:
                         means = run(m.y_spatial_prior, run(adaptor, restored, reduced))
-            index = self._indexes(scales.reshape(-1).index_select(0, position))
+            selected_scales = scales.reshape(-1).index_select(0, position)
             selected_means = means.reshape(-1).index_select(0, position).long()
-            if encode:
-                residual = y.reshape(-1).index_select(0, position).long() - selected_means
-                symbols = ops.divide_round(residual, ops.FEATURE_SCALE).clamp(-128, 127).to(torch.int8)
-                packed = (symbols.to(torch.int16) << 8) | index.to(torch.int16)
-                pending.append(packed.cpu().numpy().copy())
+            if self.skip_threshold:
+                active = selected_scales > self.skip_threshold
+                has_active = bool(active.any())
+                index = (self._indexes(selected_scales[active]) if has_active else
+                         torch.empty(0, dtype=torch.uint8, device=self.device))
+                symbols = torch.zeros(position.numel(), dtype=torch.int8, device=self.device)
+                if encode:
+                    residual = y.reshape(-1).index_select(0, position).long() - selected_means
+                    symbols[active] = ops.divide_round(residual[active], ops.FEATURE_SCALE).clamp(
+                        -128, 127).to(torch.int8)
+                    coded_symbols = symbols[active]
+                elif has_active:
+                    self.coder.decoder.decode_y(index.cpu().numpy())
+                    decoded = torch.from_numpy(self.coder.decoder.get_decoded_tensor()).to(self.device)
+                    symbols[active] = decoded
             else:
-                self.coder.decoder.decode_y(index.cpu().numpy())
-                symbols = torch.from_numpy(self.coder.decoder.get_decoded_tensor()).to(self.device)
+                index = self._indexes(selected_scales)
+                if encode:
+                    residual = y.reshape(-1).index_select(0, position).long() - selected_means
+                    symbols = ops.divide_round(residual, ops.FEATURE_SCALE).clamp(
+                        -128, 127).to(torch.int8)
+                    coded_symbols = symbols
+                else:
+                    self.coder.decoder.decode_y(index.cpu().numpy())
+                    symbols = torch.from_numpy(self.coder.decoder.get_decoded_tensor()).to(self.device)
+            if encode:
+                packed = (coded_symbols.to(torch.int16) << 8) | index.to(torch.int16)
+                pending.append(packed.cpu().numpy().copy())
             restored.view(-1).index_copy_(0, position,
                 ops.saturate(symbols.long()*ops.FEATURE_SCALE + selected_means))
         return ops.multiply(restored, q_dec), pending
@@ -164,7 +185,8 @@ class IntegerModel:
         self.coder.encoder.reset()
         # rANS is a stack: decode z first, then spatial partitions in ascending order.
         for part in reversed(parts):
-            self.coder.encoder.encode_y(part)
+            if part.size:
+                self.coder.encoder.encode_y(part)
         self.coder.encoder.encode_z(z.permute(0,2,3,1).contiguous().cpu().numpy(),
                                     qp*m.z_channel, m.z_channel)
         self.coder.encoder.flush()

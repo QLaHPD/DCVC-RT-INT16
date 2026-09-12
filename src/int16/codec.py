@@ -15,7 +15,8 @@ MAGIC = b'UF16\x01\x00\x00\x00'
 
 class IntegerCodec(Codec):
     def __init__(self, image_path, video_path, variant='hts', device=0,
-                 prepared_i=None, prepared_p=None, identities=None, source_hashes=None):
+                 prepared_i=None, prepared_p=None, identities=None, source_hashes=None,
+                 skip_threshold=0):
         set_torch_env()
         self.device = torch.device('cpu' if device == 'cpu' else f'cuda:{device}')
         if self.device.type == 'cuda':
@@ -39,6 +40,13 @@ class IntegerCodec(Codec):
         self.chunk_size = 1 if variant == 'ld' else 8
         self.image = IntegerModel(loaded[0], self.device)
         self.video = IntegerModel(loaded[1], self.device, reconstruct_on_encode=False)
+        self.set_skip_threshold(skip_threshold)
+
+    def set_skip_threshold(self, value):
+        threshold = int(float(value) * ops.FEATURE_SCALE + 0.5)
+        if threshold < 0 or threshold > 32767:
+            raise ValueError('skip_threshold is outside the INT16 feature range')
+        self.image.skip_threshold = self.video.skip_threshold = threshold
 
     def tensor(self, frames):
         values = torch.from_numpy(np.concatenate(frames, axis=0)).unsqueeze(0).to(self.device)
