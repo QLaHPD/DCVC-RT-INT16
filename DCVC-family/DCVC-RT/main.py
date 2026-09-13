@@ -24,6 +24,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    from src.cli.pareto_search import configure_parser as configure_pareto, run as run_pareto
+    pareto_parser = subparsers.add_parser('pareto-search', help='Search INT16 size/PSNR Pareto configurations')
+    configure_pareto(pareto_parser)
+    pareto_parser.set_defaults(handler=run_pareto)
+
     encode_parser = subparsers.add_parser(
         "encode",
         help="Encode videos and optional thumbnails into DCVC-RT bitstreams",

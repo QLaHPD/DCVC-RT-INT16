@@ -182,6 +182,10 @@ Checkpoints are intentionally not stored in Git. Download the official DCVC-RT c
 
 ## Encoding example
 
+For automatic rate/quality tuning on one source, see the
+[INT16 Pareto search](docs/PARETO_SEARCH.md): 800 balanced initial samples followed
+by genetic search, with atomic JSON progress and no retained test bitstreams.
+
 ```bash
 DCVC_USE_INT16=1 python main.py encode \
   --base_root /data/incoming \
