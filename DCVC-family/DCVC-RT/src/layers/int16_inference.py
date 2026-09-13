@@ -78,7 +78,9 @@ def round_divide(x, denominator):
     if torch.is_tensor(denominator):
         denominator = denominator.to(device=x.device, dtype=torch.int32)
     else:
-        denominator = torch.tensor(denominator, device=x.device, dtype=torch.int32)
+        # Keep scalar divisors on the host: torch.tensor(..., device="cuda")
+        # performs a host-to-device copy that is forbidden during graph capture.
+        denominator = int(denominator)
     abs_x = torch.abs(x)
     return torch.where(x >= 0,
                        (abs_x + denominator // 2) // denominator,
