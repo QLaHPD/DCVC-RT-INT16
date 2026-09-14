@@ -145,7 +145,7 @@ def upload_timestamp(info):
     raise ValueError('Remote video has no publication timestamp or upload date')
 
 
-def existing_stream_archives(channel_out):
+def existing_stream_archives(channel_out, completed=None, config=None):
     """One metadata snapshot per channel, preserving prior naming on resume."""
     archives = {}
     for path in Path(channel_out).glob('*.uf.json'):
@@ -155,12 +155,33 @@ def existing_stream_archives(channel_out):
         if url in archives:
             raise ValueError(f'Multiple archives for {url}: {archives[url]} and {path}')
         archives[url] = path
+        if completed is not None and config is not None and not path.is_symlink():
+            from src.archive.storage import has_completion_record, artifact_path
+            artifacts = data.get('artifacts', {})
+            if data.get('pipeline') != config or not has_completion_record(data) or 'video.bin' not in artifacts:
+                continue
+            if config.get('audio') == 'opus' and data.get('source', {}).get('media', {}).get('audio') and 'audio.opus' not in artifacts:
+                continue
+            try:
+                if all(not (artifact := artifact_path(path.parent, data, name)).is_symlink()
+                       and artifact.is_file() and artifact.stat().st_size == record['size']
+                       for name, record in artifacts.items()):
+                    completed.add(url)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
     return archives
 
-def stream_jobs(args, binary, counts, cancel_event=None):
+def stream_jobs(args, binary, counts, cancel_event=None, config=None):
     from src.archive.media import decoder_thread_budget
     seen = set()
-    archives = {}
+    archives, completed = {}, {}
+    scheduled = 0
+    def snapshot(channel):
+        if channel not in archives:
+            completed[channel] = set()
+            archives[channel] = existing_stream_archives(Path(args.output_root).resolve()/channel,
+                                                         completed[channel], config)
+        return completed[channel]
     for url in args.source_urls:
         if cancel_event is not None and cancel_event.is_set(): return
         listing = metadata(url, binary, args.cookies, flat=True, cancel_event=cancel_event)
@@ -168,26 +189,33 @@ def stream_jobs(args, binary, counts, cancel_event=None):
         if entries is None:
             entries = [listing]
         # Channel handles can resolve to a list of tabs.
-        pending = list(entries)
+        pending = [(entry, listing.get('channel_id')) for entry in entries]
         while pending:
             if cancel_event is not None and cancel_event.is_set(): return
-            entry = pending.pop(0)
+            entry, channel_hint = pending.pop(0)
             if not entry:
                 continue
             if entry.get('_type') in ('playlist', 'multi_video'):
                 sub = entry if entry.get('entries') is not None else metadata(entry['url'], binary, args.cookies, flat=True, cancel_event=cancel_event)
-                pending.extend(sub.get('entries') or [])
+                pending.extend((item, sub.get('channel_id') or channel_hint) for item in (sub.get('entries') or []))
                 continue
             try:
                 youtube = 'twitch.tv' not in url.lower()
                 video_id = safe_id(entry.get('id')) if youtube else safe_component(entry.get('id'))
                 if video_id in seen:
                     continue
-                if getattr(args,'max_videos',None) and len(seen) >= args.max_videos:
-                    return
                 seen.add(video_id)
-                event('run_discovered', total=len(seen)+len(pending))
                 video_url = 'https://www.youtube.com/watch?v=' + video_id if youtube else (entry.get('webpage_url') or entry.get('url') or 'https://www.twitch.tv/videos/'+video_id.lstrip('v'))
+                hint = entry.get('channel_id') or channel_hint
+                if hint:
+                    hint = safe_id(hint, channel=True) if youtube else safe_component(hint)
+                    if video_url in snapshot(hint):
+                        counts['resumed'] = counts.get('resumed', 0) + 1
+                        continue
+                if getattr(args,'max_videos',None) and scheduled >= args.max_videos:
+                    return
+                scheduled += 1
+                event('run_discovered', total=scheduled+len(pending))
                 event('stream_resolving', video_id=video_id)
                 info = metadata(video_url, binary, args.cookies, cancel_event=cancel_event)
                 if info.get('is_live') or info.get('live_status') == 'is_upcoming':
@@ -206,8 +234,10 @@ def stream_jobs(args, binary, counts, cancel_event=None):
                               public_metadata=public, thumbnail=info.get('thumbnail'),thumbnail_headers=info.get('http_headers'), write_thumbnail=getattr(args,'write_thumbnail',True),
                               thumbnail_codec=getattr(args,'thumbnail_codec','keep'),thumbnail_qp=getattr(args,'thumbnail_qp',45))
                 legacy = Path(args.output_root).resolve() / channel / (video_id + '.uf')
-                if channel not in archives:
-                    archives[channel] = existing_stream_archives(legacy.parent)
+                if video_url in snapshot(channel):
+                    counts['resumed'] = counts.get('resumed', 0) + 1
+                    scheduled -= 1
+                    continue
                 final = archives[channel].get(video_url)
                 if final is None:
                     final = legacy.with_name(f'{video_id}_{upload_timestamp(info)}.uf.json')
@@ -222,6 +252,7 @@ def stream_jobs(args, binary, counts, cancel_event=None):
             except Exception as exc:
                 counts['failed'] += 1
                 event('stream_failed', video_id=entry.get('id'), error=str(exc))
+    event('run_discovered', total=scheduled)
 
 
 def run_stream(args):

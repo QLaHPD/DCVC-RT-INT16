@@ -99,6 +99,24 @@ models or hardware can change both quality and performance. No per-video PSNR
 measurement or search is added, and the selector does not change the output
 format or pipeline identity beyond the actual selected codec settings.
 
+### Skip completed channel entries before resolving videos
+
+Streaming compares the channel listing with one local archive snapshot per
+channel. A compatible committed `.uf.json` plus all recorded artifacts (including
+`.bin` and required audio) at their expected sizes removes that entry before
+per-video yt-dlp metadata, downloads or worker startup. Completed entries produce
+no individual resume message; the final `resumed` count includes them.
+`--max-videos` applies to remaining work. Nested channel tabs inherit channel IDs.
+If the provider omits the channel ID in the listing, metadata must resolve it
+before the same completion check can run.
+
+This fast startup check does not hash entire bitstreams: use `verify` for full
+integrity verification. Missing/truncated outputs, missing commit records and
+incompatible settings stay on the normal checked worker path. Bare `.bin` names
+and hidden stages are insufficient. Thumbnail downloads are not retried for
+videos removed by this completed-video filter. Concurrent completions after the
+snapshot still pass through the existing worker ownership/resume checks.
+
 ### RAM staging and atomic output
 
 Video bitstreams, encoded Opus and intra-image payloads are staged in Linux

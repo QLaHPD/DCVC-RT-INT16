@@ -231,7 +231,7 @@ def execute_stream_jobs(args, config, paths, binary, counts):
     context = multiprocessing.get_context('spawn')
     policy = BufferPolicy(context)
     stop = threading.Event()
-    producer = AheadJobs(stream_jobs(args, binary, counts, cancel_event=stop), stop)
+    producer = AheadJobs(stream_jobs(args, binary, counts, cancel_event=stop, config=config), stop)
     devices = ['cpu'] if args.device == 'cpu' else (args.cuda_idx or [0])
     free = [devices[i % len(devices)] for i in range(args.procs)]
     active, outcomes, failed = [], [], set()
