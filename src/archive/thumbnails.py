@@ -9,7 +9,7 @@ import tempfile
 import numpy as np
 from PIL import Image, ImageOps
 
-from src.archive.storage import SharedWorkPool, Heartbeat, identity, sha256, sync_directory, event, has_completion_record
+from src.archive.storage import SharedWorkPool, Heartbeat, identity, sha256, sync_directory, event, has_completion_record, memory_stage_root, completed_disk_stage
 
 MAGIC = b'UFIMAGE\x01'
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff', '.avif'}
@@ -122,7 +122,7 @@ def encode_images(jobs, config, paths, device, instance=None, codec=None, source
                     codec = make_codec(config,paths,device)
                 reader = ImageReader(source)
                 event('encode_started',source=str(source),message=f'{reader.original_width}x{reader.original_height} -> {reader.original_width}x{reader.original_height} (intra image)')
-                with tempfile.TemporaryDirectory(prefix='.uf-image-',dir=target.parent) as temporary:
+                with tempfile.TemporaryDirectory(prefix='uf-image-',dir=memory_stage_root()) as temporary:
                     payload = Path(temporary)/'intra.bin'
                     result = codec.encode(reader,payload,config['qp_i'],config['qp_i'],intra_period=1,max_frames=1)
                     result.update(width=reader.width,height=reader.height,fps=1)
@@ -140,8 +140,14 @@ def encode_images(jobs, config, paths, device, instance=None, codec=None, source
                     if identity(source)!=before or sha256(source)!=digest:
                         raise ValueError('Thumbnail changed during encoding')
                     pulse.check()
-                    os.link(stage,target)  # No replacement, including after a lost claim.
-                    sync_directory(target.parent)
+                    payload.unlink()
+                    disk_stage = completed_disk_stage(temporary, target, pulse)
+                    try:
+                        pulse.check()
+                        os.link(disk_stage/target.name,target)  # Never replace a peer output.
+                        sync_directory(target.parent)
+                    finally:
+                        shutil.rmtree(disk_stage)
                 event('encode_completed',source=str(source),archive=str(target),**result)
         except Exception as exc:
             failed.add(str(target.parent)); event('encode_failed',source=str(source),error=str(exc))

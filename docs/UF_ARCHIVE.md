@@ -99,6 +99,28 @@ models or hardware can change both quality and performance. No per-video PSNR
 measurement or search is added, and the selector does not change the output
 format or pipeline identity beyond the actual selected codec settings.
 
+### RAM staging and atomic output
+
+Video bitstreams, encoded Opus and intra-image payloads are staged in Linux
+`/dev/shm` (tmpfs) while encoding. There is no disk fallback: insufficient tmpfs
+space fails the job and leaves final output unpublished. Budget RAM for the
+completed compressed video/audio per worker in addition to models and frame
+buffers. Downloaded source videos still pass through pipes.
+
+Only after encoding and integrity checks finish are completed bytes copied into
+a hidden stage on the destination filesystem, synced, and atomically linked to
+final names without replacement. A same-filesystem copy is necessary because
+RAM-to-disk rename/link cannot be atomic. The manifest commits the completed
+video archive last. A crash during this final publication may leave a hidden
+disk stage and pending journal for existing recovery logic. Older disk stages
+are retained for recovery; changing the staging policy does not delete them.
+Normal success/failure removes RAM staging; a forced kill can leave RAM files
+until cleanup or reboot. tmpfs follows the operating system's swap policy.
+
+Shared pipeline mismatches now report differing fields. Existing channel
+pipelines that omit `opus_frame_ms` use the historical 20 ms default; resume
+those with `--opus_frame_ms 20`, even though new CLI runs default to 60 ms.
+
 ## Names, resume and shared work
 
 For a local `clip.mkv`, outputs are:

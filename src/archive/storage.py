@@ -10,6 +10,39 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import shutil
+
+
+def memory_stage_root():
+    """Require Linux RAM-backed staging; never silently spill encodes to disk."""
+    root = Path('/dev/shm')
+    mounts = Path('/proc/mounts').read_text().splitlines()
+    if not any(parts[1:3] == ['/dev/shm', 'tmpfs'] for parts in map(str.split, mounts)):
+        raise RuntimeError('Encoding requires /dev/shm mounted as tmpfs for RAM staging')
+    return root
+
+
+def completed_disk_stage(memory_stage, final, heartbeat):
+    """Copy completed output to the destination filesystem before atomic commit."""
+    final = Path(final)
+    heartbeat.check()
+    stage = Path(tempfile.mkdtemp(prefix='.' + final.name + '.stage-', dir=final.parent))
+    try:
+        for source in Path(memory_stage).iterdir():
+            heartbeat.check()
+            target = stage / source.name
+            with source.open('rb') as reader, target.open('xb') as writer:
+                while chunk := reader.read(1024 * 1024):
+                    heartbeat.check()
+                    writer.write(chunk)
+                writer.flush()
+                os.fsync(writer.fileno())
+        sync_directory(stage)
+        heartbeat.check()
+        return stage
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
 
 # Reuse the tested, filesystem-based lease protocol without importing RT models.
 _SHARED_PATH = Path(__file__).resolve().parents[2] / 'DCVC-family/DCVC-RT/src/cli/shared_work.py'
@@ -21,6 +54,23 @@ class SharedWorkPool(_shared.SharedWorkPool):
     @staticmethod
     def root(channel_out):
         return Path(channel_out) / '.dcvc-uf-shared-work'
+
+    def ensure_pipeline(self, channel_out, config):
+        try:
+            return super().ensure_pipeline(channel_out, config)
+        except _shared.SharedWorkError as exc:
+            try:
+                previous = json.loads((self.root(channel_out)/'pipeline.json').read_text())['config']
+                defaults = {'opus_frame_ms': 20, 'opus_complexity': 10, 'opus_vbr': 'on'}
+                differences = [f'{key}: saved={previous.get(key, defaults.get(key))!r}, '
+                               f'requested={config.get(key, defaults.get(key))!r}'
+                               for key in sorted(previous.keys() | config.keys())
+                               if previous.get(key, defaults.get(key)) != config.get(key, defaults.get(key))]
+            except (OSError, ValueError, KeyError, TypeError):
+                raise exc
+            if differences:
+                raise _shared.SharedWorkError(f'{exc}; ' + '; '.join(differences)) from exc
+            raise
 
 
 sha256 = _shared.file_sha256

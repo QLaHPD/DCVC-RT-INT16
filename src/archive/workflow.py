@@ -17,7 +17,8 @@ from src.archive.media import (VIDEO_EXTENSIONS, FrameReader, decoder_thread_bud
                                dimensions, encode_audio, probe, verify_audio)
 from src.archive.storage import (SharedWorkPool, Heartbeat, atomic_json, bundle_path, event,
                                  identity, load_bundle, sha256, sync_directory, artifact_path, control_path,
-                                 archive_location, archive_lease, publish_flat, recover_flat)
+                                 archive_location, archive_lease, publish_flat, recover_flat,
+                                 memory_stage_root, completed_disk_stage)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -194,7 +195,7 @@ def encode_job(job, config, paths, device, instance):
                   runtime=config.get('runtime', 'fp16'),
                   resolution=f"{original['width']}x{original['height']} -> {width}x{height}", fps=fps,
                   variant=config['variant'], qi=config['qp_i'], qp=config['qp_p'])
-            stage = Path(tempfile.mkdtemp(prefix='.' + final.name + '.stage-', dir=parent))
+            stage = Path(tempfile.mkdtemp(prefix='uf-encode-', dir=memory_stage_root()))
             codec = make_codec(config, paths, device)
             last = [0.0]
             policy = job.get('buffer_policy') if remote else None
@@ -283,6 +284,10 @@ def encode_job(job, config, paths, device, instance):
             # overwrite a nonempty peer archive. Partial work is always hidden.
             if final.exists():
                 raise FileExistsError(final)
+            event('publication_started', source=str(source), message='Encoding complete; copying RAM output for atomic publication')
+            memory_stage = stage
+            stage = completed_disk_stage(memory_stage, final, pulse)
+            shutil.rmtree(memory_stage)
             if flat:
                 publish_flat(stage, final, metadata, pulse, job_id)
                 shutil.rmtree(stage)
