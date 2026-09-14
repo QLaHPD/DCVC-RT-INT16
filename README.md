@@ -50,6 +50,19 @@ remains on `int16-managed`.
 Keep model files, native binaries, caches, datasets and outputs out of Git. The
 existing RT runtime and its prepared INT16 files remain in their original location.
 
+### Choose settings by benchmark PSNR
+
+Add `--target-psnr 30` to `encode` or `stream` to select the fastest measured
+configuration with PSNR ≥30 dB; smaller bitstream size breaks equal-time ties.
+This fills INT16, HT-L, 144p and the five codec parameters automatically.
+Explicit codec parameters constrain the candidate search; omit the target to
+keep fully manual settings. The target is a **benchmark reference**, not a
+quality guarantee for new content. See the [published 2,000-trial benchmark](benchmarks/README.md).
+
+```bash
+./scripts/uf-python main.py encode --input_file video.mp4 --output_root output --target-psnr 30
+```
+
 ### YouTube streaming
 
 `stream` (also `encode --source_urls`) feeds yt-dlp output directly to FFmpeg and the UF encoder, without keeping downloaded source videos. Completed, hash-recorded files (`VIDEO_ID_UNIX_TIMESTAMP_WIDTHxHEIGHT_qIQI_qPQP.bin`, matching `.opus`, and `.uf.json`) are stored directly under the resolved YouTube channel ID, without a per-video directory. Existing archives retain the normal compatibility and integrity checks. Each video uses a fresh worker; `--procs` and `--cuda_idx` support multiple GPUs. Streaming processes complete videos. Input buffering starts at eight frames and calibrates once after five seconds to two seconds of measured encoding throughput. The next video download starts near the current download’s end to overlap yt-dlp startup; see [streaming buffering details](docs/UF_ARCHIVE.md#encode-and-stream).

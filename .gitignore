@@ -48,3 +48,6 @@ DCVC-family/DCVC-RT/data/training/
 *.uf/
 .dcvc-uf-shared-work/
 .uf-progress.jsonl
+
+# Published UF calibration measurements (no models or media).
+!/benchmarks/uf-int16-htl-144p-pareto.json

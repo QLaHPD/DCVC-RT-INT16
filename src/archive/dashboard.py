@@ -87,6 +87,8 @@ def _backend(args, events, commands):
     install(events, commands if args._ui_interactive else None)
     from src.archive.storage import event
     try:
+        if getattr(args, "target_psnr_selection", None):
+            event("target_psnr_selected", **args.target_psnr_selection)
         code = args.handler(args)
     except BaseException as exc:
         event('backend_error', error=f'{type(exc).__name__}: {exc}')

@@ -5,6 +5,8 @@ import argparse
 import math
 import sys
 
+from src.archive.presets import ExplicitCodecOption, apply_target_psnr
+
 from src.archive.workflow import run_encode, run_decode, run_cleanup, run_prepare
 from src.archive.pareto import run_pareto_search
 
@@ -53,14 +55,15 @@ def build_parser():
     encode.add_argument('--output_root', required=True)
     encode.add_argument('--channel_ids', nargs='+')
     encode.add_argument('--recursive', action=argparse.BooleanOptionalAction, default=True)
-    encode.add_argument('--qi', '--qp_i', dest='qp_i', type=int, choices=range(64), default=36)
-    encode.add_argument('--qp', '--qp_p', dest='qp_p', type=int, choices=range(64), default=30)
+    encode.add_argument('--qi', '--qp_i', action=ExplicitCodecOption, dest='qp_i', type=int, choices=range(64), default=36)
+    encode.add_argument('--qp', '--qp_p', action=ExplicitCodecOption, dest='qp_p', type=int, choices=range(64), default=30)
+    encode.add_argument('--target-psnr', type=positive, help='Select the fastest measured configuration meeting benchmark PSNR; smaller bytes break ties')
     encode.add_argument('--fps', type=positive)
-    encode.add_argument('--resolution', type=int, help='Short edge; preserve aspect ratio. Default: original size')
-    encode.add_argument('--model_structure', choices=('hts', 'htl', 'ld'), default='hts')
+    encode.add_argument('--resolution', action=ExplicitCodecOption, type=int, help='Short edge; preserve aspect ratio. Default: original size')
+    encode.add_argument('--model_structure', action=ExplicitCodecOption, choices=('hts', 'htl', 'ld'), default='hts')
     encode.add_argument('--model_path_i')
     encode.add_argument('--model_path_p')
-    encode.add_argument('--runtime', choices=('fp16', 'int16'), default='fp16')
+    encode.add_argument('--runtime', action=ExplicitCodecOption, choices=('fp16', 'int16'), default='fp16')
     encode.add_argument('--cuda', type=str2bool, default=True)
     encode.add_argument('--thumbnail_codec', choices=('keep','dcvc-intra'), default='keep')
     encode.add_argument('--thumbnail_qp', type=int, choices=range(64), default=45)
@@ -74,9 +77,9 @@ def build_parser():
     encode.add_argument('--prefetch_frames', '--ffmpeg_prefetch', type=int,
                         help='Read ahead frames (default: INT16 8, FP16 0); queue capped at 8 MiB or one frame')
     encode.add_argument('--cuda_idx', type=int, nargs='+', default=[0])
-    encode.add_argument('--reset_interval', type=int, default=32)
-    encode.add_argument('--intra_period', '--force_intra_period', type=int, default=-1)
-    encode.add_argument('--skip_thres', type=skip_threshold, default=0,
+    encode.add_argument('--reset_interval', action=ExplicitCodecOption, type=int, default=32)
+    encode.add_argument('--intra_period', '--force_intra_period', action=ExplicitCodecOption, type=int, default=-1)
+    encode.add_argument('--skip_thres', action=ExplicitCodecOption, type=skip_threshold, default=0,
                         help='Do not code latent residuals whose predicted scale is at or below this value')
     encode.add_argument('--max_frames', type=int)
     encode.add_argument('--audio', choices=('opus', 'none'), default='opus')
@@ -187,6 +190,10 @@ def main():
         if args.command == 'decode' and args.input and args.input_folder:
             parser.error('select one of --input_file and --input_folder')
     if args.command in ('encode', 'stream'):
+        try:
+            apply_target_psnr(args)
+        except ValueError as exc:
+            parser.error(str(exc))
         if args.youtube_channels or (args.twitch_channels and not args.base_root):
             if args.input_file or args.base_root:
                 parser.error('remote channel inputs cannot be combined with local input')

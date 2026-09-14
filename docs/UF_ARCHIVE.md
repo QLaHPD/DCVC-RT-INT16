@@ -74,6 +74,31 @@ without saving a source video. Cookies still use private temporary copies, and
 shared claims and atomic publication remain enforced by the encoding worker.
 Restart an existing streaming run to activate this scheduler.
 
+### Benchmark quality selection
+
+`--target-psnr 30` works with local `encode`, `stream`, and `encode --source_urls`.
+It uses the bundled [benchmark](../benchmarks/README.md), including all successful
+trials, rather than only the size/quality Pareto frontier (which excludes some
+fast configurations). Candidates must reach the requested PSNR; ordering is
+encoding seconds, then bitstream bytes, then trial number for deterministic ties.
+Time and size are competing objectives, so time has priority.
+
+The selector fills `--runtime int16 --model_structure htl --resolution 144` and
+`--qp_i`, `--qp_p`, `--reset_interval`, `--intra_period`, `--skip_thres`.
+Explicit codec parameters, including aliases `--qi`, `--qp`, and
+`--force_intra_period`, constrain selection and are retained. If no measured
+candidate qualifies, the command fails before downloading or loading models.
+Explicitly requesting another runtime, model structure or resolution also fails;
+omit `--target-psnr` for unrestricted manual settings. Audio, process count,
+source FPS and other options retain their usual behavior.
+
+The selected trial, parameters and measured size/time/PSNR are printed in a
+`target_psnr_selected` event. PSNR comes from the benchmark source, and speed
+comes from the benchmark hardware. Different content, frame rates, prepared
+models or hardware can change both quality and performance. No per-video PSNR
+measurement or search is added, and the selector does not change the output
+format or pipeline identity beyond the actual selected codec settings.
+
 ## Names, resume and shared work
 
 For a local `clip.mkv`, outputs are:
