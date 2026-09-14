@@ -33,10 +33,13 @@ def skip_threshold(value):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    encode = commands.add_parser('encode', help='Encode a video or directory into resumable UF archives')
+    encode = commands.add_parser('encode', aliases=['stream'], help='Encode a video or directory into resumable UF archives')
     sources = encode.add_mutually_exclusive_group(required=True)
     sources.add_argument('--input_file', '--input-file')
     sources.add_argument('--base_root', '--input_folder')
+    sources.add_argument('--source_urls', nargs='+', help='YouTube video or channel URLs; stream without keeping source videos')
+    encode.add_argument('--cookies', help='Cookie file; each yt-dlp call uses a private temporary copy')
+    encode.add_argument('--ytdlp_bin', default='yt-dlp')
     encode.add_argument('--output_root', required=True)
     encode.add_argument('--channel_ids', nargs='+')
     encode.add_argument('--recursive', action=argparse.BooleanOptionalAction, default=True)
@@ -67,8 +70,28 @@ def build_parser():
     encode.add_argument('--opus_bitrate', default='6k')
     encode.add_argument('--shared-work', action='store_true', help='Accepted for RT command compatibility; UF always uses cooperative claims')
     encode.add_argument('--shared-instance')
-    encode.add_argument('--ui', choices=('auto', 'plain'), default='auto', help='Timestamped events, also persisted beside archives')
+    encode.add_argument('--ui', choices=('auto', 'plain', 'tui'), default='auto', help='Timestamped events, also persisted beside archives')
+    policy = encode.add_mutually_exclusive_group()
+    policy.add_argument('--auto-delete', action='store_true', help='After encoding, verify archives and delete only their local originals')
+    policy.add_argument('--keep-originals', action='store_true', help='Retain originals and exit without waiting for TUI cleanup')
+    policy.add_argument('--cleanup-dry-run', action='store_true', help='Preview exact original paths without deleting')
     encode.set_defaults(handler=run_encode)
+    from src.archive.lifecycle import run_manage
+    manage = commands.add_parser('manage', help='Review existing channel archives and delete verified originals')
+    manage.add_argument('--output_root', required=True)
+    manage.add_argument('--channel_ids', nargs='+')
+    manage.add_argument('--ui', choices=('auto', 'plain', 'tui'), default='auto')
+    manage.add_argument('--model_path_i')
+    manage.add_argument('--model_path_p')
+    manage.add_argument('--prepared_i')
+    manage.add_argument('--prepared_p')
+    manage.add_argument('--device', choices=('cuda', 'cpu'), default='cuda')
+    manage.add_argument('--cuda_idx', type=int, default=0)
+    policy = manage.add_mutually_exclusive_group()
+    policy.add_argument('--auto-delete', action='store_true')
+    policy.add_argument('--keep-originals', action='store_true')
+    policy.add_argument('--cleanup-dry-run', action='store_true')
+    manage.set_defaults(handler=run_manage)
     pareto = commands.add_parser('pareto-search', help='Find size/PSNR Pareto configurations for one video')
     pareto.add_argument('--input_file', '--input-file', required=True)
     pareto.add_argument('--output_json', required=True)
@@ -96,7 +119,7 @@ def build_parser():
     prepare.set_defaults(handler=run_prepare)
     for command in ('decode', 'verify', 'view', 'cleanup'):
         child = commands.add_parser(command)
-        child.add_argument('--input', '--input_file', required=True, help='UF archive directory or its video.bin')
+        child.add_argument('--input', '--input_file', required=True, help='Flat .bin/.uf.json or legacy UF archive directory')
         child.add_argument('--model_path_i')
         child.add_argument('--model_path_p')
         child.add_argument('--cuda_idx', type=int, default=0)
@@ -117,7 +140,7 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    if args.command == 'encode':
+    if args.command in ('encode', 'stream'):
         if args.input_threads is None:
             from src.archive.media import decoder_thread_budget
             args.input_threads = decoder_thread_budget(args.procs) if args.runtime == 'int16' else 1
@@ -150,6 +173,9 @@ def main():
     elif getattr(args, 'cuda_idx', 0) < 0:
         parser.error('--cuda_idx must be nonnegative')
     try:
+        if args.command in ('encode', 'stream', 'manage'):
+            from src.archive.dashboard import run
+            return run(args)
         return args.handler(args)
     except KeyboardInterrupt:
         print('Interrupted; completed archives and originals are retained.', file=sys.stderr)

@@ -1,10 +1,12 @@
 """Resumable UF video archives with atomic publication and exact-path cleanup."""
 
+from contextlib import nullcontext
 import hashlib
 import json
 import multiprocessing
 import os
 from pathlib import Path
+from src.archive.dashboard import event_queue
 import shutil
 import subprocess
 import sys
@@ -14,7 +16,8 @@ import time
 from src.archive.media import (VIDEO_EXTENSIONS, FrameReader, decoder_thread_budget,
                                dimensions, encode_audio, probe, verify_audio)
 from src.archive.storage import (SharedWorkPool, Heartbeat, atomic_json, bundle_path, event,
-                                 identity, load_bundle, sha256, sync_directory)
+                                 identity, load_bundle, sha256, sync_directory, artifact_path, control_path,
+                                 archive_location, archive_lease, publish_flat, recover_flat)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -106,11 +109,16 @@ def discover(args):
     prefetch_frames = getattr(args, 'prefetch_frames', None)
     if prefetch_frames is None:
         prefetch_frames = 8 if integer else 0
+    from collections import Counter
+    stem_counts = Counter((p.relative_to(base).parent, p.stem) for p in set(sources))
     for source in sorted(set(sources)):
         relative = source.relative_to(base)
-        final = output / relative.parent / (source.name + '.uf')
+        legacy = output / relative.parent / (source.name + '.uf')
+        stem = source.name if stem_counts[(relative.parent, source.stem)] > 1 else source.stem
+        final = output / relative.parent / (stem + '.uf.json')
         jobs.append({'source': str(source), 'relative': str(relative), 'final': str(final),
-                     'input_threads': input_threads, 'prefetch_frames': prefetch_frames})
+                     'input_threads': input_threads, 'prefetch_frames': prefetch_frames,
+                     'layout': 'flat', 'legacy': str(legacy), 'lease_key': legacy.name})
     return jobs
 
 
@@ -123,7 +131,10 @@ def _copy_sidecars(source, stage):
 
 def encode_job(job, config, paths, device, instance):
     source, final = Path(job['source']), Path(job['final'])
-    parent, job_id = final.parent, final.name
+    remote = job.get('remote')
+    flat = job.get('layout') == 'flat'
+    legacy = Path(job['legacy']) if job.get('legacy') else None
+    parent, job_id = final.parent, job.get('lease_key', final.name)
     parent.mkdir(parents=True, exist_ok=True)
     os.environ['UF_PROGRESS_LOG'] = str(parent / '.uf-progress.jsonl')
     pool = SharedWorkPool(lease_seconds=900, instance_name=instance)
@@ -135,15 +146,25 @@ def encode_job(job, config, paths, device, instance):
     stage = None
     try:
         with Heartbeat(lease) as pulse:
-            if final.exists():
-                _, previous = load_bundle(final, config)
-                if previous['source']['sha256'] != sha256(source):
+            existing = final if final.exists() else (legacy if legacy and legacy.exists() else None)
+            if existing is not None:
+                _, previous = load_bundle(existing, config)
+                if remote and previous['source'].get('url') != remote['url']:
+                    raise ValueError('Existing archive has a different source URL')
+                if not remote and previous['source']['sha256'] != sha256(source):
                     raise ValueError('Original changed since the existing archive was produced')
-                event('already_encoded', source=str(source), archive=str(final))
+                event('already_encoded', source=str(source), archive=str(existing))
                 return 'resumed'
-            before = identity(source)
-            source_sha = sha256(source)
-            original = probe(source)
+            before = {} if remote else identity(source)
+            source_sha = None if remote else sha256(source)
+            if flat:
+                recovered = recover_flat(final, config, pulse, job_id, source, source_sha,
+                                         remote['url'] if remote else None)
+                if recovered is not None:
+                    event('encode_completed', source=str(source), archive=str(final), recovered=True,
+                          **recovered['video'], video_bytes=recovered['artifacts']['video.bin']['size'])
+                    return 'encoded'
+            original = remote['media'] if remote else probe(source)
             width, height = dimensions(original['width'], original['height'], config['resolution'])
             fps = config['fps'] or original['fps']
             if not fps or fps <= 0:
@@ -163,25 +184,31 @@ def encode_job(job, config, paths, device, instance):
                     event('encode_progress', source=source.name, **values)
                     last[0] = now
                     pulse.check()
-            with FrameReader(source, width, height, original, fps,
+            from src.archive.streaming import download_pipe
+            with (download_pipe(remote, remote['video_format']) if remote else nullcontext(None)) as input_pipe, \
+                    FrameReader('pipe:0' if remote else source, width, height, original, fps,
                              decoder_threads=job.get('input_threads', 1),
-                             prefetch_frames=job.get('prefetch_frames', 0)) as reader:
+                             prefetch_frames=job.get('prefetch_frames', 0), input_pipe=input_pipe) as reader:
                 result = codec.encode(reader, stage / 'video.bin', config['qp_i'], config['qp_p'],
                                       config['reset_interval'], config['intra_period'], config['max_frames'], progress)
             result.update(width=width, height=height, fps=fps)
             if config['audio'] == 'opus' and original['audio']:
-                encode_audio(source, stage / 'audio.opus', config['opus_channels'], config['opus_bitrate'], result['frames'] / fps)
+                with (download_pipe(remote, remote['audio_format']) if remote else nullcontext(None)) as audio_pipe:
+                    encode_audio('pipe:0' if remote else source, stage / 'audio.opus', config['opus_channels'], config['opus_bitrate'], result['frames'] / fps, input_pipe=audio_pipe)
                 verify_audio(stage / 'audio.opus')
             event('validation_started', source=source.name, frames=result['frames'])
             validation = codec.decode(stage / 'video.bin', result)
-            if identity(source) != before or sha256(source) != source_sha:
+            if not remote and (identity(source) != before or sha256(source) != source_sha):
                 raise ValueError('Original changed during encoding; refusing to publish')
-            _copy_sidecars(source, stage)
+            if remote:
+                atomic_json(stage / 'source.info.json', remote['public_metadata'])
+            else:
+                _copy_sidecars(source, stage)
             artifacts = {p.name: {'size': p.stat().st_size, 'sha256': sha256(p)} for p in stage.iterdir()}
             import torch
             metadata = {'format': 'dcvc-uf-archive', 'version': 1, 'pipeline': config,
                         'source': {'path': str(source), 'relative_path': job['relative'],
-                                   'sha256': source_sha, **before, 'media': original},
+                                   'sha256': source_sha, **before, 'media': original, **({'url': remote['url'], 'kind': 'youtube'} if remote else {})},
                         'video': result, 'validation': validation, 'artifacts': artifacts,
                         'environment': {'torch': torch.__version__, 'cuda': torch.version.cuda,
                                         'gpu': 'CPU reference' if device == 'cpu' else torch.cuda.get_device_name(device)}}
@@ -195,22 +222,28 @@ def encode_job(job, config, paths, device, instance):
             # overwrite a nonempty peer archive. Partial work is always hidden.
             if final.exists():
                 raise FileExistsError(final)
-            stage.rename(final)
+            if flat:
+                publish_flat(stage, final, metadata, pulse, job_id)
+                shutil.rmtree(stage)
+            else:
+                stage.rename(final)
             stage = None
             sync_directory(parent)
-            event('encode_completed', archive=str(final), **result,
+            event('encode_completed', source=str(source), archive=str(final), **result,
                   video_bytes=metadata['artifacts']['video.bin']['size'])
             return 'encoded'
     except Exception as exc:
         event('encode_failed', source=str(source), error=f'{type(exc).__name__}: {exc}')
         return 'failed'
     finally:
-        if stage is not None:
+        if stage is not None and not (flat and (parent / ('.' + final.name + '.pending')).exists()):
             shutil.rmtree(stage, ignore_errors=True)
         lease.release()
 
 
-def _job_entry(connection, *args):
+def _job_entry(connection, *args, event_queue=None):
+    from src.archive.dashboard import install
+    install(event_queue)
     try:
         connection.send(encode_job(*args))
     except Exception as exc:
@@ -221,10 +254,17 @@ def _job_entry(connection, *args):
 
 
 def run_encode(args):
+    if getattr(args, 'source_urls', None):
+        from src.archive.streaming import run_stream
+        return run_stream(args)
     config, paths = pipeline(args)
     jobs = discover(args)
+    args._cleanup_sources = {str(Path(job['source']).absolute()) for job in jobs}
     if not jobs:
-        raise ValueError('No input video files found')
+        from src.archive.lifecycle import finish
+        from src.archive.dashboard import command_queue
+        finish(args, command_queue())
+        return 0
     devices = ['cpu'] if getattr(args, 'device', 'cuda') == 'cpu' else (args.cuda_idx or [0])
     if args.procs < 1:
         raise ValueError('--procs must be positive')
@@ -233,6 +273,7 @@ def run_encode(args):
     context = multiprocessing.get_context('spawn')
     remaining = list(enumerate(jobs))
     outcomes = []
+    failed_channels = set()
     active = []
     free_devices = [devices[index % len(devices)] for index in range(args.procs)]
     try:
@@ -242,7 +283,8 @@ def run_encode(args):
                 device = free_devices.pop(0)
                 reader, writer = context.Pipe(duplex=False)
                 process = context.Process(target=_job_entry, args=(writer, job, config, paths,
-                                          device, args.shared_instance))
+                                          device, args.shared_instance),
+                                          kwargs={'event_queue': event_queue()})
                 process.start()
                 writer.close()
                 active.append((process, reader, job, device))
@@ -257,6 +299,8 @@ def run_encode(args):
                         event('worker_failed', source=job['source'], exitcode=process.exitcode)
                         status = 'failed'
                     outcomes.append(status)
+                    if status in ('failed', 'busy'):
+                        failed_channels.add(str(Path(job['final']).parent))
                     reader.close()
                     active.remove((process, reader, job, device))
                     free_devices.append(device)
@@ -270,6 +314,9 @@ def run_encode(args):
                 process.join()
             reader.close()
     event('archive_run_completed', **{key: outcomes.count(key) for key in ('encoded', 'resumed', 'busy', 'failed')})
+    from src.archive.lifecycle import finish
+    from src.archive.dashboard import command_queue
+    finish(args, command_queue(), failed_channels)
     return int('failed' in outcomes)
 
 
@@ -311,12 +358,12 @@ def run_decode(args, verify_only=False, live=False):
                 os.close(fd)
                 command = ['ffmpeg', '-v', 'error', '-nostdin', '-y', '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
                            '-s', f"{video['width']}x{video['height']}", '-r', str(video['fps']), '-i', 'pipe:0']
-                if (root / 'audio.opus').exists():
-                    command += ['-i', str(root / 'audio.opus'), '-map', '0:v:0', '-map', '1:a:0', '-c:a', 'copy']
+                if ('audio.opus' in metadata['artifacts']):
+                    command += ['-i', str(artifact_path(root, metadata, 'audio.opus')), '-map', '0:v:0', '-map', '1:a:0', '-c:a', 'copy']
                 command += ['-c:v', 'ffv1', '-f', 'matroska', temporary]
             log = tempfile.TemporaryFile()
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=log)
-        result = codec.decode(root / 'video.bin', video, sink=process.stdin if process else None)
+        result = codec.decode(artifact_path(root, metadata, 'video.bin'), video, sink=process.stdin if process else None)
         if process:
             process.stdin.close()
             if process.wait() != 0:
@@ -324,8 +371,8 @@ def run_decode(args, verify_only=False, live=False):
                 raise RuntimeError(log.read(8192).decode(errors='replace'))
         if result['decoded_yuv_sha256'] != metadata['validation']['decoded_yuv_sha256']:
             raise ValueError(f"Decoded pixels differ from archive validation ({metadata['pipeline'].get('runtime', 'fp16')}); check runtime and prepared model identity")
-        if (root / 'audio.opus').exists():
-            verify_audio(root / 'audio.opus')
+        if ('audio.opus' in metadata['artifacts']):
+            verify_audio(artifact_path(root, metadata, 'audio.opus'))
         if temporary:
             os.link(temporary, target)
             os.unlink(temporary)
@@ -347,8 +394,9 @@ def run_decode(args, verify_only=False, live=False):
 def run_cleanup(args):
     root, metadata = load_bundle(args.input)
     pool = SharedWorkPool(instance_name='cleanup')
-    pool.ensure_pipeline(root.parent, metadata['pipeline'])
-    lease, _ = pool.try_acquire(root.parent, root.name)
+    parent, key = archive_lease(root, metadata)
+    pool.ensure_pipeline(parent, metadata['pipeline'])
+    lease, _ = pool.try_acquire(parent, key)
     if lease is None:
         raise RuntimeError('Archive is owned by another worker; retry cleanup later')
     try:
@@ -363,6 +411,8 @@ def _cleanup_owned(args, root, metadata, heartbeat):
         raise ValueError('Partial archives cannot authorize original deletion')
     if metadata['source']['media']['audio'] and 'audio.opus' not in metadata['artifacts']:
         raise ValueError('Archive omits source audio; refusing original deletion')
+    if metadata['source'].get('kind') == 'youtube':
+        raise ValueError('Streamed archives have no stored original video to delete')
     source = (Path(args.base_root).resolve() / metadata['source']['relative_path']
               if args.base_root else Path(metadata['source']['path']))
     if args.base_root and not source.resolve().is_relative_to(Path(args.base_root).resolve()):
@@ -381,11 +431,11 @@ def _cleanup_owned(args, root, metadata, heartbeat):
     if identity(source) != before or sha256(source) != metadata['source']['sha256']:
         raise ValueError('Source changed during validation')
     heartbeat.check()
-    atomic_json(root / 'cleanup-intent.json', {'source': str(source),
+    atomic_json(control_path(root, metadata, 'cleanup-intent.json'), {'source': str(source),
                 'sha256': metadata['source']['sha256'], 'requested_at': time.time()})
     source.unlink()
     sync_directory(source.parent)
-    atomic_json(root / 'cleanup.json', {'source': str(source), 'sha256': metadata['source']['sha256'],
+    atomic_json(control_path(root, metadata, 'cleanup.json'), {'source': str(source), 'sha256': metadata['source']['sha256'],
                                        'deleted_at': time.time()})
     event('original_deleted', source=str(source), archive=str(root))
     return 0

@@ -53,29 +53,49 @@ do not change archive compatibility or force re-encoding of completed videos.
 `checkpoints/cvpr2026_image.pth.tar` and the corresponding video checkpoint.
 `--model_path_i` and `--model_path_p` override them.
 
-Each source creates a `<filename including extension>.uf` directory containing
-`video.bin`, a manifest, optional Opus audio, and available metadata/thumbnail
-sidecars. Keep the whole bundle: UF bitstreams do not store every playback or
-model parameter. Audio defaults to mono Opus at 6k; use `--opus_channels stereo`
-and a suitable `--opus_bitrate` when desired. `--audio none` omits audio.
+New runs write flat sibling files in the channel/output folder: `<video>.bin`,
+`<video>.opus` (when audio exists), and `<video>.uf.json`, plus metadata/thumbnail
+sidecars. Keep the manifest with the bitstream: it records model identities,
+playback settings, artifact hashes, source identity and decode validation.
+Duplicate local stems retain their source extension in the output name to avoid
+collisions (for example `clip.mkv.bin` and `clip.mp4.bin`).
 
-Archives are decoded and hashed before atomic publication. Repeating the same
-command checks and resumes existing bundles. Different configurations require a
-separate output directory. Filesystem leases coordinate instances sharing the
-same output directory; `--shared-work --shared-instance NAME` is accepted.
-Use identical checkpoints and settings on every instance. Busy work is reported
-and skipped by that invocation. Events include timestamps and are also appended
-to `.uf-progress.jsonl`. `--ui auto` and `--ui plain` currently both print events.
+Older `<filename>.uf/` bundles remain readable and are recognized on resume;
+updating code does not move existing archives. An already-running process keeps
+its original layout. New jobs carry the flat-layout setting explicitly.
+
+Payloads are decoded and hashed in a hidden staging directory. Flat payloads are
+published without overwriting existing files, followed by the manifest as the
+completion record. Interrupted publication can reuse only byte-identical files;
+a differing final output is never overwritten. Filesystem leases coordinate
+instances using identical settings. Keep separate output directories for different
+configurations; UF never replaces an RT bitstream sharing its filename.
+
+Audio defaults to mono Opus at 6 kbps. `--audio none` omits audio, which prevents
+original deletion if that source had audio. Timestamped events are also appended
+to `.uf-progress.jsonl`.
+
+`--ui plain` prints events. `--ui tui` shows frame progress/FPS, channel inventory,
+and cleanup controls; `--ui auto` selects TUI in an interactive terminal and plain
+otherwise. A TUI run stays open for review after encoding, including a run where
+all videos were already encoded. Arrows select a channel, **d** requests deletion
+of its verified originals, **a** requests deletion for all eligible listed channels,
+**y** confirms, and **q** exits. Declining a prompt leaves originals untouched.
+
+Append `--auto-delete` to encode to verify and delete matching local originals
+automatically after the run. Failed/busy channels are excluded. `--keep-originals`
+retains originals and exits without a cleanup prompt. `--cleanup-dry-run` previews
+exact paths without deleting. These policies do not change bitstream compatibility.
 
 ## Decode and verify
 
 ```bash
-./scripts/uf-python main.py verify --input runs/bunny-qi36-qp30/Big_Buck_Bunny_720_10s_30MB.mp4.uf
-./scripts/uf-python main.py decode --input runs/bunny-qi36-qp30/Big_Buck_Bunny_720_10s_30MB.mp4.uf --output_file runs/bunny-reconstructed.mkv
-./scripts/uf-python main.py view --input runs/bunny-qi36-qp30/Big_Buck_Bunny_720_10s_30MB.mp4.uf
+./scripts/uf-python main.py verify --input runs/bunny-qi36-qp30/Big_Buck_Bunny_720_10s_30MB.bin
+./scripts/uf-python main.py decode --input runs/bunny-qi36-qp30/Big_Buck_Bunny_720_10s_30MB.bin --output_file runs/bunny-reconstructed.mkv
+./scripts/uf-python main.py view --input runs/bunny-qi36-qp30/Big_Buck_Bunny_720_10s_30MB.bin
 ```
 
-The input can also point to the bundle's `video.bin`. Decode writes lossless
+The input accepts a flat `.bin` or `.uf.json`, or an older bundle directory / `video.bin`. Decode writes lossless
 FFV1 reconstruction in Matroska and copies archived audio. View pipes video
 frames to ffplay without storing decoded media; this initial viewer has no
 seeking or synchronized audio playback. Both require the matching checkpoints.
@@ -85,8 +105,8 @@ across different GPUs is not guaranteed to reproduce that hash.
 ## Explicit original cleanup
 
 ```bash
-./scripts/uf-python main.py cleanup --input PATH/VIDEO.mp4.uf
-./scripts/uf-python main.py cleanup --input PATH/VIDEO.mp4.uf --yes
+./scripts/uf-python main.py cleanup --input PATH/VIDEO.bin
+./scripts/uf-python main.py cleanup --input PATH/VIDEO.bin --yes
 ```
 
 The first command previews the exact original file. `--yes` verifies decoding
@@ -95,5 +115,22 @@ files are retained. Partial encodes (`--max_frames`) and archives omitting
 source audio cannot authorize deletion. `--base_root` remaps the original's
 relative path when accessing the archive on another machine.
 
-This initial UF CLI does not yet provide the RT TUI, URL downloading, or image
-archive commands. Original videos are retained by every encode command.
+To review a channel independently of encoding (including legacy bundles):
+
+```bash
+./scripts/uf-python main.py manage --output_root /mnt/to_storage/DATA/YOUTUBE --channel_ids CHANNEL_ID --ui tui
+./scripts/uf-python main.py manage --output_root /mnt/to_storage/DATA/YOUTUBE --channel_ids CHANNEL_ID --ui plain --auto-delete
+```
+
+`manage` reviews all archives in the selected output folders. An encode run limits
+cleanup to its own discovered sources. Before deleting, cleanup verifies artifact
+hashes, complete decode validation and the exact original's hash; only the original
+video is removed. Other files and directories are retained. Leases serialize
+cleanup with an encoder/other cleanup instance. TUI inventory refreshes show when
+another instance has removed originals.
+
+YouTube input uses `stream --source_urls URL` with the same encode settings; see
+[the streaming example](../README.md#youtube-streaming). Streamed archives have no
+stored original video and are shown as such, so neither automatic cleanup nor TUI
+confirmation deletes anything for them. Image archive commands are not yet exposed
+by this UF CLI.

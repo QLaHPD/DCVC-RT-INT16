@@ -49,3 +49,27 @@ remains on `int16-managed`.
 
 Keep model files, native binaries, caches, datasets and outputs out of Git. The
 existing RT runtime and its prepared INT16 files remain in their original location.
+
+### YouTube streaming
+
+`stream` (also `encode --source_urls`) feeds yt-dlp output directly to FFmpeg and the UF encoder, without keeping downloaded source videos. Completed, decoded-and-validated files (`VIDEO.bin`, `VIDEO.opus`, `VIDEO.uf.json`) are stored directly under the resolved YouTube channel ID, without a per-video directory. Existing archives retain the normal compatibility and integrity checks. Each video uses a fresh worker; this streaming mode currently supports `--procs 1` and full videos only.
+
+```bash
+./scripts/uf-python main.py stream --source_urls https://www.youtube.com/@FattoincasadaBenedettaOfficial --output_root /mnt/to_storage/DATA/YOUTUBE --runtime int16 --model_structure htl --resolution 144 --procs 1 --audio opus --opus_channels mono --opus_bitrate 6k --qp_i 10 --qp_p 14 --reset_interval 2 --intra_period -1 --skip_thres 0.2 --ytdlp_bin /path/to/yt-dlp
+```
+
+Omit `--fps` to preserve source frame rate. Video input uses the highest available resolution and is resized with preserved aspect ratio. Audio favors tracks identified as original; ambiguous multiple-language selections fail rather than choosing a dub silently. Optional `--cookies /path/to/cookies.txt` uses a temporary mode-660 copy for each yt-dlp invocation, leaving the supplied file unchanged. Download failures never publish an incomplete archive.
+
+The example configuration was the fastest measured UF HT-L INT16 candidate above 30 dB on the 144p Bunny search. Fixed encoder settings do not guarantee that PSNR on other videos. Streaming sources have a URL identity rather than a local source-file checksum, and local-original cleanup does not apply to them.
+
+### Managed interface and original cleanup
+
+Use `--ui plain` for timestamped logs or `--ui tui` for frame/FPS progress and channel cleanup controls (`auto` selects based on terminal availability). After encoding, TUI stays open for review; select a channel, press **d**, then **y** to approve verified original deletion. **a** requests cleanup for all eligible listed channels; **q** exits. `--auto-delete` performs verified cleanup automatically; `--keep-originals` retains inputs and exits. Streamed inputs have no stored original video to delete.
+
+Existing outputs can be reviewed separately:
+
+```bash
+./scripts/uf-python main.py manage --output_root /mnt/to_storage/DATA/YOUTUBE --channel_ids CHANNEL_ID --ui tui
+```
+
+[Storage compatibility, deletion safeguards, and plain-mode commands](docs/UF_ARCHIVE.md).

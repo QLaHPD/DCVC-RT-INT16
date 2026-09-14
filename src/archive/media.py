@@ -48,7 +48,7 @@ def dimensions(width, height, resolution):
 
 class FrameReader:
     def __init__(self, source, width, height, original, fps=None, decoder_threads=1,
-                 prefetch_frames=0):
+                 prefetch_frames=0, input_pipe=None):
         if not isinstance(decoder_threads, int) or decoder_threads < 1:
             raise ValueError('decoder_threads must be a positive integer')
         if not isinstance(prefetch_frames, int) or prefetch_frames < 0:
@@ -68,7 +68,7 @@ class FrameReader:
         command += ['-pix_fmt', 'yuv420p', '-vsync', '0', '-f', 'rawvideo', 'pipe:1']
         self.errors = tempfile.TemporaryFile()
         try:
-            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=self.errors)
+            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=self.errors, stdin=input_pipe)
         except BaseException:
             self.errors.close()
             raise
@@ -166,10 +166,10 @@ class FrameReader:
         self.close()
 
 
-def encode_audio(source, target, channels, bitrate, duration):
+def encode_audio(source, target, channels, bitrate, duration, input_pipe=None):
     subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-i', str(source), '-map', '0:a:0',
                     '-vn', '-c:a', 'libopus', '-ac', '1' if channels == 'mono' else '2',
-                    '-b:a', bitrate, '-t', str(duration), '-f', 'opus', str(target)], check=True)
+                    '-b:a', bitrate, '-t', str(duration), '-f', 'opus', str(target)], check=True, stdin=input_pipe)
 
 
 def verify_audio(path):
