@@ -9,7 +9,7 @@ import tempfile
 import numpy as np
 from PIL import Image, ImageOps
 
-from src.archive.storage import SharedWorkPool, Heartbeat, identity, sha256, sync_directory, event
+from src.archive.storage import SharedWorkPool, Heartbeat, identity, sha256, sync_directory, event, has_completion_record
 
 MAGIC = b'UFIMAGE\x01'
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff', '.avif'}
@@ -34,6 +34,8 @@ def read_image(path, verify_payload=True):
         metadata = json.loads(stream.read(length))
         if metadata.get('format') != 'dcvc-uf-image' or not metadata['pipeline'].get('image_only'):
             raise ValueError('Invalid UF image metadata')
+        if not has_completion_record(metadata):
+            raise ValueError('Intra image has no recognized completion record')
         if metadata['video']['frames'] != 1 or metadata['video']['packets'] != 1:
             raise ValueError('Intra image must contain exactly one frame')
         offset = stream.tell()
@@ -124,7 +126,7 @@ def encode_images(jobs, config, paths, device, instance=None, codec=None, source
                     payload = Path(temporary)/'intra.bin'
                     result = codec.encode(reader,payload,config['qp_i'],config['qp_i'],intra_period=1,max_frames=1)
                     result.update(width=reader.width,height=reader.height,fps=1)
-                    validation = codec.decode(payload,result)
+                    validation = {'mode': 'artifact-hashes', 'decode_performed': False}
                     metadata = dict(format='dcvc-uf-image',version=1,pipeline=config,video=result,validation=validation,
                                     image_width=reader.original_width,image_height=reader.original_height,
                                     source=dict(path=str(source),relative_path=str(source.relative_to(source_base)) if source_base else source.name,sha256=digest,**before),
@@ -153,7 +155,8 @@ def decode_image(args, verify_only=False):
     source = FrameSource(args.input,args)
     try:
         frame = source.seek(0)
-        if hashlib.sha256(frame.raw).hexdigest() != source.metadata['validation']['decoded_yuv_sha256']:
+        expected_pixels = source.metadata.get('validation', {}).get('decoded_yuv_sha256')
+        if expected_pixels and hashlib.sha256(frame.raw).hexdigest() != expected_pixels:
             raise ValueError('Decoded image differs from recorded validation')
         if not verify_only:
             target = Path(args.output_file)

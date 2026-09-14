@@ -5,7 +5,7 @@ import json
 import os
 import time
 
-from src.archive.storage import event, manifest_path
+from src.archive.storage import event, manifest_path, has_completion_record
 
 
 def roots_for(args):
@@ -50,7 +50,7 @@ def inventory(roots, sources=None, base_root=None):
                 in_scope = sources is None or str(source.absolute()) in sources
                 eligible = (in_scope and not remote and data['pipeline'].get('max_frames') is None
                             and (not data['source']['media']['audio'] or 'audio.opus' in data['artifacts'])
-                            and bool(data.get('validation', {}).get('decoded_yuv_sha256')))
+                            and has_completion_record(data))
                 entry = channels.setdefault(str(channel), dict(channel=str(channel), archives=[], originals=0,
                         bytes=0, streamed=0, absent=0, ineligible=0))
                 exists = source.exists() if not remote else False

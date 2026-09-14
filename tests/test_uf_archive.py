@@ -142,11 +142,37 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(decoder_thread_budget(), 1)
 
     def test_failure_never_publishes_or_deletes_input(self):
-        with patch.object(FakeCodec, 'decode', side_effect=ValueError('bad stream')):
+        with patch.object(FakeCodec, 'encode', side_effect=ValueError('failed encode')):
             self.assertEqual(self.encode(), 'failed')
         self.assertFalse(self.final.exists())
         self.assertFalse(list(self.final.parent.glob('*.stage-*')))
         self.assertTrue(self.source.exists())
+
+    def test_encode_has_no_decode_pass_and_manual_verify_still_decodes(self):
+        from src.archive.workflow import run_decode
+        with patch.object(FakeCodec, 'decode', side_effect=AssertionError('unexpected decode')):
+            self.assertEqual(self.encode(), 'encoded')
+            self.assertEqual(self.encode(), 'resumed')
+        _, data = load_bundle(self.final)
+        self.assertEqual(data['validation'], {'mode':'artifact-hashes','decode_performed':False})
+        args=types.SimpleNamespace(input=str(self.final))
+        before=(self.final/'manifest.json').read_bytes()
+        with patch('src.archive.workflow.checked_codec',return_value=FakeCodec()), patch.object(FakeCodec,'decode',side_effect=ValueError('bad decode')):
+            with self.assertRaisesRegex(ValueError,'bad decode'):run_decode(args,verify_only=True)
+        self.assertEqual((self.final/'manifest.json').read_bytes(),before)
+
+    def test_legacy_pixel_hash_still_checked_without_rewriting_manifest(self):
+        from src.archive.workflow import run_decode
+        self.assertEqual(self.encode(),'encoded')
+        manifest=self.final/'manifest.json';data=json.loads(manifest.read_text())
+        data['validation']={'decoded_yuv_sha256':'old-pixel-hash','decoded_frames':data['video']['frames']}
+        manifest.write_text(json.dumps(data))
+        before=manifest.read_bytes()
+        load_bundle(self.final)
+        with patch('src.archive.workflow.checked_codec',return_value=FakeCodec()):
+            with self.assertRaisesRegex(ValueError,'Decoded pixels differ'):
+                run_decode(types.SimpleNamespace(input=str(self.final)),verify_only=True)
+        self.assertEqual(manifest.read_bytes(),before)
 
     def test_peer_claim_and_pipeline_mismatch(self):
         pool = SharedWorkPool(instance_name='other')

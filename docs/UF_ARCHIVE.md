@@ -68,12 +68,14 @@ clip.info.json                 (when provided)
 clip.jpg_qI45.dcvci             (when thumbnail encoding is enabled)
 ```
 
-A newly streamed video's basename is `VIDEO_ID_UPLOAD_DATE`, just as in RT.
+A newly streamed video's basename is `VIDEO_ID_UNIX_TIMESTAMP`. The provider's
+`timestamp` is preferred, followed by `release_timestamp`; date-only metadata
+uses midnight UTC. Existing archive basenames are recognized on resume.
 For duplicate local basenames, MKV is preferred, followed by MP4, WebM, MOV and
 AVI. Alternate containers remain untouched. Relative input folders are retained.
 
 Keep `.uf.json` with its video bitstream: it contains runtime, prepared-model
-identities, frame counts, source identity, artifact hashes and validation results.
+identities, frame counts, source identity, artifact hashes and the completion mode.
 Older flat names and `<filename>.uf/` bundles remain readable and resumable.
 An already-running process keeps its original output layout.
 
@@ -132,7 +134,8 @@ For one original, `cleanup --input_file ARCHIVE` previews;
 Folder decoding selects `all`, `videos` or `images`, writing raw YUV420 `.yuv`
 video and `.png` images, as in RT. `--worker`/`-w` and `--cuda_idx 0 1 ...` allow
 multiple decoding workers. Explicit `.mkv` output uses FFV1 and copies archived
-audio. Output files are published only after verification and never replaced.
+audio. Decoded output files are published only after decoding completes and available
+recorded hashes are checked; existing output files are never replaced.
 
 The shared RT Tk viewer provides Play/Pause, previous/next frame, a seek slider,
 `--start_frame`, `--fps`, and display size limits. It decodes in memory without
@@ -143,7 +146,7 @@ Like RT's viewer, playback is video-only, without synchronized audio. Folder
 image viewing provides a gallery and reuses the intra model between images.
 
 UF `.dcvci` files are self-contained: they embed their pipeline, original image
-size, payload hash and decoded-pixel validation. They use the UF intra network,
+size and payload hash. Older images also contain decoded-pixel validation. They use the UF intra network,
 not RT's intra network. The encoder reuses one intra model for the image batch
 and does not load the temporal model for image-only input. Odd image dimensions
 are padded internally and cropped back on PNG export/display.
@@ -164,3 +167,20 @@ video checkpoint. Tk/Pillow import successfully. The concurrent FP16 GPU image
 smoke test exhausted Jetson memory; it remains to be rerun with sufficient free
 GPU memory. The live encoder was left running. No interactive display or five-GPU
 hardware test was performed during this integration.
+
+## Encode completion without a second neural pass
+
+New video and intra-image encodes no longer run a full decoder before publication.
+Their manifests explicitly record `validation.mode = "artifact-hashes"` and
+`decode_performed = false`; they do not claim to contain a decoded-pixel baseline.
+Atomic publication, source identity checks, artifact hashing and ownership checks
+remain in place. This setting does not change the encoding pipeline fingerprint,
+bitstreams, or existing archives, so a previous run can resume with the same args.
+
+`verify` still decodes explicitly. Normal decode checks stream completeness and
+model/runtime identities; if an older archive has a recorded decoded-pixel hash,
+it also compares that hash. Cleanup still checks decoding before deleting a local
+original. Nothing retroactively removes or updates an older validation record.
+Use updated UF code to read new encode-only archives.
+
+Streaming retains the full yt-dlp metadata document in `.info.json`, including formats, chapters, subtitles, categories and provider timestamps when available. It does not whitelist or discard fields.

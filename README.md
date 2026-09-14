@@ -52,7 +52,7 @@ existing RT runtime and its prepared INT16 files remain in their original locati
 
 ### YouTube streaming
 
-`stream` (also `encode --source_urls`) feeds yt-dlp output directly to FFmpeg and the UF encoder, without keeping downloaded source videos. Completed, decoded-and-validated files (`VIDEO_ID_UPLOAD_DATE_WIDTHxHEIGHT_qIQI_qPQP.bin`, matching `.opus`, and `.uf.json`) are stored directly under the resolved YouTube channel ID, without a per-video directory. Existing archives retain the normal compatibility and integrity checks. Each video uses a fresh worker; `--procs` and `--cuda_idx` support multiple GPUs. Streaming processes complete videos.
+`stream` (also `encode --source_urls`) feeds yt-dlp output directly to FFmpeg and the UF encoder, without keeping downloaded source videos. Completed, hash-recorded files (`VIDEO_ID_UNIX_TIMESTAMP_WIDTHxHEIGHT_qIQI_qPQP.bin`, matching `.opus`, and `.uf.json`) are stored directly under the resolved YouTube channel ID, without a per-video directory. Existing archives retain the normal compatibility and integrity checks. Each video uses a fresh worker; `--procs` and `--cuda_idx` support multiple GPUs. Streaming processes complete videos.
 
 ```bash
 ./scripts/uf-python main.py stream --source_urls https://www.youtube.com/@FattoincasadaBenedettaOfficial --output_root /mnt/to_storage/DATA/YOUTUBE --runtime int16 --model_structure htl --resolution 144 --procs 1 --audio opus --opus_channels mono --opus_bitrate 6k --qp_i 10 --qp_p 14 --reset_interval 2 --intra_period -1 --skip_thres 0.2 --ytdlp_bin /path/to/yt-dlp
@@ -90,3 +90,5 @@ The RT viewer controls now drive UF decoding: video seeking starts at the neares
 I-frame, and folders open an intra-image gallery. Both decode in memory without
 saving media. `--runtime auto` uses the recorded arithmetic, including INT16.
 [Commands, archive compatibility and validation limits](docs/UF_ARCHIVE.md).
+
+Encoding publishes after encoding and artifact hashing, without an automatic neural decode pass. `verify` remains available explicitly; existing decoded-pixel validation records are still honored.

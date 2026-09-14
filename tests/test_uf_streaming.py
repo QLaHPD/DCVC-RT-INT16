@@ -49,16 +49,32 @@ class StreamingTests(unittest.TestCase):
         channel = 'UC'+'a'*22
         video = dict(format_id='v',url='x',vcodec='vp9',height=720,width=1280,acodec='none')
         smaller = dict(video,format_id='small',height=360,width=640)
-        info = dict(id='abcdefghijk',channel_id=channel,upload_date='20260102',formats=[video,smaller])
+        info = dict(id='abcdefghijk',channel_id=channel,upload_date='20260102',timestamp=1767355200,formats=[video,smaller],chapters=[{'title':'Intro','start_time':0}],categories=['Food'])
         self.assertEqual(select_formats(info,480)[0]['format_id'],'small')
         with tempfile.TemporaryDirectory() as root:
             args=build_parser().parse_args(['stream','--source_urls','https://www.youtube.com/@example',
                                            '--output_root',root,'--procs','5'])
             with patch('src.archive.streaming.metadata',side_effect=[{'entries':[info],'_type':'playlist'},info]):
                 jobs=list(stream_jobs(args,'yt-dlp',{'failed':0}))
-            self.assertEqual(Path(jobs[0]['final']).name,'abcdefghijk_20260102.uf.json')
+            self.assertEqual(Path(jobs[0]['final']).name,'abcdefghijk_1767355200.uf.json')
             self.assertEqual(jobs[0]['remote']['video_format'],'small')
+            self.assertEqual(jobs[0]['remote']['public_metadata'],info)
             self.assertEqual(Path(jobs[0]['final']).parent.name,channel)
+
+    def test_unix_timestamp_fallback_is_utc_and_old_names_resume(self):
+        import json
+        from src.archive.streaming import upload_timestamp, existing_stream_archives
+        self.assertEqual(upload_timestamp({'timestamp':1767355200,'upload_date':'20260101'}),1767355200)
+        self.assertEqual(upload_timestamp({'release_timestamp':1767355200}),1767355200)
+        self.assertEqual(upload_timestamp({'upload_date':'19700102'}),86400)
+        with self.assertRaises(ValueError):upload_timestamp({})
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'abcdefghijk_20260102.uf.json'
+            url='https://www.youtube.com/watch?v=abcdefghijk'
+            path.write_text(json.dumps({'format':'dcvc-uf-archive','source':{'url':url}}))
+            before=path.read_bytes()
+            self.assertEqual(existing_stream_archives(directory)[url],path)
+            self.assertEqual(path.read_bytes(),before)
 
     def test_ffmpeg_decodes_streamed_container_without_source_file(self):
         import subprocess

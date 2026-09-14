@@ -103,9 +103,37 @@ def download_pipe(remote, format_id):
                 raise RuntimeError('yt-dlp stream failed: ' + errors.read().decode(errors='replace')[-2500:])
 
 
+
+def upload_timestamp(info):
+    """Prefer provider Unix time; date-only metadata means midnight UTC."""
+    from datetime import datetime, timezone
+    import math
+    for key in ('timestamp','release_timestamp'):
+        value = info.get(key)
+        if isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value >= 0:
+            return int(value)
+    date = info.get('upload_date')
+    if isinstance(date,str) and re.fullmatch(r'\d{8}',date):
+        return int(datetime.strptime(date,'%Y%m%d').replace(tzinfo=timezone.utc).timestamp())
+    raise ValueError('Remote video has no publication timestamp or upload date')
+
+
+def existing_stream_archives(channel_out):
+    """One metadata snapshot per channel, preserving prior naming on resume."""
+    archives = {}
+    for path in Path(channel_out).glob('*.uf.json'):
+        data = json.loads(path.read_text())
+        url = data.get('source',{}).get('url')
+        if data.get('format') != 'dcvc-uf-archive' or not url: continue
+        if url in archives:
+            raise ValueError(f'Multiple archives for {url}: {archives[url]} and {path}')
+        archives[url] = path
+    return archives
+
 def stream_jobs(args, binary, counts):
     from src.archive.media import decoder_thread_budget
     seen = set()
+    archives = {}
     for url in args.source_urls:
         listing = metadata(url, binary, args.cookies, flat=True)
         entries = listing.get('entries') if listing.get('_type') in ('playlist', 'multi_video') else [listing]
@@ -141,16 +169,19 @@ def stream_jobs(args, binary, counts):
                 original = dict(width=int(video['width']), height=int(video['height']),
                                 fps=float(video.get('fps') or info.get('fps') or 30),
                                 duration=float(info.get('duration') or 0), audio=audio is not None)
-                public = {k: info.get(k) for k in ('id', 'channel_id', 'channel', 'title', 'description', 'upload_date', 'duration', 'webpage_url')}
+                # Keep the complete yt-dlp document, matching RT's info.json.
+                # The legacy job key is retained for compatibility with workers.
+                public = info
                 remote = dict(url=video_url, media=original, binary=binary, cookies=args.cookies,
                               video_format=video['format_id'], audio_format=audio['format_id'] if audio else None,
                               public_metadata=public, thumbnail=info.get('thumbnail'),thumbnail_headers=info.get('http_headers'), write_thumbnail=getattr(args,'write_thumbnail',True),
                               thumbnail_codec=getattr(args,'thumbnail_codec','keep'),thumbnail_qp=getattr(args,'thumbnail_qp',45))
                 legacy = Path(args.output_root).resolve() / channel / (video_id + '.uf')
-                base = video_id + '_' + re.sub(r'[^0-9]', '', str(info.get('upload_date') or '00000000'))
-                # Keep old flat archives resumable after adopting RT names.
-                old_flat = legacy.with_name(video_id + '.uf.json')
-                final = old_flat if old_flat.exists() else legacy.with_name(base + '.uf.json')
+                if channel not in archives:
+                    archives[channel] = existing_stream_archives(legacy.parent)
+                final = archives[channel].get(video_url)
+                if final is None:
+                    final = legacy.with_name(f'{video_id}_{upload_timestamp(info)}.uf.json')
                 job = dict(source=video_id, relative=channel+'/'+video_id, final=str(final), remote=remote,
                            hwaccel=getattr(args,'ff_hwaccel','none'), layout='flat', filename_style='rt', legacy=str(legacy), lease_key=legacy.name,lease_seconds=getattr(args,'shared_lease_seconds',900),
                            input_threads=args.input_threads or decoder_thread_budget(1),

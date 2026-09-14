@@ -117,6 +117,13 @@ def archive_lease(root, metadata):
     return Path(root).parent, Path(root).name
 
 
+
+def has_completion_record(metadata):
+    """Accept legacy decode-validated archives and explicit encode-only commits."""
+    validation = metadata.get('validation', {})
+    return bool(validation.get('decoded_yuv_sha256')) or (
+        validation.get('mode') == 'artifact-hashes' and validation.get('decode_performed') is False)
+
 def load_bundle(path, expected=None):
     manifest = manifest_path(path)
     if manifest.is_symlink():
@@ -140,8 +147,8 @@ def load_bundle(path, expected=None):
         raise ValueError('Input bitstream does not belong to this manifest')
     if expected is not None and data['pipeline'] != expected:
         raise ValueError(f'Existing archive uses different encoding settings/models: {root}')
-    if not data.get('validation', {}).get('decoded_yuv_sha256'):
-        raise ValueError(f'Archive has no completed decode validation: {root}')
+    if not has_completion_record(data):
+        raise ValueError(f'Archive has no recognized completion record: {root}')
     for name, info in data['artifacts'].items():
         if Path(name).name != name:
             raise ValueError(f'Unsafe artifact name: {name}')
@@ -156,7 +163,7 @@ def publish_flat(stage, manifest, metadata, heartbeat, lease_key):
 
     An interrupted publication can leave payloads without a manifest. Retrying
     accepts only byte-identical payloads, never replaces a final file, and commits
-    only after the current owner has finished full decode validation.
+    only after the current owner has completed encoding and recorded artifact hashes.
     """
     manifest, stage = Path(manifest), Path(stage)
     stem = manifest.name.removesuffix('.uf.json')

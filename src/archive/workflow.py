@@ -231,8 +231,8 @@ def encode_job(job, config, paths, device, instance):
                     with (download_pipe(remote, remote['audio_format']) if remote else nullcontext(None)) as audio_pipe:
                         encode_audio('pipe:0' if remote else source, stage / 'audio.opus', config['opus_channels'], config['opus_bitrate'], result['frames'] / fps, input_pipe=audio_pipe,frame_ms=config.get('opus_frame_ms',20),complexity=config.get('opus_complexity',10),vbr=config.get('opus_vbr','on'))
                 verify_audio(stage / 'audio.opus')
-            event('validation_started', source=source.name, frames=result['frames'])
-            validation = codec.decode(stage / 'video.bin', result)
+            # Publication checks bytes and ownership, without a second neural pass.
+            validation = {'mode': 'artifact-hashes', 'decode_performed': False}
             if not remote and (identity(source) != before or sha256(source) != source_sha):
                 raise ValueError('Original changed during encoding; refusing to publish')
             if remote:
@@ -449,7 +449,8 @@ def run_decode(args, verify_only=False, live=False):
             if process.wait() != 0:
                 log.seek(0)
                 raise RuntimeError(log.read(8192).decode(errors='replace'))
-        if result['decoded_yuv_sha256'] != metadata['validation']['decoded_yuv_sha256']:
+        expected_pixels = metadata.get('validation', {}).get('decoded_yuv_sha256')
+        if expected_pixels and result['decoded_yuv_sha256'] != expected_pixels:
             raise ValueError(f"Decoded pixels differ from archive validation ({metadata['pipeline'].get('runtime', 'fp16')}); check runtime and prepared model identity")
         if ('audio.opus' in metadata['artifacts']):
             verify_audio(artifact_path(root, metadata, 'audio.opus'))

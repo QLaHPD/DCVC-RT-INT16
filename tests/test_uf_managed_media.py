@@ -78,11 +78,12 @@ class ManagedMediaTests(unittest.TestCase):
         other=self.root/'keep.txt';other.write_text('keep')
         target=self.root/'out'/'thumb.jpg_qI45.dcvci'
         fake=FakeCodec()
-        with patch('src.archive.workflow.make_codec',return_value=fake) as factory:
+        with patch('src.archive.workflow.make_codec',return_value=fake) as factory, patch.object(fake,'decode',side_effect=AssertionError('unexpected encode validation')):
             self.assertFalse(encode_images([(original,target)],self.config,(), 'cpu'))
             self.assertFalse(encode_images([(original,target)],self.config,(), 'cpu'))
             self.assertEqual(factory.call_count,1)
         metadata,_=read_image(target)
+        self.assertEqual(metadata['validation'],{'mode':'artifact-hashes','decode_performed':False})
         self.assertEqual((metadata['image_width'],metadata['image_height']),(7,5))
         self.args.input=str(target);self.args.output_file=str(self.root/'decoded.png')
         with patch('src.archive.workflow.checked_codec',return_value=fake):
