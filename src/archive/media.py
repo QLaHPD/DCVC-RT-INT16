@@ -48,7 +48,7 @@ def dimensions(width, height, resolution):
 
 class FrameReader:
     def __init__(self, source, width, height, original, fps=None, decoder_threads=1,
-                 prefetch_frames=0, input_pipe=None):
+                 prefetch_frames=0, input_pipe=None, hwaccel="none"):
         if not isinstance(decoder_threads, int) or decoder_threads < 1:
             raise ValueError('decoder_threads must be a positive integer')
         if not isinstance(prefetch_frames, int) or prefetch_frames < 0:
@@ -61,14 +61,20 @@ class FrameReader:
             filters.append(f'scale={width}:{height}:flags=bicubic')
         if fps is not None:
             filters.append(f'fps={fps}')
-        command = ['ffmpeg', '-v', 'error', '-nostdin', '-threads', str(decoder_threads), '-noautorotate',
+        if hwaccel not in ('none','auto','jetson'): raise ValueError('Unsupported decoder')
+        filters += ['format=yuv420p','setsar=1/1']
+        command = ['ffmpeg', '-v', 'error', '-nostdin', '-threads', str(decoder_threads), '-noautorotate', '-hwaccel', 'none' if hwaccel=='jetson' else hwaccel,
                    '-i', str(source), '-map', '0:v:0', '-an', '-sn', '-dn']
         if filters:
             command += ['-vf', ','.join(filters)]
         command += ['-pix_fmt', 'yuv420p', '-vsync', '0', '-f', 'rawvideo', 'pipe:1']
         self.errors = tempfile.TemporaryFile()
         try:
-            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=self.errors, stdin=input_pipe)
+            if hwaccel == 'jetson':
+                from src.archive.rt_managed import managed_module
+                self.process = managed_module('jetson_decode').start_jetson_pipe(str(source),command)
+            else:
+                self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=self.errors, stdin=input_pipe)
         except BaseException:
             self.errors.close()
             raise
@@ -151,12 +157,16 @@ class FrameReader:
         # Closing buffered stdout first could block on the reader's stream lock.
         if self.process.poll() is None:
             self.process.kill()
-            self.process.wait()
+            try:
+                self.process.wait()
+            except Exception:
+                if not hasattr(self.process,'close'): raise
         if self._thread is not None:
             self._thread.join(timeout=10)
             if self._thread.is_alive():
                 raise RuntimeError('Input prefetch thread did not stop')
         self.process.stdout.close()
+        if hasattr(self.process,'close'): self.process.close()
         self.errors.close()
 
     def __enter__(self):
@@ -166,10 +176,10 @@ class FrameReader:
         self.close()
 
 
-def encode_audio(source, target, channels, bitrate, duration, input_pipe=None):
+def encode_audio(source, target, channels, bitrate, duration, input_pipe=None, frame_ms=20, complexity=10, vbr="on"):
     subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-i', str(source), '-map', '0:a:0',
                     '-vn', '-c:a', 'libopus', '-ac', '1' if channels == 'mono' else '2',
-                    '-b:a', bitrate, '-t', str(duration), '-f', 'opus', str(target)], check=True, stdin=input_pipe)
+                    '-b:a', bitrate, '-frame_duration', str(frame_ms), '-compression_level', str(complexity), '-vbr', vbr, '-t', str(duration), '-f', 'opus', str(target)], check=True, stdin=input_pipe)
 
 
 def verify_audio(path):

@@ -16,7 +16,7 @@ from src.utils.transforms import yuv_444_to_420
 
 
 class Codec:
-    def __init__(self, image_path, video_path, variant='hts', device=0, skip_threshold=0):
+    def __init__(self, image_path, video_path, variant='hts', device=0, skip_threshold=0, image_only=False):
         set_torch_env()
         self.device = torch.device(f'cuda:{device}')
         torch.cuda.set_device(self.device)
@@ -28,6 +28,9 @@ class Codec:
         self.image.load_state_dict(get_state_dict(image_path), strict=True)
         self.image.update(skip_threshold)
         self.image.half().to(self.device, memory_format=torch.channels_last)
+        self.video = None
+        if image_only:
+            return
         if variant == 'ld':
             from src.models.video_model_ld import DMC
             self.video = DMC().eval()
@@ -82,8 +85,9 @@ class Codec:
                 reset = not is_i and reset_interval > 0 and (count + self.chunk_size) % reset_interval == 1
                 if is_i:
                     result = self.image.compress(x, qp_i, pad_b, pad_r)
-                    self.video.clear_dpb()
-                    self.video.add_ref_feature_from_frame(result['x_hat'])
+                    if self.video is not None:
+                        self.video.clear_dpb()
+                        self.video.add_ref_feature_from_frame(result['x_hat'])
                 else:
                     result = self.video.compress(x, qp_p, reset, pad_b, pad_r)
                 write_ip(output, is_i, 0, qp_i if is_i else qp_p, result['ec_parallel'],
@@ -134,8 +138,9 @@ class Codec:
                 first = False
                 if is_i:
                     result = self.image.decompress(bits, sps, qp, ec_part)
-                    self.video.clear_dpb()
-                    self.video.add_ref_feature_from_frame(result['x_hat'], apply_feature_adaptor=False)
+                    if self.video is not None:
+                        self.video.clear_dpb()
+                        self.video.add_ref_feature_from_frame(result['x_hat'], apply_feature_adaptor=False)
                 else:
                     result = self.video.decompress(bits, sps, qp, ec_part, reset)
                 frames = result['x_hat'] if isinstance(result['x_hat'], list) else [result['x_hat']]

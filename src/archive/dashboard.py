@@ -1,10 +1,9 @@
-"""Plain events and an interactive terminal dashboard for UF managed jobs."""
-import curses
-import json
+"""Adapt UF codec events to the exact RT managed plain/TUI dashboard."""
 import multiprocessing
 import queue
 import sys
 import time
+from pathlib import Path
 from collections import deque
 
 _EVENTS = None
@@ -28,78 +27,64 @@ class State:
     def __init__(self):
         self.channels = []
         self.active = {}
-        self.messages = deque(maxlen=10)
-        self.selected = 0
-        self.confirm = None
+        self.messages = deque(maxlen=40)
         self.finished = False
+        self.code = 0
+        self.total = 0
+        self.done = 0
+        self.slots = {}
+        self.started = {}
 
-    def update(self, record):
+    def update(self, record, dashboard):
         kind = record.get('event', '')
-        source = record.get('source')
+        key = record.get('job_key') or record.get('source')
         if kind == 'lifecycle_inventory':
             self.channels = record['channels']
-            self.selected = min(self.selected, max(0, len(self.channels)-1))
-            return
-        if kind == 'backend_finished':
-            self.finished = True
-        if source and kind in ('encode_started', 'encode_progress', 'validation_started'):
-            self.active.setdefault(source, {}).update(record)
-        if source and kind in ('encode_failed', 'original_deleted', 'encode_completed', 'already_encoded'):
-            self.active.pop(source, None)
-        if kind != 'encode_progress':
+        elif kind == 'run_discovered':
+            self.total = record['total']
+            dashboard.total = self.total
+            if dashboard._plain is not None:
+                dashboard._plain.total = self.total
+                dashboard._plain.global_bar.total = self.total
+                dashboard._plain._refresh_global()
+        elif kind == 'backend_finished':
+            self.finished, self.code = True, record.get('code', 0)
+        elif key and kind in ('encode_started', 'encode_progress', 'validation_started'):
+            if key not in self.slots:
+                used = set(self.slots.values())
+                self.slots[key] = next(i for i in range(len(used)+1) if i not in used)
+                self.started[key] = time.monotonic()
+            self.active.setdefault(key, {}).update(record)
+            row = self.active[key]
+            name = Path(row.get('source', key)).name
+            dashboard.set_worker_text(self.slots[key], f"{name}: {'validating' if kind == 'validation_started' else 'encode'} {row.get('frames',0):,} frames {row.get('fps',0):.2f} FPS")
+        if kind in ('encode_completed', 'already_encoded', 'encode_failed'):
+            self.done += 1
+            if key in self.slots:
+                dashboard.clear_worker(self.slots.pop(key))
+                self.active.pop(key, None)
+            elapsed = time.monotonic() - self.started.pop(key) if key in self.started else None
+            dashboard.increment_done(elapsed_seconds=elapsed)
+        if kind not in ('encode_progress', 'lifecycle_inventory'):
             stamp = record.get('time', '')[11:19]
-            detail = record.get('error') or record.get('message') or source or record.get('archive') or ''
-            self.messages.append(f'{stamp} {kind}: {detail}')
-
-    def key(self, key):
-        if self.confirm:
-            action = self.confirm if key in (ord('y'), ord('Y')) else None
-            self.confirm = None
-            return action
-        if key in (ord('q'), ord('Q')):
-            return {'action': 'quit'}
-        if key in (curses.KEY_UP, ord('k')):
-            self.selected = max(0, self.selected-1)
-        if key in (curses.KEY_DOWN, ord('j')):
-            self.selected = min(max(0, len(self.channels)-1), self.selected+1)
-        if key in (ord('d'), ord('D')) and self.channels:
-            row = self.channels[self.selected]
-            if row['originals'] and not row.get('blocked'):
-                self.confirm = {'action': 'delete', 'channel': row['channel']}
-        if key in (ord('a'), ord('A')) and any(r['originals'] and not r.get('blocked') for r in self.channels):
-            self.confirm = {'action': 'auto'}
-        return None
-
-
-def render(screen, state):
-    screen.erase()
-    height, width = screen.getmaxyx()
-    lines = ['DCVC-UF managed encoding | q exit | arrows select | d delete selected | a delete all eligible', '']
-    for source, row in list(state.active.items())[-3:]:
-        lines.append(f"{source}: {row['event']}  {row.get('frames', 0):,} frames  {row.get('fps', 0):.1f} FPS")
-    lines += ['', 'Channel                         Archives   Originals    Reclaim MiB   Status']
-    visible = max(1, height - 14)
-    start = max(0, state.selected - visible + 1)
-    for index in range(start, min(len(state.channels), start + visible)):
-        row = state.channels[index]
-        label = row['channel'].rstrip('/').split('/')[-1]
-        status = 'blocked' if row.get('blocked') else 'review deletion' if row['originals'] else 'retained (ineligible)' if row.get('ineligible') else 'no local originals'
-        lines.append(f"{'>' if index == state.selected else ' '} {label[:29]:29} {len(row['archives']):7} {row['originals']:11} {row['bytes']/1048576:13.1f}   {status}")
-    lines += ['', *list(state.messages)[-3:]]
-    if state.confirm:
-        lines.insert(1, 'DELETE verified original video files? y confirms; any other key cancels.')
-    if state.finished:
-        lines += ['', 'Run finished. Press q to close.']
-    for index, line in enumerate(lines[:max(0,height-1)]):
-        try:
-            screen.addnstr(index, 0, line, max(0,width-1))
-        except curses.error:
-            pass
-    screen.refresh()
+            detail = record.get('error') or record.get('message') or record.get('resolution') or record.get('source') or record.get('archive') or ''
+            text = f'{stamp} {kind}: {detail}'
+            self.messages.append(text)
+            if not dashboard.interactive:
+                dashboard.write(text)
+        rows = []
+        for row in self.channels:
+            count = len(row['archives'])
+            status = ('validation-failed' if row.get('blocked') else 'awaiting-approval' if row['originals']
+                      else 'retained' if row.get('ineligible') else 'cleaned' if row.get('absent') else 'complete')
+            rows.append(dict(channel_id=row['channel'], status=status, processed=count, pending=0,
+                         already_done=0, failures=int(row.get('blocked',False)), active=0, total=count,
+                         delete_files=row['originals'], reclaimable_bytes=row['bytes'],last_error=row.get('last_error','')))
+        dashboard.update_lifecycle(rows, list(self.messages))
 
 
 def _backend(args, events, commands):
-    install(events, commands)
+    install(events, commands if args._ui_interactive else None)
     from src.archive.storage import event
     try:
         code = args.handler(args)
@@ -110,54 +95,46 @@ def _backend(args, events, commands):
 
 
 def run(args):
-    mode = getattr(args, 'ui', 'plain')
-    tui = mode == 'tui' or mode == 'auto' and sys.stdin.isatty() and sys.stdout.isatty()
-    if not tui:
-        return args.handler(args)
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise ValueError('--ui tui requires an interactive terminal; use --ui plain')
+    from src.archive.rt_managed import dashboard_module
+    dashboard = dashboard_module().EncodeDashboard(0, getattr(args, 'procs', 1) or 1,
+                                                   Path(args.output_root), mode=args.ui)
+    args._ui_interactive = dashboard.interactive
     context = multiprocessing.get_context('spawn')
     events, commands = context.Queue(), context.Queue()
     worker = context.Process(target=_backend, args=(args, events, commands))
-    worker.start()
     state = State()
-    code = [0]
-    def loop(screen):
-        screen.timeout(150)
-        try:
-            curses.curs_set(0)
-        except curses.error:
-            pass
+    worker.start()
+    try:
         while True:
             try:
+                record = events.get(timeout=.1)
+                state.update(record, dashboard)
                 while True:
-                    record = events.get_nowait()
-                    if record.get('event') == 'backend_finished':
-                        code[0] = record.get('code', 0)
-                    state.update(record)
+                    state.update(events.get_nowait(), dashboard)
             except queue.Empty:
                 pass
-            if not worker.is_alive():
-                state.finished = True
-            render(screen, state)
-            if state.finished and any(getattr(args, name, False) for name in ('auto_delete', 'keep_originals', 'cleanup_dry_run')):
+            for action in dashboard.poll_actions():
+                if action.kind == 'exit-approvals':
+                    # Like RT, x retains pending originals and exits after work.
+                    commands.put({'action':'quit'})
+                elif action.kind in ('approve', 'retry', 'keep'):
+                    commands.put({'action': {'approve':'delete','retry':'retry','keep':'keep'}[action.kind],
+                                  'channel':action.channel_id})
+            if state.finished:
                 break
-            action = state.key(screen.getch())
-            if action:
-                commands.put(action)
-                if action['action'] == 'quit':
-                    break
-    try:
-        curses.wrapper(loop)
+            if not worker.is_alive():
+                # Drain the last queued completion before interpreting exit status.
+                try:
+                    while True:state.update(events.get_nowait(), dashboard)
+                except queue.Empty:pass
+                if worker.exitcode and not state.finished:state.code=worker.exitcode
+                break
     finally:
-        commands.put({'action': 'quit'})
+        commands.put({'action':'quit'})
         worker.join(timeout=2)
         if worker.is_alive():
-            # Interrupt the supervisor so its finally blocks stop owned workers.
             import os, signal
-            os.kill(worker.pid, signal.SIGINT)
-            worker.join(timeout=10)
-        if worker.is_alive():
-            worker.terminate(); worker.join()
-        events.close(); commands.close()
-    return code[0]
+            os.kill(worker.pid,signal.SIGINT);worker.join(timeout=10)
+        if worker.is_alive():worker.terminate();worker.join()
+        dashboard.close();events.close();commands.close()
+    return state.code

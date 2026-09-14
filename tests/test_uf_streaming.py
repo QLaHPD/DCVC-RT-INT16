@@ -37,11 +37,28 @@ class StreamingTests(unittest.TestCase):
 
     def test_stream_cli_uses_encode_validation(self):
         import main
-        with patch('sys.argv', ['main.py','stream','--source_urls','https://www.youtube.com/watch?v=abcdefghijk','--output_root','/tmp/test-uf','--runtime','int16']), patch('src.archive.streaming.run_stream',return_value=0) as run:
+        with patch('sys.argv', ['main.py','stream','--source_urls','https://www.youtube.com/watch?v=abcdefghijk','--output_root','/tmp/test-uf','--runtime','int16']), patch('src.archive.dashboard.run',return_value=0) as run:
             self.assertEqual(main.main(),0)
             args=run.call_args.args[0]
             self.assertEqual(args.cuda_idx,[0])
             self.assertEqual(args.prefetch_frames,8)
+
+    def test_source_height_cap_and_rt_stream_names(self):
+        from src.archive.streaming import stream_jobs
+        from main import build_parser
+        channel = 'UC'+'a'*22
+        video = dict(format_id='v',url='x',vcodec='vp9',height=720,width=1280,acodec='none')
+        smaller = dict(video,format_id='small',height=360,width=640)
+        info = dict(id='abcdefghijk',channel_id=channel,upload_date='20260102',formats=[video,smaller])
+        self.assertEqual(select_formats(info,480)[0]['format_id'],'small')
+        with tempfile.TemporaryDirectory() as root:
+            args=build_parser().parse_args(['stream','--source_urls','https://www.youtube.com/@example',
+                                           '--output_root',root,'--procs','5'])
+            with patch('src.archive.streaming.metadata',side_effect=[{'entries':[info],'_type':'playlist'},info]):
+                jobs=list(stream_jobs(args,'yt-dlp',{'failed':0}))
+            self.assertEqual(Path(jobs[0]['final']).name,'abcdefghijk_20260102.uf.json')
+            self.assertEqual(jobs[0]['remote']['video_format'],'small')
+            self.assertEqual(Path(jobs[0]['final']).parent.name,channel)
 
     def test_ffmpeg_decodes_streamed_container_without_source_file(self):
         import subprocess

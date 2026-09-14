@@ -52,11 +52,14 @@ def safe_id(value, channel=False):
     return value
 
 
-def select_formats(info):
+def select_formats(info, max_height=0):
     formats = [f for f in info.get('formats', []) if f.get('url') and f.get('vcodec') not in (None, 'none')
                and f.get('height') and not f.get('has_drm')]
     if not formats:
         raise ValueError('No downloadable video format')
+    if max_height:
+        bounded = [f for f in formats if f['height'] <= max_height]
+        formats = bounded or [f for f in formats if f['height'] == min(v['height'] for v in formats)]
     video = max(formats, key=lambda f: (f.get('height') or 0, f.get('width') or 0, f.get('tbr') or 0))
     audio = [f for f in info.get('formats', []) if f.get('acodec') not in (None, 'none')
              and f.get('url') and not f.get('has_drm')]
@@ -100,20 +103,8 @@ def download_pipe(remote, format_id):
                 raise RuntimeError('yt-dlp stream failed: ' + errors.read().decode(errors='replace')[-2500:])
 
 
-def run_stream(args):
-    from src.archive.workflow import pipeline, _job_entry
+def stream_jobs(args, binary, counts):
     from src.archive.media import decoder_thread_budget
-    if args.procs != 1:
-        raise ValueError('UF YouTube streaming currently requires --procs 1')
-    if args.max_frames:
-        raise ValueError('UF streaming currently requires full videos; omit --max_frames')
-    binary = shutil.which(args.ytdlp_bin)
-    if not binary:
-        raise ValueError('yt-dlp not found; pass --ytdlp_bin /path/to/yt-dlp')
-    args._cleanup_sources = set()  # Streamed jobs have no local originals.
-    config, paths = pipeline(args)
-    context = multiprocessing.get_context('spawn')
-    counts = {'encoded': 0, 'resumed': 0, 'busy': 0, 'failed': 0}
     seen = set()
     for url in args.source_urls:
         listing = metadata(url, binary, args.cookies, flat=True)
@@ -131,54 +122,125 @@ def run_stream(args):
                 pending.extend(sub.get('entries') or [])
                 continue
             try:
-                video_id = safe_id(entry.get('id'))
+                youtube = 'twitch.tv' not in url.lower()
+                video_id = safe_id(entry.get('id')) if youtube else safe_component(entry.get('id'))
                 if video_id in seen:
                     continue
+                if getattr(args,'max_videos',None) and len(seen) >= args.max_videos:
+                    return
                 seen.add(video_id)
-                video_url = 'https://www.youtube.com/watch?v=' + video_id
+                event('run_discovered', total=len(seen)+len(pending))
+                video_url = 'https://www.youtube.com/watch?v=' + video_id if youtube else (entry.get('webpage_url') or entry.get('url') or 'https://www.twitch.tv/videos/'+video_id.lstrip('v'))
                 event('stream_resolving', video_id=video_id)
                 info = metadata(video_url, binary, args.cookies)
                 if info.get('is_live') or info.get('live_status') == 'is_upcoming':
                     event('stream_skipped_live', video_id=video_id)
                     continue
-                channel = safe_id(info.get('channel_id'), channel=True)
-                video, audio = select_formats(info)
+                channel = safe_id(info.get('channel_id'), channel=True) if youtube else safe_component(info.get('channel_id') or info.get('uploader_id'))
+                video, audio = select_formats(info, getattr(args,"source_max_height",480))
                 original = dict(width=int(video['width']), height=int(video['height']),
                                 fps=float(video.get('fps') or info.get('fps') or 30),
                                 duration=float(info.get('duration') or 0), audio=audio is not None)
                 public = {k: info.get(k) for k in ('id', 'channel_id', 'channel', 'title', 'description', 'upload_date', 'duration', 'webpage_url')}
                 remote = dict(url=video_url, media=original, binary=binary, cookies=args.cookies,
                               video_format=video['format_id'], audio_format=audio['format_id'] if audio else None,
-                              public_metadata=public)
+                              public_metadata=public, thumbnail=info.get('thumbnail'),thumbnail_headers=info.get('http_headers'), write_thumbnail=getattr(args,'write_thumbnail',True),
+                              thumbnail_codec=getattr(args,'thumbnail_codec','keep'),thumbnail_qp=getattr(args,'thumbnail_qp',45))
                 legacy = Path(args.output_root).resolve() / channel / (video_id + '.uf')
-                final = legacy.with_name(video_id + '.uf.json')
+                base = video_id + '_' + re.sub(r'[^0-9]', '', str(info.get('upload_date') or '00000000'))
+                # Keep old flat archives resumable after adopting RT names.
+                old_flat = legacy.with_name(video_id + '.uf.json')
+                final = old_flat if old_flat.exists() else legacy.with_name(base + '.uf.json')
                 job = dict(source=video_id, relative=channel+'/'+video_id, final=str(final), remote=remote,
-                           layout='flat', legacy=str(legacy), lease_key=legacy.name,
+                           hwaccel=getattr(args,'ff_hwaccel','none'), layout='flat', filename_style='rt', legacy=str(legacy), lease_key=legacy.name,lease_seconds=getattr(args,'shared_lease_seconds',900),
                            input_threads=args.input_threads or decoder_thread_budget(1),
                            prefetch_frames=args.prefetch_frames if args.prefetch_frames is not None else 8)
                 event('stream_selected', video_id=video_id, channel_id=channel, video_format=remote['video_format'],
                       audio_format=remote['audio_format'], audio_language=audio.get('language') if audio else None,
                       audio_note=audio.get('format_note') if audio else None, archive=str(final))
-                parent, child = context.Pipe(duplex=False)
-                worker = context.Process(target=_job_entry, args=(child, job, config, paths,
-                     'cpu' if args.device == 'cpu' else args.cuda_idx[0], args.shared_instance),
-                    kwargs={'event_queue': event_queue()})
-                try:
-                    worker.start();child.close()
-                    while worker.is_alive() and not parent.poll(1):
-                        pass
-                    outcome = parent.recv() if parent.poll() else 'failed'
-                    worker.join()
-                finally:
-                    if worker.is_alive():worker.terminate();worker.join()
-                    parent.close();child.close()
-                counts[outcome if outcome in counts else 'failed'] += 1
+                yield job
             except Exception as exc:
                 counts['failed'] += 1
                 event('stream_failed', video_id=entry.get('id'), error=str(exc))
-    event('stream_finished', **counts)
+
+
+def run_stream(args):
+    from src.archive.workflow import pipeline, execute_jobs
+    if args.max_frames:
+        raise ValueError('Streaming requires full videos; omit --max_frames')
+    binary = shutil.which(args.ytdlp_bin)
+    if not binary:
+        raise ValueError('yt-dlp not found; pass --yt-dlp /path/to/yt-dlp')
+    args._cleanup_sources = set()
+    config,paths = pipeline(args)
+    counts = {'encoded':0,'resumed':0,'busy':0,'failed':0}
+    outcomes,failed = execute_jobs(args,stream_jobs(args,binary,counts),config,paths)
+    for result in outcomes: counts[result if result in counts else 'failed'] += 1
+    event('stream_finished',**counts)
     from src.archive.lifecycle import finish
     from src.archive.dashboard import command_queue
-    # Streaming never has local originals to delete; show the completed channel.
-    finish(args, command_queue(), [str(Path(args.output_root).resolve())] if counts['failed'] else ())
+    finish(args,command_queue(),failed)
     return int(counts['failed'] > 0)
+
+
+def store_thumbnail(remote, output_base):
+    """Keep RT's thumbnail name and never replace a peer's completed sidecar."""
+    import urllib.parse
+    import urllib.request
+    url = remote.get('thumbnail')
+    if not isinstance(url,str) or not url.startswith(('https://','http://')): return None
+    extension = Path(urllib.parse.urlparse(url).path).suffix.lower()
+    if extension not in ('.jpg','.jpeg','.png','.webp'): extension = '.jpg'
+    target = output_base.with_name(output_base.name+extension)
+    if target.exists():
+        if target.is_symlink(): raise ValueError('Unsafe thumbnail path')
+        return target
+    with tempfile.TemporaryDirectory(prefix='.uf-thumbnail-',dir=target.parent) as temporary:
+        stage = Path(temporary)/target.name
+        request = urllib.request.Request(url,headers=remote.get('thumbnail_headers') or {})
+        with urllib.request.urlopen(request,timeout=30) as response, stage.open('xb') as output:
+            shutil.copyfileobj(response,output);output.flush();os.fsync(output.fileno())
+        from PIL import Image
+        with Image.open(stage) as image: image.verify()
+        try: os.link(stage,target)
+        except FileExistsError: pass
+    return target
+
+
+def finish_thumbnail(remote,final,config,paths,device,instance,codec=None):
+    if not remote or not remote.get('write_thumbnail'): return
+    try:
+        image = store_thumbnail(remote,Path(final).with_name(Path(final).name.removesuffix('.uf.json')))
+        if image and remote.get('thumbnail_codec') == 'dcvc-intra':
+            from copy import copy
+            from src.archive.thumbnails import encode_images
+            qp = remote['thumbnail_qp']
+            image_codec = None
+            if codec is not None:
+                image_codec = copy(codec);image_codec.video = None
+                if config.get('runtime')=='int16':
+                    image_codec.preamble = image_codec.preamble[:40]+bytes(32)
+            encode_images([(image,image.with_name(f'{image.name}_qI{qp}.dcvci'))],
+                          {**config,'qp_i':qp,'qp_p':qp},paths,device,instance,codec=image_codec)
+    except Exception as exc:
+        event('thumbnail_failed',source=str(final),error=str(exc))
+
+
+def safe_component(value):
+    if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',value):
+        raise ValueError(f'Invalid channel/video identifier: {value!r}')
+    return value
+
+
+def channel_urls(youtube,twitch):
+    urls = []
+    for channel in youtube:
+        if channel.lower().endswith('.txt'):
+            for line in Path(channel).read_text().splitlines():
+                value = line.strip()
+                if not value or value.startswith('#'): continue
+                urls.append('https://www.youtube.com/watch?v='+safe_id(value))
+        else:
+            urls.append('https://www.youtube.com/channel/'+safe_id(channel,channel=True)+'/videos')
+    urls.extend('https://www.twitch.tv/'+safe_component(channel)+'/videos?filter=archives&sort=time' for channel in twitch)
+    return urls

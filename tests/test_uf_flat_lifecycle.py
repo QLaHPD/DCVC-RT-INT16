@@ -10,7 +10,7 @@ from test_uf_archive import ArchiveTests as Fixtures, FakeCodec
 from src.archive.storage import load_bundle, artifact_path, publish_flat
 from src.archive.workflow import run_cleanup, run_decode
 from src.archive.lifecycle import inventory, finish
-from src.archive.dashboard import State
+from src.archive.rt_managed import dashboard_module
 
 
 class FlatLifecycleTests(unittest.TestCase):
@@ -41,6 +41,35 @@ class FlatLifecycleTests(unittest.TestCase):
         self.assertEqual(self.encode(),'resumed')
         with patch('src.archive.workflow.checked_codec',return_value=FakeCodec()):
             self.assertEqual(run_decode(self.options(input=str(root/'source.bin')),verify_only=True),0)
+
+    def test_existing_opus_is_reused_without_reencoding(self):
+        from src.archive.media import encode_audio
+        from src.archive.storage import sha256
+        self.flat(); self.final.parent.mkdir()
+        opus=self.final.with_name('source.opus')
+        encode_audio(self.source,opus,'mono','6k',1)
+        before=sha256(opus)
+        with patch('src.archive.workflow.encode_audio',side_effect=AssertionError('must reuse audio')):
+            self.assertEqual(self.encode(),'encoded')
+        self.assertEqual(sha256(opus),before)
+
+    def test_inventory_remaps_another_machines_source(self):
+        import shutil
+        self.flat();self.assertEqual(self.encode(),'encoded')
+        mount=self.root/'another-mount';mount.mkdir()
+        shutil.copy2(self.source,mount/self.source.name)
+        self.source.unlink()
+        row=next(iter(inventory([self.final.parent],base_root=mount).values()))
+        self.assertEqual(row['originals'],1)
+        self.assertEqual(row['archives'][0]['source'],str(mount/self.source.name))
+
+    def test_missing_metadata_and_unprocessed_sources_block_channel(self):
+        from src.archive.lifecycle import channel_blockers
+        self.flat();self.assertEqual(self.encode(),'encoded')
+        row=next(iter(inventory([self.final.parent]).values()))
+        self.assertTrue(channel_blockers(row,self.options(allow_missing_metadata=False)))
+        self.source.with_name('another.mkv').write_bytes(b'pending')
+        self.assertTrue(channel_blockers(row,self.options(allow_missing_metadata=True)))
 
     def test_flat_collision_never_overwrites(self):
         self.flat();self.final.parent.mkdir()
@@ -103,13 +132,24 @@ class FlatLifecycleTests(unittest.TestCase):
 
     def test_tui_waits_for_confirmation_even_on_completed_run(self):
         self.flat();self.assertEqual(self.encode(),'encoded')
-        state=State();rows=inventory([self.final.parent])
-        state.update(dict(event='lifecycle_inventory',channels=list(rows.values())))
-        self.assertIsNone(state.key(ord('d')))
-        self.assertIsNotNone(state.confirm)
-        self.assertIsNone(state.key(ord('n')))
-        self.assertIsNone(state.key(ord('d')))
-        action=state.key(ord('y'));self.assertEqual(action['action'],'delete')
+        rows=inventory([self.final.parent])
+        module=dashboard_module()
+        with contextlib.redirect_stderr(io.StringIO()):
+            dashboard=module.EncodeDashboard(1,1,self.final.parent,mode='plain')
+        row=next(iter(rows.values()))
+        dashboard.channels=[dict(channel_id=row['channel'],status='awaiting-approval',total=1)]
+        class Keys:
+            def __init__(self,keys):self.keys=iter(keys)
+            def getch(self):return next(self.keys,-1)
+        with patch.object(dashboard,'_draw'):
+            dashboard._screen=Keys([ord('a'),ord('d')])
+            self.assertEqual(dashboard.poll_actions(),[])
+            self.assertEqual(dashboard.views[dashboard.view_index],'approvals')
+            dashboard._screen=Keys([ord('n')]);self.assertEqual(dashboard.poll_actions(),[])
+            dashboard._screen=Keys([ord('d'),ord('y')]);actions=dashboard.poll_actions()
+        dashboard._screen=None;dashboard.close()
+        self.assertEqual(actions[0].kind,'approve')
+        action={'action':'delete','channel':actions[0].channel_id}
         class Commands:
             def __init__(self):self.items=iter([action, {'action':'quit'}]);self.calls=0
             def get(self,timeout):self.calls+=1;return next(self.items)
@@ -185,3 +225,24 @@ class DashboardQueueTests(unittest.TestCase):
             finally:
                 if worker.is_alive():worker.terminate();worker.join()
                 parent.close();child.close();events.close()
+
+class RTFilenameTests(unittest.TestCase):
+    setUp = FlatLifecycleTests.setUp
+    encode = FlatLifecycleTests.encode
+    flat = FlatLifecycleTests.flat
+    options = FlatLifecycleTests.options
+    # Inherit setup/encode helpers only; keep this test separate from old-flat compatibility tests.
+    def test_rt_filename_and_plain_audio_use_source_id(self):
+        self.flat(); self.job['filename_style']='rt'
+        self.assertEqual(self.encode(),'encoded')
+        video=self.final.with_name('source_48x32_qI36_qP30.bin')
+        self.assertTrue(video.is_file())
+        self.assertFalse(self.final.with_name('source.bin').exists())
+        self.assertTrue(self.final.with_name('source.opus').exists())
+        root,data=load_bundle(video)
+        self.assertEqual(data['files']['video.bin'],video.name)
+        self.assertEqual(self.encode(),'resumed')
+        with patch('src.archive.workflow.checked_codec',return_value=FakeCodec()):
+            self.assertEqual(run_decode(self.options(input=str(video)),verify_only=True),0)
+        with self.assertRaisesRegex(ValueError,'does not belong'):
+            load_bundle(self.final.with_name('source_96x64_qI36_qP30.bin'))

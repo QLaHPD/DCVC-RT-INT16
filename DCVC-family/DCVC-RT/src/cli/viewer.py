@@ -4,18 +4,13 @@ import argparse
 import queue
 import threading
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, TYPE_CHECKING
 
 import torch
 
-from src.codec.frame_decoder import (
-    BitstreamFrameSource,
-    DecodedFrame,
-    DecoderModels,
-    configure_decode_runtime,
-    load_decoder_models,
-    resolve_decode_device,
-)
+if TYPE_CHECKING:
+    from src.codec.frame_decoder import BitstreamFrameSource, DecodedFrame, DecoderModels
+
 from src.utils.common import str2bool
 from src.utils.stream_helper import NalType
 
@@ -78,7 +73,11 @@ class DecodeWorker:
 
 
 class ImageGalleryWorker:
-    def __init__(self, models: DecoderModels):
+    def __init__(self, models: DecoderModels, source_factory=None):
+        if source_factory is None:
+            from src.codec.frame_decoder import BitstreamFrameSource
+            source_factory = BitstreamFrameSource
+        self.source_factory = source_factory
         self.models = models
         self.requests: queue.Queue = queue.Queue()
         self.results: queue.Queue = queue.Queue()
@@ -107,7 +106,7 @@ class ImageGalleryWorker:
                 return
             source = None
             try:
-                source = BitstreamFrameSource(image_path, self.models)
+                source = self.source_factory(image_path, self.models)
                 if source.index.frame_count != 1 or source.index.frames[0].nal_type != NalType.NAL_I:
                     raise ValueError(".dcvci must contain exactly one I-frame")
                 frame = source.seek(0, output_format="rgb")
@@ -272,13 +271,13 @@ class ViewerApp:
 
 class ImageGalleryApp:
     def __init__(self, root, image_paths: Sequence[Path], models: DecoderModels, start_image: int,
-                 max_width: int, max_height: int, runtime_label: str):
+                 max_width: int, max_height: int, runtime_label: str, source_factory=None):
         import tkinter as tk
 
         self.tk = tk
         self.root = root
         self.image_paths = list(image_paths)
-        self.worker = ImageGalleryWorker(models)
+        self.worker = ImageGalleryWorker(models, source_factory)
         self.max_width = max_width
         self.max_height = max_height
         self.runtime_label = runtime_label
@@ -411,6 +410,12 @@ def configure_parser(parser: argparse.ArgumentParser):
 
 
 def run(args) -> int:
+    from src.codec.frame_decoder import (
+        BitstreamFrameSource,
+        configure_decode_runtime,
+        load_decoder_models,
+        resolve_decode_device,
+    )
     bin_path = Path(args.bin_path)
     if not bin_path.exists():
         print(f"Bitstream or image folder not found: {bin_path}")

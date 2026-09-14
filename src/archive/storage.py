@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -27,6 +28,8 @@ sha256 = _shared.file_sha256
 
 def event(name, **fields):
     record = {'time': datetime.now(timezone.utc).isoformat(), 'event': name, **fields}
+    if os.environ.get('UF_JOB_KEY'):
+        record['job_key'] = os.environ['UF_JOB_KEY']
     line = json.dumps(record)
     from src.archive.dashboard import event_queue
     destination = event_queue()
@@ -83,7 +86,14 @@ def manifest_path(path):
     if path.name.endswith('.uf.json'):
         return path
     candidate = path.with_suffix('.uf.json')
-    return candidate if candidate.exists() else path.parent / 'manifest.json'
+    if candidate.exists():
+        return candidate
+    match = re.fullmatch(r'(.+)_\d+x\d+_qI\d+_qP\d+\.bin', path.name)
+    if match:
+        candidate = path.parent / (match.group(1) + '.uf.json')
+        if candidate.exists():
+            return candidate
+    return path.parent / 'manifest.json'
 
 
 def artifact_path(root, metadata, name):
@@ -126,6 +136,8 @@ def load_bundle(path, expected=None):
             raise ValueError('Flat artifact map is incomplete')
         if len(set(data['files'].values())) != len(data['files']):
             raise ValueError('Flat artifacts must have distinct paths')
+    if data.get('layout') == 'flat' and Path(path).suffix == '.bin' and artifact_path(root, data, 'video.bin').name != Path(path).name:
+        raise ValueError('Input bitstream does not belong to this manifest')
     if expected is not None and data['pipeline'] != expected:
         raise ValueError(f'Existing archive uses different encoding settings/models: {root}')
     if not data.get('validation', {}).get('decoded_yuv_sha256'):
@@ -152,11 +164,15 @@ def publish_flat(stage, manifest, metadata, heartbeat, lease_key):
     names = {}
     for name in metadata['artifacts']:
         if name == 'video.bin':
-            names[name] = stem + '.bin'
+            if metadata.get('filename_style') == 'rt':
+                video, config = metadata['video'], metadata['pipeline']
+                names[name] = f"{stem}_{video['width']}x{video['height']}_qI{config['qp_i']}_qP{config['qp_p']}.bin"
+            else:
+                names[name] = stem + '.bin'
         elif name == 'audio.opus':
             names[name] = stem + '.opus'
         elif name == 'source.info.json':
-            names[name] = stem + '.uf.info.json'
+            names[name] = stem + ('.info.json' if metadata.get('filename_style') == 'rt' else '.uf.info.json')
         else:
             names[name] = name
     if len(set(names.values())) != len(names):

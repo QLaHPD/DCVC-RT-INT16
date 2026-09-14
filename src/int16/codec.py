@@ -16,7 +16,7 @@ MAGIC = b'UF16\x01\x00\x00\x00'
 class IntegerCodec(Codec):
     def __init__(self, image_path, video_path, variant='hts', device=0,
                  prepared_i=None, prepared_p=None, identities=None, source_hashes=None,
-                 skip_threshold=0):
+                 skip_threshold=0, image_only=False):
         set_torch_env()
         self.device = torch.device('cpu' if device == 'cpu' else f'cuda:{device}')
         if self.device.type == 'cuda':
@@ -29,24 +29,30 @@ class IntegerCodec(Codec):
         else:
             self.stream = None
         loaded = []
-        for index, (source, kind, path) in enumerate(((image_path, 'image', prepared_i),
-                                                     (video_path, variant, prepared_p))):
+        specifications = [(image_path, 'image', prepared_i)]
+        if not image_only:
+            specifications.append((video_path, variant, prepared_p))
+        for index, (source, kind, path) in enumerate(specifications):
             _, data = resolve_prepared(source, kind, path,
                                         identities[index] if identities else None,
                                         source_hashes[index] if source_hashes else None)
             loaded.append(data)
         self.preamble = MAGIC + b''.join(bytes.fromhex(data['identity']) for data in loaded)
+        if image_only:
+            self.preamble += bytes(32)
         self.variant = variant
         self.chunk_size = 1 if variant == 'ld' else 8
         self.image = IntegerModel(loaded[0], self.device)
-        self.video = IntegerModel(loaded[1], self.device, reconstruct_on_encode=False)
+        self.video = None if image_only else IntegerModel(loaded[1], self.device, reconstruct_on_encode=False)
         self.set_skip_threshold(skip_threshold)
 
     def set_skip_threshold(self, value):
         threshold = int(float(value) * ops.FEATURE_SCALE + 0.5)
         if threshold < 0 or threshold > 32767:
             raise ValueError('skip_threshold is outside the INT16 feature range')
-        self.image.skip_threshold = self.video.skip_threshold = threshold
+        self.image.skip_threshold = threshold
+        if self.video is not None:
+            self.video.skip_threshold = threshold
 
     def tensor(self, frames):
         values = torch.from_numpy(np.concatenate(frames, axis=0)).unsqueeze(0).to(self.device)

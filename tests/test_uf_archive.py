@@ -128,7 +128,7 @@ class ArchiveTests(unittest.TestCase):
                 return 0
             argv = ['main.py', 'encode', '--input_file', str(self.source),
                     '--output_root', str(self.root/'output'), '--runtime', runtime, *extra]
-            with patch('main.run_encode', run), patch('sys.argv', argv), \
+            with patch('src.archive.dashboard.run', run), patch('sys.argv', argv), \
                  patch('src.archive.media.os.sched_getaffinity', return_value=set(range(6)), create=True):
                 self.assertEqual(main.main(), 0)
             self.assertEqual(captured, [expected])
@@ -207,8 +207,9 @@ class ArchiveTests(unittest.TestCase):
         args = types.SimpleNamespace(input_file=None, base_root=str(self.root), channel_ids=None,
                                      recursive=True, output_root=str(self.root / 'out'))
         jobs = discover(args)
-        self.assertEqual(len(jobs), 2)
-        self.assertEqual(len({job['final'] for job in jobs}), 2)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]['source'],str(self.source))
+        self.assertTrue(other.exists())
 
     def test_aspect_ratio_and_no_unnecessary_resize(self):
         self.assertEqual(dimensions(1280, 720, 144), (256, 144))
