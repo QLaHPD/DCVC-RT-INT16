@@ -52,9 +52,27 @@ source contains audio.
 
 `--input_threads` sets the FFmpeg thread budget. INT16 defaults to up to four
 threads per worker and `--prefetch_frames 8` (alias `--ffmpeg_prefetch`); queued
-frames are bounded to 8 MiB or one frame. `--ff_hwaccel none|auto|jetson` selects
+local-file queues are bounded to 8 MiB or one frame. `--ff_hwaccel none|auto|jetson` selects
 the decoder. The Jetson option reuses RT's GStreamer NVDEC bridge for supported
 local H.264 inputs, with a complete software retry on hardware decode failure.
+
+Streaming instead primes an eight-frame decoded input queue. After the first
+five seconds of encoding, it measures average encoding FPS once and changes the
+queue capacity to `ceil(FPS * 2)` frames, shared by subsequent videos/workers in
+that run. If the first video ends before five seconds, calibration waits for an
+eligible later video. The queue fills ahead as download/decode speed permits;
+it cannot compensate for a persistently slower source. Its YUV444 frame storage
+uses approximately `frames * width * height * 3` bytes (about 15 MiB for 140
+frames at 256x144), without the local-file queue's 8 MiB cap.
+
+Next-video metadata resolves in the background. At 20 or fewer remaining video
+fragments, one additional yt-dlp video stream starts while the current worker
+finishes. Formats without fragment counts use 95% byte progress when available;
+remaining encoded frames and download completion provide additional triggers.
+The pending stream backpressures on a bounded OS pipe until a worker is free,
+without saving a source video. Cookies still use private temporary copies, and
+shared claims and atomic publication remain enforced by the encoding worker.
+Restart an existing streaming run to activate this scheduler.
 
 ## Names, resume and shared work
 

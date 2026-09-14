@@ -35,14 +35,36 @@ def command(binary, cookies):
             '--fragment-retries', '5', *(['--cookies', cookies] if cookies else [])]
 
 
-def metadata(url, binary, cookies, flat=False):
+def metadata(url, binary, cookies, flat=False, cancel_event=None):
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError('Streaming metadata cancelled')
     with cookie_copy(cookies) as copy:
         cmd = command(binary, copy) + ['--dump-single-json', '--skip-download']
         cmd += ['--flat-playlist', '--ignore-errors'] if flat else ['--no-playlist']
-        result = subprocess.run(cmd + ['--', url], capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(result.stderr[-2500:])
-        return json.loads(result.stdout)
+        if cancel_event is None:
+            result = subprocess.run(cmd + ['--', url], capture_output=True, text=True)
+            if result.returncode:
+                raise RuntimeError(result.stderr[-2500:])
+            return json.loads(result.stdout)
+        process = subprocess.Popen(cmd + ['--',url], stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+        try:
+            while True:
+                if cancel_event.is_set():
+                    raise InterruptedError('Streaming metadata cancelled')
+                try:
+                    output,errors = process.communicate(timeout=.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+            if process.returncode: raise RuntimeError(errors[-2500:])
+            return json.loads(output)
+        finally:
+            if process.poll() is None:
+                import signal
+                try: os.killpg(process.pid,signal.SIGKILL)
+                except ProcessLookupError: pass
+                process.wait()
+            process.stdout.close(); process.stderr.close()
 
 
 def safe_id(value, channel=False):
@@ -75,7 +97,12 @@ def select_formats(info, max_height=0):
 
 
 @contextmanager
-def download_pipe(remote, format_id):
+def download_pipe(remote, format_id, prepared=None):
+    if prepared is not None:
+        from src.archive.stream_pipeline import prepared_pipe
+        with prepared_pipe(prepared) as stream:
+            yield stream
+        return
     with cookie_copy(remote.get('cookies')) as copy, tempfile.TemporaryFile() as errors:
         cmd = command(remote['binary'], copy) + ['--no-playlist', '-f', str(format_id), '-o', '-', '--', remote['url']]
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors)
@@ -130,23 +157,25 @@ def existing_stream_archives(channel_out):
         archives[url] = path
     return archives
 
-def stream_jobs(args, binary, counts):
+def stream_jobs(args, binary, counts, cancel_event=None):
     from src.archive.media import decoder_thread_budget
     seen = set()
     archives = {}
     for url in args.source_urls:
-        listing = metadata(url, binary, args.cookies, flat=True)
+        if cancel_event is not None and cancel_event.is_set(): return
+        listing = metadata(url, binary, args.cookies, flat=True, cancel_event=cancel_event)
         entries = listing.get('entries') if listing.get('_type') in ('playlist', 'multi_video') else [listing]
         if entries is None:
             entries = [listing]
         # Channel handles can resolve to a list of tabs.
         pending = list(entries)
         while pending:
+            if cancel_event is not None and cancel_event.is_set(): return
             entry = pending.pop(0)
             if not entry:
                 continue
             if entry.get('_type') in ('playlist', 'multi_video'):
-                sub = entry if entry.get('entries') is not None else metadata(entry['url'], binary, args.cookies, flat=True)
+                sub = entry if entry.get('entries') is not None else metadata(entry['url'], binary, args.cookies, flat=True, cancel_event=cancel_event)
                 pending.extend(sub.get('entries') or [])
                 continue
             try:
@@ -160,7 +189,7 @@ def stream_jobs(args, binary, counts):
                 event('run_discovered', total=len(seen)+len(pending))
                 video_url = 'https://www.youtube.com/watch?v=' + video_id if youtube else (entry.get('webpage_url') or entry.get('url') or 'https://www.twitch.tv/videos/'+video_id.lstrip('v'))
                 event('stream_resolving', video_id=video_id)
-                info = metadata(video_url, binary, args.cookies)
+                info = metadata(video_url, binary, args.cookies, cancel_event=cancel_event)
                 if info.get('is_live') or info.get('live_status') == 'is_upcoming':
                     event('stream_skipped_live', video_id=video_id)
                     continue
@@ -196,7 +225,8 @@ def stream_jobs(args, binary, counts):
 
 
 def run_stream(args):
-    from src.archive.workflow import pipeline, execute_jobs
+    from src.archive.workflow import pipeline
+    from src.archive.stream_pipeline import execute_stream_jobs
     if args.max_frames:
         raise ValueError('Streaming requires full videos; omit --max_frames')
     binary = shutil.which(args.ytdlp_bin)
@@ -205,7 +235,7 @@ def run_stream(args):
     args._cleanup_sources = set()
     config,paths = pipeline(args)
     counts = {'encoded':0,'resumed':0,'busy':0,'failed':0}
-    outcomes,failed = execute_jobs(args,stream_jobs(args,binary,counts),config,paths)
+    outcomes,failed = execute_stream_jobs(args,config,paths,binary,counts)
     for result in outcomes: counts[result if result in counts else 'failed'] += 1
     event('stream_finished',**counts)
     from src.archive.lifecycle import finish

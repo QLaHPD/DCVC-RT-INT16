@@ -197,7 +197,20 @@ def encode_job(job, config, paths, device, instance):
             stage = Path(tempfile.mkdtemp(prefix='.' + final.name + '.stage-', dir=parent))
             codec = make_codec(config, paths, device)
             last = [0.0]
+            policy = job.get('buffer_policy') if remote else None
+            if policy is not None: policy.claim()
+            current_reader = [None]
             def progress(**values):
+                if policy is not None:
+                    policy.observe(values.get('frames',0),values.get('fps',0))
+                    reader = current_reader[0]
+                    if reader is not None and reader._queue.maxsize != policy.capacity():
+                        reader.set_prefetch_frames(policy.capacity())
+                nearing = job.get('stream_near_end')
+                if nearing is not None:
+                    total_frames = original.get('duration',0)*fps
+                    if total_frames > 0 and total_frames-values.get('frames',0) <= (policy.capacity() if policy else 8):
+                        nearing.set()
                 now = time.monotonic()
                 if now - last[0] >= 2:
                     event('encode_progress', source=source.name, **values)
@@ -209,10 +222,12 @@ def encode_job(job, config, paths, device, instance):
             mode = job.get('hwaccel','none')
             for decode_mode in (('jetson','none') if mode=='jetson' else (mode,)):
                 try:
-                    with (download_pipe(remote, remote['video_format']) if remote else nullcontext(None)) as input_pipe, \
+                    with (download_pipe(remote, remote['video_format'], prepared=job.get('prepared_download')) if remote else nullcontext(None)) as input_pipe, \
                             FrameReader('pipe:0' if remote else source, width, height, original, fps,
                                      decoder_threads=job.get('input_threads', 1),
-                                     prefetch_frames=job.get('prefetch_frames', 0), input_pipe=input_pipe,hwaccel=decode_mode) as reader:
+                                     prefetch_frames=policy.capacity() if policy is not None else job.get('prefetch_frames', 0), input_pipe=input_pipe,hwaccel=decode_mode,adaptive_buffer=policy is not None) as reader:
+                        current_reader[0] = reader
+                        if policy is not None: reader.prime()
                         result = codec.encode(reader, stage / 'video.bin', config['qp_i'], config['qp_p'],
                                               config['reset_interval'], config['intra_period'], config['max_frames'], progress)
                     break
@@ -220,6 +235,8 @@ def encode_job(job, config, paths, device, instance):
                     if decode_mode != 'jetson': raise
                     (stage/'video.bin').unlink(missing_ok=True)
                     event('decoder_fallback',source=str(source),error=str(exc),message='Retrying input with software decoding')
+            if policy is not None: policy.release()
+            if job.get('stream_near_end') is not None: job['stream_near_end'].set()
             result.update(width=width, height=height, fps=fps)
             if config['audio'] == 'opus' and original['audio']:
                 existing_audio = parent / (final.name.removesuffix('.uf.json') + '.opus') if flat else None
@@ -292,12 +309,26 @@ def encode_job(job, config, paths, device, instance):
 def _job_entry(connection, *args, event_queue=None):
     from src.archive.dashboard import install
     install(event_queue)
+    job = args[0]
+    prepared = job.get('prepared_download')
+    policy = job.get('buffer_policy')
     try:
+        if prepared is not None:
+            import signal
+            from src.archive.stream_pipeline import open_descriptor
+            def terminate(_signal, _frame):
+                raise KeyboardInterrupt()
+            signal.signal(signal.SIGTERM, terminate)
+            open_descriptor(prepared)
         connection.send(encode_job(*args))
     except Exception as exc:
         event('worker_failed', error=f'{type(exc).__name__}: {exc}')
         connection.send('failed')
     finally:
+        if prepared is not None:
+            from src.archive.stream_pipeline import close_descriptor
+            close_descriptor(prepared)
+        if policy is not None: policy.release()
         connection.close()
 
 

@@ -48,7 +48,7 @@ def dimensions(width, height, resolution):
 
 class FrameReader:
     def __init__(self, source, width, height, original, fps=None, decoder_threads=1,
-                 prefetch_frames=0, input_pipe=None, hwaccel="none"):
+                 prefetch_frames=0, input_pipe=None, hwaccel="none", adaptive_buffer=False):
         if not isinstance(decoder_threads, int) or decoder_threads < 1:
             raise ValueError('decoder_threads must be a positive integer')
         if not isinstance(prefetch_frames, int) or prefetch_frames < 0:
@@ -83,8 +83,8 @@ class FrameReader:
         self._stop = threading.Event()
         self._thread = self._queue = None
         if prefetch_frames:
-            # Bound queued YUV444 arrays to 8 MiB, or one frame for large inputs.
-            capacity = min(prefetch_frames, max(1, (8*1024*1024)//(width*height*3)))
+            # Local queues are capped at 8 MiB; streaming uses its measured frame target.
+            capacity = prefetch_frames if adaptive_buffer else min(prefetch_frames, max(1, (8*1024*1024)//(width*height*3)))
             self._queue = queue.Queue(maxsize=capacity)
             self._thread = threading.Thread(target=self._prefetch, name='uf-input', daemon=True)
             try:
@@ -93,6 +93,23 @@ class FrameReader:
                 self._thread = None
                 self.close()
                 raise
+
+    def set_prefetch_frames(self, capacity):
+        if self._queue is None or capacity < 1:
+            raise ValueError('Adaptive buffering requires a positive threaded queue')
+        with self._queue.not_full:
+            self._queue.maxsize = int(capacity)
+            self._queue.not_full.notify_all()
+
+    def prime(self):
+        """Fill the initial buffer, or stop waiting on a short/error input."""
+        if self._queue is None:
+            return
+        with self._queue.not_empty:
+            while len(self._queue.queue) < self._queue.maxsize:
+                if self._stop.is_set() or any(frame is None or error is not None for frame,error in self._queue.queue):
+                    return
+                self._queue.not_empty.wait(timeout=.1)
 
     def read(self):
         if self._closed:
