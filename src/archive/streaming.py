@@ -82,9 +82,18 @@ def select_formats(info, max_height=0):
     if max_height:
         bounded = [f for f in formats if f['height'] <= max_height]
         formats = bounded or [f for f in formats if f['height'] == min(v['height'] for v in formats)]
-    video = max(formats, key=lambda f: (f.get('height') or 0, f.get('width') or 0, f.get('tbr') or 0))
+    best_geometry = max((f.get('height') or 0, f.get('width') or 0) for f in formats)
+    best_formats = [f for f in formats
+                    if ((f.get('height') or 0, f.get('width') or 0) == best_geometry)]
+    separate_video = [f for f in best_formats if f.get('acodec') in (None, 'none')]
+    if separate_video:
+        best_formats = separate_video
+    video = max(best_formats, key=lambda f: f.get('tbr') or 0)
     audio = [f for f in info.get('formats', []) if f.get('acodec') not in (None, 'none')
              and f.get('url') and not f.get('has_drm')]
+    separate_audio = [f for f in audio if f.get('vcodec') in (None, 'none')]
+    if separate_audio:
+        audio = separate_audio
     # yt-dlp marks original tracks in format_note / language_preference.
     originals = [f for f in audio if 'original' in str(f.get('format_note', '')).lower()
                  or (f.get('language_preference') or 0) >= 10]

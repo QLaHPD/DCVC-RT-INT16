@@ -24,6 +24,22 @@ class StreamingTests(unittest.TestCase):
         a['format_note']=''
         with self.assertRaises(ValueError):select_formats({'formats':[v,a,b]})
 
+    def test_prefers_separate_video_and_original_audio(self):
+        combined=dict(format_id='18',url='combined',vcodec='avc1',acodec='mp4a',height=360,width=640,tbr=207)
+        avc=dict(format_id='134',url='avc',vcodec='avc1',acodec='none',height=360,width=640,tbr=78)
+        vp9=dict(format_id='243',url='vp9',vcodec='vp9',acodec='none',height=360,width=640,tbr=131)
+        dubbed=dict(format_id='140-en',url='dub',vcodec='none',acodec='aac',language='en',tbr=206)
+        original=dict(format_id='140-pt',url='original',vcodec='none',acodec='aac',language='pt',
+                      language_preference=10,format_note='Portuguese original',tbr=129)
+        video,audio=select_formats({'formats':[combined,avc,vp9,dubbed,original]})
+        self.assertEqual(video['format_id'],'243')
+        self.assertEqual(audio['format_id'],'140-pt')
+
+    def test_preserves_best_resolution_if_only_combined_format_has_it(self):
+        high=dict(format_id='18',url='high',vcodec='avc1',acodec='mp4a',height=720,width=1280,tbr=200)
+        low=dict(format_id='low',url='low',vcodec='vp9',acodec='none',height=360,width=640,tbr=300)
+        self.assertEqual(select_formats({'formats':[high,low]})[0]['format_id'],'18')
+
     def test_ids_cannot_escape_output_directory(self):
         with self.assertRaises(ValueError):safe_id('../escape')
         with self.assertRaises(ValueError):safe_id('channel_handle',channel=True)
