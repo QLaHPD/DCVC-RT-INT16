@@ -49,12 +49,46 @@ def content_hash(data):
         descriptor = [name, str(tensor.dtype), list(tensor.shape)]
         digest.update(json.dumps(descriptor, separators=(',', ':')).encode())
         values = tensor.detach().cpu().contiguous().numpy()
-        digest.update(values.astype(values.dtype.newbyteorder('<'), copy=False).tobytes())
+        # The contiguous NumPy buffer already exposes every canonical byte.
+        digest.update(values.astype(values.dtype.newbyteorder('<'), copy=False))
     return digest.hexdigest()
 
 
-def load_prepared(path, source_sha256=None, variant=None, expected_identity=None):
-    data = torch.load(path, map_location='cpu', weights_only=True)
+class PreparedFileGuard:
+    """Keep mapped checkpoint validation valid until device copies finish."""
+
+    def __init__(self):
+        self.files = []
+
+    @staticmethod
+    def signature(path):
+        stat = Path(path).stat()
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def check(self):
+        for path, signature in self.files:
+            try:
+                unchanged = self.signature(path) == signature
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                raise ValueError(f'Prepared checkpoint changed while loading: {path}')
+
+
+def load_prepared(path, source_sha256=None, variant=None, expected_identity=None,
+                  memory_map=False, _guard=None):
+    guard = _guard if _guard is not None else PreparedFileGuard()
+    options = {}
+    if memory_map:
+        # torch.load cannot map legacy pickle serialization. Retain support for
+        # those prepared files, and keep CPU execution on independent storage.
+        signature = guard.signature(path)
+        with open(path, 'rb') as stream:
+            mapped = stream.read(4) == b'PK\x03\x04'
+        if mapped:
+            guard.files.append((Path(path), signature))
+            options['mmap'] = True
+    data = torch.load(path, map_location='cpu', weights_only=True, **options)
     if data.get('format') != 'dcvc-uf-prepared-v1' or data.get('arithmetic') != ARITHMETIC_ID:
         raise ValueError('Unsupported UF integer preparation format/arithmetic')
     if source_sha256 is not None and data['source_sha256'] != source_sha256:
@@ -64,10 +98,12 @@ def load_prepared(path, source_sha256=None, variant=None, expected_identity=None
     identity = content_hash(data)
     if data.get('identity') != identity or (expected_identity is not None and identity != expected_identity):
         raise ValueError('Prepared integer model/table identity mismatch; copy the matching prepared file')
+    guard.check()
     return data
 
 
-def resolve_prepared(checkpoint, variant, path=None, expected_identity=None, expected_source=None):
+def resolve_prepared(checkpoint, variant, path=None, expected_identity=None, expected_source=None,
+                     memory_map=False, _guard=None):
     """An explicit prepared file is self-contained; float weights are only needed to create it."""
     if path is None and expected_source is not None:
         source = Path(checkpoint)
@@ -75,8 +111,9 @@ def resolve_prepared(checkpoint, variant, path=None, expected_identity=None, exp
         if candidate.exists():
             path = candidate
     if path is not None and Path(path).exists():
-        return Path(path), load_prepared(path, expected_source, variant, expected_identity)
-    path, data = prepare(checkpoint, variant, path)
+        return Path(path), load_prepared(path, expected_source, variant, expected_identity,
+                                         memory_map=memory_map, _guard=_guard)
+    path, data = prepare(checkpoint, variant, path, memory_map=memory_map, _guard=_guard)
     if expected_identity is not None and data['identity'] != expected_identity:
         raise ValueError('Prepared identity mismatch; copy the prepared file used by the encoder')
     if expected_source is not None and data['source_sha256'] != expected_source:
@@ -84,13 +121,14 @@ def resolve_prepared(checkpoint, variant, path=None, expected_identity=None, exp
     return path, data
 
 
-def prepare(checkpoint, variant, output=None):
+def prepare(checkpoint, variant, output=None, memory_map=False, _guard=None):
     from src.utils.common import get_state_dict
     checkpoint = Path(checkpoint).resolve()
     source_sha = file_hash(checkpoint)
     output = Path(output) if output else checkpoint.parent / f'{checkpoint.name}.{ARITHMETIC_ID}.{source_sha[:16]}.int16.pt'
     if output.exists():
-        return output, load_prepared(output, source_sha, variant)
+        return output, load_prepared(output, source_sha, variant,
+                                     memory_map=memory_map, _guard=_guard)
     model = make_model(variant)
     model.load_state_dict(get_state_dict(checkpoint), strict=True)
     model.update(0)
@@ -136,4 +174,5 @@ def prepare(checkpoint, variant, output=None):
                 raise ValueError('Concurrent preparation produced a different identity')
     finally:
         Path(temporary).unlink(missing_ok=True)
-    return output, load_prepared(output, source_sha, variant)
+    return output, load_prepared(output, source_sha, variant,
+                                 memory_map=memory_map, _guard=_guard)

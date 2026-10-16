@@ -54,13 +54,14 @@ existing RT runtime and its prepared INT16 files remain in their original locati
 
 Add `--target-psnr 30` to `encode` or `stream` to select the fastest measured
 configuration with PSNR ≥30 dB; smaller bitstream size breaks equal-time ties.
-This fills INT16, HT-L, 144p and the five codec parameters automatically.
+This fills INT16, HT-L and the five codec parameters automatically. Use any
+`--resolution`; omitting it defaults to the benchmark's 144p short edge.
 Explicit codec parameters constrain the candidate search; omit the target to
 keep fully manual settings. The target is a **benchmark reference**, not a
 quality guarantee for new content. See the [published 2,000-trial benchmark](benchmarks/README.md).
 
 ```bash
-./scripts/uf-python main.py encode --input_file video.mp4 --output_root output --target-psnr 30
+./scripts/uf-python main.py encode --input_file video.mp4 --output_root output --target-psnr 30 --resolution 480
 ```
 
 ### YouTube streaming

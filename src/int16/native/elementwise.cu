@@ -8,7 +8,9 @@
 
 namespace {
 __device__ int16_t sat(int64_t x) { return x < -32768 ? -32768 : (x > 32767 ? 32767 : x); }
-__device__ int64_t rna(int64_t x, int d) { return x < 0 ? -((-x+d/2)/d) : (x+d/2)/d; }
+// Byte conversion, INT16 symbol quantization and YUV conversion all fit INT32,
+// including their rounding offsets.
+__device__ int32_t rna(int32_t x, int d) { return x < 0 ? -((-x+d/2)/d) : (x+d/2)/d; }
 void check(const torch::Tensor& x) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type()==at::kShort && x.is_contiguous(), "contiguous CUDA INT16 required");
     TORCH_CHECK(x.numel()>0 && x.numel()<=INT32_MAX, "unsupported tensor size");
@@ -44,6 +46,33 @@ __global__ void bytes_kernel(int16_t* out,const uint8_t* x,int64_t n) {
     int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(i<n) out[i]=rna((2*static_cast<int32_t>(x[i])-255)*512,510);
 }
+__global__ void bytes_unshuffle_kernel(int16_t* out,const uint8_t* x,
+    int h,int w,int oh,int ow,int tiles_w) {
+    // Coalesce the byte reads and the unshuffled INT16 writes. Four padding
+    // words make both sides of the 8-by-32 transpose free of bank conflicts.
+    __shared__ int32_t tile[64][36];
+    int ox=(blockIdx.x%tiles_w)*32,group=blockIdx.x/tiles_w;
+    int oy=group%oh,plane=group/oh;
+    int position=threadIdx.x/8,sub_x=threadIdx.x%8;
+    if(ox+position<ow) {
+        int ix=ox*8+threadIdx.x;
+        ix=ix<w?ix:w-1;
+        #pragma unroll
+        for(int dy=0;dy<8;++dy) {
+            int iy=oy*8+dy;
+            iy=iy<h?iy:h-1;
+            int64_t offset=(static_cast<int64_t>(plane)*h+iy)*w+ix;
+            tile[dy*8+sub_x][position]=rna((2*static_cast<int>(x[offset])-255)*512,510);
+        }
+    }
+    __syncthreads();
+    #pragma unroll
+    for(int i=threadIdx.x;i<64*32;i+=256) {
+        int channel=i/32,pos=i%32;
+        if(ox+pos<ow)
+            out[((static_cast<int64_t>(plane)*64+channel)*oh+oy)*ow+ox+pos]=tile[channel][pos];
+    }
+}
 __global__ void symbols_kernel(int8_t* out,const int16_t* x,int64_t n) {
     int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(i<n) out[i]=rna(x[i],512);
@@ -69,10 +98,11 @@ __global__ void wsilu4_kernel(int16_t* out,const int16_t* x,const int16_t* lut,i
     for(int k=0;k<4;++k) sum+=lut[static_cast<int32_t>(x[first+k*hw])+32768];
     out[i]=sat(sum);
 }
-__global__ void raw_frame_kernel(uint8_t* out,const int16_t* x,int count,int width,int height,
-    int input_width,int input_height) {
-    int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i>=count) return;
+struct RawFrames {
+    const int16_t* data[8];
+};
+__device__ uint8_t raw_pixel(const int16_t* x,int i,int width,int height,
+                           int input_width,int input_height) {
     int pixels=width*height,value;
     if(i<pixels) {
         int offset=(i/width)*input_width+i%width;
@@ -85,7 +115,19 @@ __global__ void raw_frame_kernel(uint8_t* out,const int16_t* x,int count,int wid
         int numerator=(sum+1024)*255;
         value=numerator<0?-((-numerator+2047)/2048):numerator/2048;
     }
-    out[i]=value<0?0:(value>255?255:value);
+    return value<0?0:(value>255?255:value);
+}
+__global__ void raw_frame_kernel(uint8_t* out,const int16_t* x,int count,int width,int height,
+    int input_width,int input_height) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<count) out[i]=raw_pixel(x,i,width,height,input_width,input_height);
+}
+__global__ void raw_frames_kernel(uint8_t* out,RawFrames frames,int frame_bytes,
+    int width,int height,int input_width,int input_height) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<frame_bytes)
+        out[static_cast<int64_t>(blockIdx.y)*frame_bytes+i]=
+            raw_pixel(frames.data[blockIdx.y],i,width,height,input_width,input_height);
 }
 }
 
@@ -139,6 +181,20 @@ torch::Tensor uf_bytes(const torch::Tensor& input) {
     bytes_kernel<<<(x.numel()+255)/256,256,0,c10::cuda::getCurrentCUDAStream()>>>(out.data_ptr<int16_t>(),x.data_ptr<uint8_t>(),x.numel());
     C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
 }
+
+torch::Tensor uf_bytes_unshuffle(const torch::Tensor& input) {
+    TORCH_CHECK(input.is_cuda() && input.scalar_type()==at::kByte && input.dim()==4 &&
+                input.numel()>0 && input.numel()<=INT32_MAX,"nonempty CUDA NCHW bytes required");
+    c10::cuda::CUDAGuard guard(input.device()); auto x=input.contiguous();
+    int64_t oh=(x.size(2)+15)/16*2,ow=(x.size(3)+15)/16*2;
+    int64_t count=x.size(0)*x.size(1)*64*oh*ow;
+    TORCH_CHECK(count<=INT32_MAX,"unshuffled source exceeds indexing bounds");
+    auto out=torch::empty({x.size(0),x.size(1)*64,oh,ow},x.options().dtype(at::kShort));
+    int64_t tiles_w=(ow+31)/32,blocks=x.size(0)*x.size(1)*oh*tiles_w;
+    bytes_unshuffle_kernel<<<blocks,256,0,c10::cuda::getCurrentCUDAStream()>>>(
+        out.data_ptr<int16_t>(),x.data_ptr<uint8_t>(),x.size(2),x.size(3),oh,ow,tiles_w);
+    C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
+}
 torch::Tensor uf_wsilu4(const torch::Tensor& input,const torch::Tensor& table) {
     auto x=input.contiguous(),lut=table.contiguous(); check(x); check(lut);
     TORCH_CHECK(x.dim()==4 && x.size(1)%4==0 && lut.dim()==1 && lut.numel()==65536 && lut.device()==x.device(),"invalid WSiLU4 inputs");
@@ -156,6 +212,31 @@ torch::Tensor uf_raw_frame(const torch::Tensor& input,int width,int height) {
     auto out=torch::empty({count},x.options().dtype(at::kByte));
     raw_frame_kernel<<<(count+255)/256,256,0,c10::cuda::getCurrentCUDAStream()>>>(out.data_ptr<uint8_t>(),
         x.data_ptr<int16_t>(),count,width,height,x.size(3),x.size(2));
+    C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
+}
+
+torch::Tensor uf_raw_frames(const std::vector<torch::Tensor>& inputs,int width,int height) {
+    TORCH_CHECK(!inputs.empty() && inputs.size()<=8,"one to eight YUV420 frames required");
+    if(inputs.size()==1) return uf_raw_frame(inputs[0],width,height).view({1,-1});
+    const auto& first=inputs[0];
+    TORCH_CHECK(first.is_cuda() && first.dim()==4 && first.size(0)==1 && first.size(1)==3 &&
+                width>0 && height>0 && width%2==0 && height%2==0 &&
+                width<=first.size(3) && height<=first.size(2),"invalid YUV420 dimensions");
+    c10::cuda::CUDAGuard guard(first.device());
+    int64_t frame_bytes=static_cast<int64_t>(width)*height*3/2;
+    int64_t count=frame_bytes*inputs.size();
+    TORCH_CHECK(count<=INT32_MAX,"YUV420 chunk exceeds indexing bounds");
+    RawFrames pointers{};
+    std::vector<torch::Tensor> contiguous;
+    for(const auto& input:inputs) {
+        TORCH_CHECK(input.device()==first.device() && input.sizes()==first.sizes(),
+                    "YUV420 frame shape/device mismatch");
+        contiguous.push_back(input.contiguous()); check(contiguous.back());
+        pointers.data[contiguous.size()-1]=contiguous.back().data_ptr<int16_t>();
+    }
+    auto out=torch::empty({static_cast<int64_t>(inputs.size()),frame_bytes},first.options().dtype(at::kByte));
+    raw_frames_kernel<<<dim3((frame_bytes+255)/256,inputs.size()),256,0,c10::cuda::getCurrentCUDAStream()>>>(
+        out.data_ptr<uint8_t>(),pointers,frame_bytes,width,height,first.size(3),first.size(2));
     C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
 }
 

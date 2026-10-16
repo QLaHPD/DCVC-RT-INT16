@@ -47,6 +47,9 @@ class Codec:
         return (torch.from_numpy(array).unsqueeze(0).to(self.device).half() / 255.0 - 0.5
                 ).contiguous(memory_format=torch.channels_last)
 
+    def tensor_for_encode(self, frames):
+        return self.tensor(frames)
+
     def write_preamble(self, stream):
         pass
 
@@ -81,7 +84,7 @@ class Codec:
                 valid = len(frames)
                 if not is_i:
                     frames += [frames[-1]] * (self.chunk_size - valid)
-                x = self.tensor(frames)
+                x = self.tensor_for_encode(frames)
                 reset = not is_i and reset_interval > 0 and (count + self.chunk_size) % reset_interval == 1
                 if is_i:
                     result = self.image.compress(x, qp_i, pad_b, pad_r)
@@ -111,6 +114,13 @@ class Codec:
         uv = (uv * 255).clamp(0, 255).byte().squeeze(0).cpu().numpy()
         return y.tobytes() + uv.tobytes()
 
+    @classmethod
+    def raw_frames(cls, frames, width, height):
+        return b''.join(cls.raw_frame(frame, width, height) for frame in frames)
+
+    def decode_video(self, bits, sps, qp, ec_part, reset, remaining):
+        return self.video.decompress(bits, sps, qp, ec_part, reset), self.chunk_size
+
     @torch.no_grad()
     def decode(self, path, metadata, sink=None, progress=lambda **values: None):
         count, packets, digest = 0, 0, hashlib.sha256()
@@ -138,22 +148,26 @@ class Codec:
                 first = False
                 if is_i:
                     result = self.image.decompress(bits, sps, qp, ec_part)
+                    expected = 1
                     if self.video is not None:
                         self.video.clear_dpb()
                         self.video.add_ref_feature_from_frame(result['x_hat'], apply_feature_adaptor=False)
                 else:
-                    result = self.video.decompress(bits, sps, qp, ec_part, reset)
+                    result, expected = self.decode_video(bits, sps, qp, ec_part, reset, total-count)
+                    if expected not in (self.chunk_size, min(self.chunk_size, total-count)):
+                        raise ValueError('UF decoder requested an unexpected chunk length')
                 frames = result['x_hat'] if isinstance(result['x_hat'], list) else [result['x_hat']]
-                if len(frames) != (1 if is_i else self.chunk_size):
+                if len(frames) != expected:
                     raise ValueError('UF decoder returned an unexpected chunk length')
-                for frame in frames[:total-count]:
+                valid = frames[:total-count]
+                for frame in valid:
                     if frame.is_floating_point() and not torch.isfinite(frame).all():
                         raise ValueError('Decoder produced non-finite pixels')
-                    raw = self.raw_frame(frame, sps['width'], sps['height'])
-                    digest.update(raw)
-                    if sink is not None:
-                        sink.write(raw)
-                    count += 1
+                raw = self.raw_frames(valid, sps['width'], sps['height'])
+                digest.update(raw)
+                if sink is not None:
+                    sink.write(raw)
+                count += len(valid)
                 packets += 1
                 progress(frames=count, total=total)
         if count != total or packets != metadata['packets']:

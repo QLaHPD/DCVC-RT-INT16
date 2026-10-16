@@ -24,11 +24,23 @@ sys.path.insert(0, str(ROOT))
 def worker(options, index, processes, barrier, connection):
     try:
         import torch
+        if options.entropy_library:
+            spec = importlib.util.spec_from_file_location('MLCodec_extensions_cpp', options.entropy_library)
+            entropy = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(entropy)
+            sys.modules['MLCodec_extensions_cpp'] = entropy
         if options.native_library:
             spec = importlib.util.spec_from_file_location('uf_int16_cuda', options.native_library)
             native = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(native)
             sys.modules['uf_int16_cuda'] = native
+        if options.ops_source:
+            import src.int16 as integer_package
+            spec = importlib.util.spec_from_file_location('src.int16.ops', options.ops_source)
+            reference_ops = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(reference_ops)
+            sys.modules['src.int16.ops'] = reference_ops
+            integer_package.ops = reference_ops
         if options.layers_source:
             import src.int16.layers as layers_backend
             spec = importlib.util.spec_from_file_location('src.int16._benchmark_layers', options.layers_source)
@@ -42,29 +54,40 @@ def worker(options, index, processes, barrier, connection):
             spec.loader.exec_module(reference_archive)
             archive_backend.Codec = reference_archive.Codec
         import src.int16.codec as backend
+        codec_backend = backend
+        if options.integer_codec_source:
+            spec = importlib.util.spec_from_file_location('src.int16._benchmark_integer_codec', options.integer_codec_source)
+            codec_backend = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(codec_backend)
         from src.archive.media import FrameReader, decoder_thread_budget, dimensions, probe
         import uf_int16_cuda
+        import MLCodec_extensions_cpp
 
         if options.model_source:
             spec = importlib.util.spec_from_file_location('src.int16._benchmark_reference', options.model_source)
             reference = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(reference)
             backend.IntegerModel = reference.IntegerModel
+            codec_backend.IntegerModel = reference.IntegerModel
         source = Path(options.input).resolve()
         media = probe(source)
         width, height = dimensions(media['width'], media['height'], options.resolution)
         output = Path(options.output) / f'p{processes}-w{index}'
         output.mkdir(parents=True, exist_ok=False)
         initialized = time.monotonic()
-        codec = backend.IntegerCodec(
+        codec = codec_backend.IntegerCodec(
             ROOT / 'checkpoints/cvpr2026_image.pth.tar',
             ROOT / f'checkpoints/cvpr2026_video_{options.variant}.pth.tar', options.variant,
             prepared_i=next((ROOT / 'checkpoints').glob('cvpr2026_image.*.int16.pt')),
             prepared_p=next((ROOT / 'checkpoints').glob(f'cvpr2026_video_{options.variant}.*.int16.pt')),
             skip_threshold=options.skip_thres)
         coordinated = (options.gpu_scheduling == 'auto' and processes > 1 and options.variant == 'htl'
-                       and not options.model_source and min(width, height) >= 144)
+                       and (not options.model_source or options.reference_gpu_gate)
+                       and min(width, height) >= 144)
         if coordinated:
+            if not all(hasattr(model, 'gpu_gate') and callable(getattr(model, '_compress', None))
+                       for model in (codec.image, codec.video)):
+                raise ValueError('Saved models do not support shared GPU coordination')
             codec.set_gpu_gate(Path(options.output)/'gpu.lock')
         torch.cuda.synchronize(codec.device)
         initialization_seconds = time.monotonic() - initialized
@@ -106,10 +129,14 @@ def worker(options, index, processes, barrier, connection):
                              model_module=type(codec.image).__module__,
                              layers_module=type(codec.image.layers).__module__,
                              archive_module=codec.encode.__module__,
+                             integer_codec_module=type(codec).__module__,
                              kernel_revision=getattr(uf_int16_cuda, 'kernel_revision', None),
                              native_library_sha256=hashlib.sha256(Path(uf_int16_cuda.__file__).read_bytes()).hexdigest(),
+                             entropy_library_sha256=hashlib.sha256(Path(MLCodec_extensions_cpp.__file__).read_bytes()).hexdigest(),
                              model_preamble=codec.preamble.hex(),
                              gpu_scheduling='serialized' if coordinated else 'concurrent',
+                             decode_gpu_scheduling='serialized' if coordinated and
+                                 callable(getattr(codec.image, '_decompress', None)) else 'concurrent',
                              input_threads=threads, width=width, height=height,
                              runs=runs, validation=validation))
     except BaseException:
@@ -139,11 +166,18 @@ def main():
     parser.add_argument('--verify', action='store_true', help='Decode in memory and record pixel hashes; never save decoded video')
     parser.add_argument('--archive-source', help='Saved src/archive/codec.py for a complete older verification path')
     parser.add_argument('--model-source', help='Saved src/int16/model.py for comparison against an older implementation')
+    parser.add_argument('--reference-gpu-gate', action='store_true',
+                        help='Coordinate encoding for a saved model that implements the GPU gate')
     parser.add_argument('--layers-source', help='Saved src/int16/layers.py for a complete older implementation')
     parser.add_argument('--native-library', help='Saved uf_int16_cuda extension for a complete older implementation')
+    parser.add_argument('--entropy-library', help='Saved MLCodec_extensions_cpp extension for an older entropy runtime')
+    parser.add_argument('--integer-codec-source', help='Saved src/int16/codec.py, including initialization and source conversion')
+    parser.add_argument('--ops-source', help='Saved src/int16/ops.py for the older arithmetic dispatcher')
     options = parser.parse_args()
     if min(options.frames, options.repeat, *options.procs) < 1:
         parser.error('frames, repeat and procs must be positive')
+    if options.reference_gpu_gate and not options.model_source:
+        parser.error('--reference-gpu-gate requires --model-source')
     output = Path(options.output)
     output.mkdir(parents=True, exist_ok=False)
     model_source = Path(options.model_source) if options.model_source else ROOT / 'src/int16/model.py'
@@ -155,6 +189,10 @@ def main():
     archive_source = Path(options.archive_source) if options.archive_source else ROOT / 'src/archive/codec.py'
     report['archive_source_sha256'] = hashlib.sha256(archive_source.read_bytes()).hexdigest()
     report['layers_source_sha256'] = hashlib.sha256(layers_source.read_bytes()).hexdigest()
+    integer_source = Path(options.integer_codec_source) if options.integer_codec_source else ROOT / 'src/int16/codec.py'
+    ops_source = Path(options.ops_source) if options.ops_source else ROOT / 'src/int16/ops.py'
+    report['integer_codec_source_sha256'] = hashlib.sha256(integer_source.read_bytes()).hexdigest()
+    report['ops_source_sha256'] = hashlib.sha256(ops_source.read_bytes()).hexdigest()
     context = multiprocessing.get_context('spawn')
     for processes in options.procs:
         barrier = context.Barrier(processes)

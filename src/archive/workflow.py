@@ -442,7 +442,10 @@ def checked_codec(metadata, args):
                 raise ValueError(f'Checkpoint does not match archive: {path}')
     if config.get('runtime') == 'int16':
         paths += (args.prepared_i, args.prepared_p)
-    return make_codec(config, paths, 'cpu' if getattr(args, 'device', 'cuda') == 'cpu' else args.cuda_idx)
+    codec = make_codec(config, paths, 'cpu' if getattr(args, 'device', 'cuda') == 'cpu' else args.cuda_idx)
+    if getattr(args, '_gpu_gate', None) and hasattr(codec, 'set_gpu_gate'):
+        codec.set_gpu_gate(args._gpu_gate)
+    return codec
 
 
 def run_decode(args, verify_only=False, live=False):

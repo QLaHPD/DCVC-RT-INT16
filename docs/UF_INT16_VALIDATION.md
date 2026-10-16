@@ -1,5 +1,270 @@
 # UF integer validation on Jetson Orin
 
+## Python checkpoint storage, partial output and seeking — 2026-10-16
+
+These changes follow `packed-v9`. Controls, frozen source files, library
+hashes and measurements are in `runs/python-speed-20261016-round7/`.
+The CUDA revision remains `packed-v9` and entropy revision `lazy-skip-v2`.
+Runtime arithmetic, prepared identities, archive fields and encoded bytes remain
+unchanged. No new dependencies or downloaded models are required.
+
+CUDA initialization maps modern prepared checkpoint files while copying each
+network to the GPU. Legacy prepared serialization keeps ordinary loading, as
+does CPU execution. Complete content hashing and identity checks remain in
+place. File signatures are checked after validation and after device copies,
+so a checkpoint changed during initialization is rejected. Hashing now reads
+the contiguous NumPy buffer directly, avoiding a tensor-sized temporary byte
+copy. A 34 MiB synthetic hash workload measured 40.75 → 32.53 ms, with identical
+identities across integer dtypes, scalars, empty tensors and transposed views.
+
+Before the direct-buffer hashing change, three alternating HT-L initialization
+and 17-frame encode/decode probes measured these medians per worker:
+
+| Measurement | Ordinary loading | Mapped loading |
+|---|---:|---:|
+| Initialization | 2.419 s | 2.276 s |
+| Process RSS after initialization | 689.1 MiB | 481.1 MiB |
+| Process RSS after encode/decode | 700.8 MiB | 537.8 MiB |
+| Peak process RSS | 1123.1 MiB | 1120.9 MiB |
+
+The retained memory reduction is approximately 163 MiB per worker after that
+workload. Startup peak memory is essentially unchanged; CUDA weight allocation
+and the number of model sets are unchanged.
+
+Final partial chunks now reconstruct only their valid output frames. HT-S
+retains its shared head pairs. A partial reset still reconstructs the padded
+eighth frame for the next reference. Ordinary model calls continue to return a
+complete chunk. The archive and viewer request partial output only when both
+the model and layer implementations support it; saved implementations retain
+their full-output path. At 256×144, QI10/QP14, reset 2, skip 0.2, the median of
+seven alternating in-memory decode measurements after warmup was:
+
+| Frames | HT-L decode FPS before → after | HT-S decode FPS before → after |
+|---:|---:|---:|
+| 3 | 29.60 → 35.78 | 35.61 → 43.02 |
+| 10 | 57.32 → 65.06 | 71.02 → 80.59 |
+| 20 | 80.60 → 85.34 | 101.03 → 106.64 |
+| 34 | 86.04 → 90.83 | 109.32 → 115.47 |
+
+These gains concern short clips with a partial final chunk. Their contribution
+shrinks on long videos. Reset-disabled cases also matched every pixel hash and
+improved 5.8–28.0% on these fixtures.
+
+Viewer seeks decode intermediate P chunks into reference features without
+rendering their pixels. Reset references are retained. Conversion and transfer
+are performed only for the target chunk. Explicit `output_frames=0` is supported
+for integer P decoding; intra decoding still requires its image output. Eight
+forward/backward seeks through a 34-frame noisy fixture produced identical
+pixel hashes and these median improvements over five repetitions:
+
+| Mode | Reset disabled | Reset 2 |
+|---|---:|---:|
+| HT-L | 29.2% | 28.5% |
+| HT-S | 38.0% | 31.2% |
+| LD | 15.2% | 8.6% |
+
+Additional experiments were left outside the runtime. Fusing prior quantization
+passed 307 exact checks and improved its isolated operation, but full HT-L
+encoding was effectively unchanged: -0.28% at 144p and +0.10% at 288p over five
+alternating repetitions. Pinned transfers were flat at 144p-sized partitions
+and slower for small transfers. Concatenation occupied approximately 0.33–0.35%
+of measured encoding time. Deferred reconstruction weights saved 33 MiB of GPU
+allocation while keeping a 231 MiB checkpoint mapping resident and increasing
+peak process RSS by 68 MiB in the probe. Explicit heap trimming released only
+about 2 MiB at startup. These changes were not added to the runtime.
+
+The frozen optimization snapshot passed all **165 tests** and all **12 bidirectional
+HT-L/HT-S/LD compatibility cases**, including the previous golden streams and
+pixel hashes. The normal CLI encoded, verified and resumed both fixtures with
+`--fps 4 --procs 2`, preserving 34/137 frames, encoded bytes and both originals.
+Batch verification completed 24 coordinated GPU chunks without overlap and
+removed its temporary lock directory. No decoded media was saved.
+
+The final throughput check uses the same 1.02 GHz Orin, FFV1 input,
+QI10/QP14, reset 2, skip 0.2, three encode repetitions and separate in-memory
+decoding. The control restores the local `ffn-v7` implementation from the start
+of round6; it precedes both `pipeline-v8` and `packed-v9`:
+
+| Dimensions | Frames per worker | Workers | Encode FPS before → final | Decode FPS before → final |
+|---|---:|---:|---:|---:|
+| 256×144 | 257 | 1 | 111.71 → 118.68 | 98.17 → 107.90 |
+| 256×144 | 257 | 2, aggregate | 113.47 → 121.47 | 96.17 → 107.71 |
+| 512×288 | 129 | 1 | 30.11 → 31.66 | 27.14 → 29.42 |
+| 512×288 | 129 | 2, aggregate | 30.88 → 32.55 | 27.11 → 29.57 |
+| 256×144 | 1025 | 2, aggregate | 117.11 → 125.66 | 96.71 → 108.26 |
+
+Initialization and network downloads are excluded from these synthetic FPS
+measurements. `audit-final.json`, `final-fingerprints.json` and `final-source/`
+record the checked evidence and exact measured implementation. Runtime code and
+reproduction instructions are included in this branch.
+
+## Python packed storage between depth blocks — 2026-10-16
+
+`packed-v9` additionally carries packed output between consecutive compatible
+depth blocks. The final pointwise projection writes the same completed value
+to its ordinary NCHW output and a temporary packed output in one pass. The next
+block consumes the packed input directly. The cache is local to one sequential
+call, uses the existing size bounds and is discarded at the end of that chain.
+Other shapes, layouts and older extensions retain the original execution path.
+
+The full-pipeline settings of the `pipeline-v8` comparison measured the
+following medians of three encode repetitions. Decode
+values are separate full in-memory verification passes:
+
+| Dimensions | Workers | Encode FPS before → after | Decode FPS before → after |
+|---|---:|---:|---:|
+| 256×144 | 1 | 117.29 → 118.94 | 106.94 → 107.96 |
+| 256×144 | 2, aggregate | 119.70 → 121.35 | 106.52 → 107.54 |
+| 512×288 | 1 | 31.33 → 31.64 | 29.05 → 29.40 |
+| 512×288 | 2, aggregate | 32.19 → 32.56 | 29.34 → 29.55 |
+
+Streams and decoded hashes match `pipeline-v8`. The promoted implementation
+passed all 151 tests and all 12 bidirectional HT-L/HT-S/LD compatibility cases.
+The earlier evidence and native build logs are in the round6 run directory;
+the installed `packed-v9` library and frozen promoted sources are also saved in
+the round7 control snapshot.
+
+## Python block storage and bounded startup memory — 2026-10-16
+
+This round compares the preceding local `ffn-v7` implementation against
+`pipeline-v8`, with its initializer, model, layers, arithmetic dispatcher,
+archive wrapper and both native libraries restored for the control. Frozen
+sources, library hashes and a completion audit are in
+`runs/python-speed-20261016-round6/`. Runtime changes and reproduction
+instructions are included in this branch; run artifacts remain local.
+
+Canonical depth blocks retain channel-last storage between their internal
+convolutions, eliminating three repeated input packs while preserving their
+public NCHW input/output. Shape rules retain the existing implementation for
+other blocks, layouts and alignment. The existing 16 MiB input-packing and
+8 MiB receptive-field limits remain. Reset decoding reuses the last decoded
+frame for its unshuffled reference instead of repeating the reconstruction
+head. Output conversion and transfer operate on a complete chunk in memory;
+single frames retain the existing conversion kernel.
+
+Source conversion, replication to a multiple of 16 and 8x pixel unshuffle use
+one tiled CUDA pass. Shared-memory tiling coalesces both reads and writes.
+The original public `tensor()` method and older-library fallback retain their
+INT16 behavior; the archive encode hook uses bytes when both model and layer
+implementations support them. Quantization parameter views are reused.
+
+The entropy extension starts only the requested workers and grows its pool
+when parallelism increases, carrying installed tables to the new workers.
+The single-stream masked decoder avoids Python mask/gather/scatter temporaries
+and has vector-friendly all-active/all-skipped paths. Its revision is
+`lazy-skip-v2`; all eight entropy parallelism settings match saved original
+bytes. Checkpoint initialization releases each CPU checkpoint after copying
+its network, before reading the next. No additional model copies, libraries,
+arithmetic identities, prepared identities or bitstream fields were added.
+
+Both existing extensions were rebuilt and installed offline with one compiler
+job and CUDA architecture 8.7. The same Orin Nano at 1.02 GHz, moving FFV1
+input, HT-L INT16, QI10/QP14, reset 2, intra -1, skip 0.2 and 30 source FPS
+were used. Encode values are medians of three repetitions after a 17-frame
+warmup, including FFmpeg input and stream writes, excluding initialization.
+Decode values are separate full in-memory verification passes, after every
+worker finishes encoding.
+
+| Dimensions | Frames per worker | Workers | Encode FPS before → after | Decode FPS before → after |
+|---|---:|---:|---:|---:|
+| 256×144 | 257 | 1 | 111.71 → 117.29 | 98.17 → 106.94 |
+| 256×144 | 257 | 2, aggregate | 113.47 → 119.70 | 96.17 → 106.52 |
+| 512×288 | 129 | 1 | 30.11 → 31.33 | 27.14 → 29.05 |
+| 512×288 | 129 | 2, aggregate | 30.88 → 32.19 | 27.11 → 29.34 |
+
+HT-L encoding improved 4.0–5.5% and decoding 7.0–10.8%. Peak RSS fell
+approximately 73–95 MiB per worker. The sustained two-worker run, with 1,025
+frames per worker, measured 117.11 → 124.02 encode FPS and 96.71 → 107.26
+decode FPS, with identical streams and pixels. The other UF modes were also
+measured with 129 frames per worker:
+
+| Mode | Workers | Encode FPS before → after | Decode FPS before → after |
+|---|---:|---:|---:|
+| HT-S | 1 | 134.98 → 140.99 | 120.96 → 135.95 |
+| HT-S | 2, aggregate | 132.63 → 139.77 | 110.98 → 125.76 |
+| LD | 1 | 75.16 → 76.22 | 86.18 → 93.66 |
+| LD | 2, aggregate | 77.91 → 78.42 | 89.26 → 95.89 |
+
+All 148 tests passed without skips. All 12 cross-decoding cases match the
+previous golden streams and pixels in both directions. The checker now
+switches the complete model and layer classes, including helper methods and
+cached native block callables. The CLI encoded, verified and resumed both
+synthetic originals with `--fps 4 --procs 2`, preserving their previous streams
+and 34/137 decoded frames. Batch verification completed 24 coordinated GPU
+chunks without overlap and removed its temporary lock directory. No decoded
+media was written. These synthetic FPS measurements exclude network and
+model initialization; initialization is recorded separately in the reports.
+
+Rebuild both existing extensions after updating:
+
+```bash
+MAX_JOBS=1 TORCH_CUDA_ARCH_LIST=8.7 ./scripts/uf-python -m pip install --no-build-isolation --no-deps ./src/cpp ./src/int16/native
+```
+
+## Python FFN orientation and shared decoder scheduling — 2026-10-16
+
+This round compares against published commit
+[`b5205e6`](https://github.com/QLaHPD/DCVC-RT-INT16/commit/b5205e6b94ac8348116d7eb864983d245d70059e),
+restoring its model, layer dispatcher, archive wrapper and `dispatch-v6` native
+library. These runtime and benchmark changes were measured following that push.
+
+Selected feed-forward expansion convolutions now use spatial positions as MMA
+rows and output channels as columns. Each lane combines two individually
+rounded, saturated and activated channels before one warp shuffle completes
+the four-channel reduction. Shape rules retain the older orientation where
+it measured faster, including the main 512-channel expansion at 144p.
+The existing 16 MiB input-packing bound remains in force. Rejected tile,
+occupancy and byte-packing experiments are retained only in the local run
+directory. The native revision is `ffn-v7`; its arithmetic identity stays v1.
+
+INT16 HT-L workers sharing a GPU now coordinate complete decode chunks as well
+as encode chunks for frames with a short edge of at least 144 pixels. Batch
+decoding resolves the runtime per archive and passes the same temporary GPU
+gate to its image and video codecs. GPU completion precedes releasing the
+gate. Lock paths remain absent from archive metadata and identities. CPU,
+HT-S, LD and independent GPUs retain their existing scheduling. No additional
+models or dependencies are required, and the extension was built and installed
+with `MAX_JOBS=1` and `TORCH_CUDA_ARCH_LIST=8.7`.
+
+Measurements use the same Orin Nano at 1.02 GHz, local moving FFV1 input,
+HT-L INT16, QI10/QP14, reset 2, intra -1, skip 0.2 and 30 source FPS.
+Encode throughput is the median of three repetitions after a 17-frame warmup,
+including FFmpeg input and bitstream writes and excluding initialization.
+Decode throughput is a separate full in-memory verification pass per worker
+group. All workers finish timed encoding before verification starts.
+
+| Dimensions | Frames per worker | Workers | Encode FPS before → after | Decode FPS before → after |
+|---|---:|---:|---:|---:|
+| 256×144 | 257 | 1 | 111.44 → 111.64 | 96.68 → 98.21 |
+| 256×144 | 257 | 2, aggregate | 112.91 → 113.33 | 87.64 → 96.06 |
+| 512×288 | 129 | 1 | 29.48 → 30.18 | 26.42 → 27.23 |
+| 512×288 | 129 | 2, aggregate | 29.78 → 30.84 | 23.95 → 27.06 |
+
+Encoding is effectively unchanged at 144p and improved 2.3–3.6% at 288p.
+Aggregate two-worker decoding improved 9.6% at 144p and 13.0% at 288p.
+The sustained two-worker check, with 1,025 frames per worker and three encode
+repetitions, measured 116.64 → 117.09 encode FPS (effectively unchanged) and
+88.06 → 96.69 decode FPS (9.8%). HT-S and LD encoding also remained essentially
+unchanged, with observed differences ranging from -0.6% to +0.7%. Peak RSS
+remained approximately 1.19 GiB per HT-L worker at 144p and 1.23 GiB at 288p.
+
+All 131 regression tests and all 12 HT-L/HT-S/LD cross-decoding cases passed.
+The compatibility checker rebinds cached native block callables when switching
+libraries and records both library hashes. Both decoding directions, measured
+streams and decoded pixels match the preceding round's golden hashes.
+Full-range CPU comparisons cover the new kernels, accumulation cancellation,
+rounding boundaries, batches, tails, noncontiguous views and two-byte offsets.
+
+The normal CLI encoded and verified two synthetic originals with `--fps 4
+--procs 2`, producing 34 and 137 frames and resuming both without re-encoding.
+The real batch coordinator additionally verified both archives entirely in
+memory across 24 GPU chunks: their lock intervals did not overlap and the
+temporary gate directory was removed afterward. Original inputs were retained;
+no decoded media files were written. Reports, source/native fingerprints,
+frozen controls and the completion audit are under
+`runs/python-speed-20261016-round5/`. These synthetic results exclude download
+throughput and model initialization.
+
 ## Python convolution dispatch and integer boundaries — 2026-10-16
 
 This round compares against the preceding local `packed-v5` implementation,

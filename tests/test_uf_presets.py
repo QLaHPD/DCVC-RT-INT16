@@ -32,7 +32,7 @@ class PresetTests(unittest.TestCase):
         self.assertGreaterEqual(args.target_psnr_selection['measured_psnr'], 30)
 
     def test_incompatible_benchmark_settings_fail(self):
-        for option, value in [('runtime', 'fp16'), ('model_structure', 'hts'), ('resolution', '96')]:
+        for option, value in [('runtime', 'fp16'), ('model_structure', 'hts')]:
             with self.subTest(option=option), self.assertRaisesRegex(ValueError, 'requires'):
                 apply_target_psnr(self.parse('--target-psnr', '30', '--'+option, value))
 

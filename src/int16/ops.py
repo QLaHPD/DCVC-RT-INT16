@@ -80,6 +80,22 @@ def from_bytes(x):
     return saturate(divide_round((2 * x.to(torch.int64) - 255) * FEATURE_SCALE, 510))
 
 
+def from_bytes_unshuffle(x):
+    """Source conversion, replication to 16 pixels and 8x pixel unshuffle."""
+    if x.is_cuda:
+        import uf_int16_cuda
+        fused = getattr(uf_int16_cuda, 'from_bytes_unshuffle', None)
+        if fused is not None:
+            return fused(x)
+    values = from_bytes(x)
+    bottom, right = (-values.shape[2]) % 16, (-values.shape[3]) % 16
+    if bottom:
+        values = torch.cat((values, values[:, :, -1:, :].expand(-1, -1, bottom, -1)), dim=2)
+    if right:
+        values = torch.cat((values, values[:, :, :, -1:].expand(-1, -1, -1, right)), dim=3)
+    return F.pixel_unshuffle(values, 8)
+
+
 def lookup(x, lut):
     if x.is_cuda:
         from uf_int16_cuda import lookup as native_lookup

@@ -1,4 +1,4 @@
-"""Coordinate GPU work between INT16 HT-L encoders in one run."""
+"""Coordinate GPU work between INT16 HT-L workers in one run."""
 
 from collections import Counter
 import fcntl
@@ -31,11 +31,11 @@ class GpuGate:
 
 
 class EncodeGates:
-    """Coordinate only HT-L workers sharing a GPU within this invocation."""
+    """Coordinate HT-L workers; decode jobs resolve their mode per archive."""
     def __init__(self, config, devices):
         self.temporary = None
         self.paths = {}
-        if not config or config.get('runtime') != 'int16' or config.get('variant') != 'htl':
+        if config is not None and (config.get('runtime') != 'int16' or config.get('variant') != 'htl'):
             return
         shared = [device for device, count in Counter(devices).items()
                   if device != 'cpu' and count > 1]

@@ -44,9 +44,8 @@ def apply_target_psnr(args):
     benchmark = json.loads(BENCHMARK.read_text())
     explicit = getattr(args, '_explicit_codec_options', set())
     settings = benchmark['settings']
-    dimensions = settings['resolution'].split(' -> ')[-1].split('x')
-    required = dict(runtime=settings['runtime'], model_structure=settings['model_structure'],
-                    resolution=min(map(int, dimensions)))
+    benchmark_resolution = settings['resolution'].split(' -> ')[-1]
+    required = dict(runtime=settings['runtime'], model_structure=settings['model_structure'])
     for field, value in required.items():
         if field in explicit and getattr(args, field) != value:
             raise ValueError(f'Bundled --target-psnr benchmark requires --{field} {value}; '
@@ -55,12 +54,16 @@ def apply_target_psnr(args):
     trial = select_trial(benchmark['results'], target, constraints)
     for field, value in required.items():
         setattr(args, field, value)
+    if getattr(args, 'resolution', None) is None:
+        args.resolution = min(map(int, benchmark_resolution.split('x')))
     for field, key in CONFIG_FIELDS.items():
         setattr(args, field, trial['config'][key])
     args.target_psnr_selection = dict(
         target_psnr=target, benchmark=BENCHMARK.name, trial=trial['trial'],
         measured_psnr=trial['psnr_db'], encode_seconds=trial['encode_seconds'],
         bitstream_bytes=trial['bitstream_bytes'], config=trial['config'],
+        benchmark_resolution=benchmark_resolution, resolution=args.resolution,
         message=(f"Benchmark trial {trial['trial']}: {trial['psnr_db']:.3f} dB, "
                  f"{trial['encode_seconds']:.3f}s, {trial['bitstream_bytes']} bytes; "
-                 f"{trial['config']}. Reference measurements, not a per-video quality guarantee."))
+                 f"{trial['config']}. Reference measurements at {benchmark_resolution}; "
+                 f"output short edge {args.resolution}px. Actual video quality can vary."))

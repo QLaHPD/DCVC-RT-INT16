@@ -21,6 +21,10 @@ def pad_right_bottom(x, multiple):
 
 
 class IntegerModel:
+    supports_byte_input = True
+    supports_partial_output = True
+    supports_skipped_output = True
+
     def __init__(self, prepared, device='cuda:0', reconstruct_on_encode=True):
         from src.models.entropy_models import EntropyCoder
         self.variant = prepared['variant']
@@ -31,6 +35,7 @@ class IntegerModel:
         self.layers = Layers(self.model, prepared, self.device)
         self.coder = EntropyCoder()
         self.coder.set_entropy_coder_parallel(1)
+        self._masked_decode = getattr(self.coder.decoder, 'decode_y_with_skip', None)
         values = prepared['tensors']
         for index, kind in enumerate(('z', 'y')):
             self.coder.set_cdf(values[f'tables.{kind}_cdf'].numpy(),
@@ -93,7 +98,8 @@ class IntegerModel:
         else:
             q_dec, scales, means = params.chunk(3, dim=1)
             q_dec = q_dec.clamp_min(ops.FEATURE_SCALE//2)
-            q_enc = ops.reciprocal(q_dec)
+            if encode:
+                q_enc = ops.reciprocal(q_dec)
         if encode:
             y = ops.multiply(y, q_enc)
         shape = scales.shape
@@ -122,7 +128,10 @@ class IntegerModel:
                     # One fixed-size transfer contains both indexes and skip flags.
                     indexes = native.prior_indexes(scales, position, table,
                                                     self.skip_threshold).cpu().numpy()
-                    if self.skip_threshold:
+                    masked_decode = self._masked_decode
+                    if masked_decode is not None:
+                        symbols = masked_decode(indexes)
+                    elif self.skip_threshold:
                         active = indexes >= 0
                         symbols = np.zeros(indexes.size, dtype=np.int8)
                         if active.any():
@@ -191,17 +200,27 @@ class IntegerModel:
         temporal = run(m.temporal_prior_encoder, self.memory, quant)
         return run(m.y_prior_fusion, hyper, temporal)
 
-    def _reconstruct(self, y_hat, qp, reset, output_pixels=True):
+    def _reconstruct(self, y_hat, qp, reset, output_pixels=True, output_frames=None):
         m, run = self.model, self.layers
         if self.variant == 'image':
             return run(m.dec, y_hat, run.parameter('q_scale_dec', qp))
+        if output_frames == 0:
+            output_pixels = False
         feature = run(m.decoder, y_hat, self.context, run.parameter('q_decoder', qp))
         # P-frame encoding only needs decoded features for its next context.
         # A reset additionally needs the final frame in unshuffled form.
-        frames = run(m.recon_head, feature) if output_pixels else None
+        partial = output_frames is not None and output_frames < (1 if self.variant == 'ld' else 8)
+        options = {'output_frames': output_frames} if partial else {}
+        frames = run(m.recon_head, feature, **options) if output_pixels else None
         self.reference = feature
         if reset:
-            reference = run(m.recon_head, feature, for_reset=True)
+            if output_pixels and not partial:
+                # The reset reference is exactly the last frame before its
+                # pixel shuffle. Reuse it instead of running that head twice.
+                last = frames[-1] if isinstance(frames, list) else frames
+                reference = F.pixel_unshuffle(last, 8)
+            else:
+                reference = run(m.recon_head, feature, for_reset=True)
             self.clear_dpb()
             self.reference = reference
         return frames
@@ -220,7 +239,8 @@ class IntegerModel:
     def _compress(self, x, qp, *args):
         image = self.variant == 'image'
         reset = False if image else args[0]
-        x = pad_right_bottom(x, 16)
+        if x.dtype != torch.uint8:
+            x = pad_right_bottom(x, 16)
         m, run = self.model, self.layers
         if image:
             y = run(m.enc, x, run.parameter('q_scale_enc', qp))
@@ -245,10 +265,25 @@ class IntegerModel:
         return {'bit_stream': bits, 'x_hat': frames, 'ec_parallel': 1}
 
     @torch.no_grad()
-    def decompress(self, bits, sps, qp, ec_part, reset=False):
+    def decompress(self, bits, sps, qp, ec_part, reset=False, *, output_frames=None):
+        options = {'output_frames': output_frames} if output_frames is not None else {}
+        if (self.gpu_gate is None or self.device.type != 'cuda'
+                or min(sps['width'], sps['height']) < 144):
+            return self._decompress(bits, sps, qp, ec_part, reset, **options)
+        with self.gpu_gate:
+            try:
+                return self._decompress(bits, sps, qp, ec_part, reset, **options)
+            finally:
+                torch.cuda.synchronize(self.device)
+
+    def _decompress(self, bits, sps, qp, ec_part, reset=False, *, output_frames=None):
         if ec_part != 1:
             raise ValueError('Unsupported UF integer entropy parallelism')
         image = self.variant == 'image'
+        maximum = 1 if image or self.variant == 'ld' else 8
+        minimum = 1 if image else 0
+        if output_frames is not None and (type(output_frames) is not int or not minimum <= output_frames <= maximum):
+            raise ValueError('Invalid UF reconstruction frame count')
         if not image:
             self._context()
         height, width = (sps['height']+15)//16, (sps['width']+15)//16
@@ -256,4 +291,5 @@ class IntegerModel:
         z = self._decode_z((height+3)//4, (width+3)//4, qp)
         params = self._params(z, qp, height, width)
         y_hat, _ = self._prior(None, params, qp, image, encode=False)
-        return {'x_hat': self._reconstruct(y_hat, qp, reset)}
+        frames = self._reconstruct(y_hat, qp, reset, output_frames=output_frames)
+        return {'x_hat': [] if output_frames == 0 else frames}

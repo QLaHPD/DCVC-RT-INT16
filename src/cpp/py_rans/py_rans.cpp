@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <future>
+#include <limits>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 namespace py = pybind11;
@@ -95,10 +97,9 @@ std::vector<uint32_t> pmf_to_quantized_cdf(const std::vector<float>& pmf)
 
 RansEncoder::RansEncoder()
 {
-    m_encoders.resize(MAX_EC_PARALLEL);
-    for (int i = 0; i < MAX_EC_PARALLEL; i++) {
-        m_encoders[i] = std::make_shared<RansEncoderLib>();
-    }
+    m_rans_symbols.resize(2);
+    m_max_value.resize(2);
+    set_entropy_coder_parallel(1);
 }
 
 void RansEncoder::encode_y(const std::shared_ptr<std::vector<int16_t>>& symbols, const int symbolSize)
@@ -250,8 +251,8 @@ py::array_t<uint8_t> RansEncoder::get_encoded_stream()
 
 void RansEncoder::reset()
 {
-    for (int i = 0; i < MAX_EC_PARALLEL; i++) {
-        m_encoders[i]->reset();
+    for (const auto& encoder : m_encoders) {
+        encoder->reset();
     }
 }
 
@@ -275,8 +276,10 @@ void RansEncoder::set_cdf(const std::shared_ptr<std::vector<int32_t>>& cdfs,
         ransSymbols->at(i) = std::move(ransSym);
     }
 
-    for (int i = 0; i < MAX_EC_PARALLEL; i++) {
-        m_encoders[i]->set_cdf(ransSymbols, max_value, index);
+    m_rans_symbols.at(index) = ransSymbols;
+    m_max_value.at(index) = max_value;
+    for (const auto& encoder : m_encoders) {
+        encoder->set_cdf(ransSymbols, max_value, index);
     }
 }
 
@@ -298,17 +301,27 @@ void RansEncoder::set_cdf(const py::array_t<int32_t>& cdfs, const py::array_t<in
 
 void RansEncoder::set_entropy_coder_parallel(int n)
 {
-    assert(n >= 1 && n <= MAX_EC_PARALLEL);
+    if (n < 1 || n > MAX_EC_PARALLEL) {
+        throw std::invalid_argument("entropy parallelism must be between 1 and 8");
+    }
+    while (m_encoders.size() < static_cast<size_t>(n)) {
+        auto encoder = std::make_shared<RansEncoderLib>();
+        for (int index = 0; index < 2; ++index) {
+            if (m_rans_symbols[index]) {
+                encoder->set_cdf(m_rans_symbols[index], m_max_value[index], index);
+            }
+        }
+        m_encoders.push_back(std::move(encoder));
+    }
     m_entropy_coder_parallel = n;
 }
 
 RansDecoder::RansDecoder()
 {
-    m_decoded_tensor = std::make_shared<std::vector<int8_t>>(3840 * 2160 / 16 / 16 * 128 * 2);
-    m_decoders.resize(MAX_EC_PARALLEL);
-    for (int i = 0; i < MAX_EC_PARALLEL; i++) {
-        m_decoders[i] = std::make_shared<RansDecoderLib>();
-    }
+    m_decoded_tensor = std::make_shared<std::vector<int8_t>>();
+    m_cdfs.resize(2);
+    m_max_value.resize(2);
+    set_entropy_coder_parallel(1);
 }
 
 void RansDecoder::decode_y(const std::shared_ptr<std::vector<uint8_t>>& indexes, const int indexSize)
@@ -337,6 +350,62 @@ void RansDecoder::decode_y(const py::array_t<uint8_t>& indexes)
     std::copy(indexes_ptr, indexes_ptr + indexSize, vec_indexes->data());
 
     decode_y(vec_indexes, indexSize);
+}
+
+py::array_t<int8_t> RansDecoder::decode_y_with_skip(
+    const py::array_t<int16_t, py::array::c_style | py::array::forcecast>& indexes)
+{
+    if (m_entropy_coder_parallel != 1) {
+        throw std::invalid_argument("masked integer decoding requires one entropy stream");
+    }
+    if (indexes.size() > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument("too many masked entropy indexes");
+    }
+    const int size = static_cast<int>(indexes.size());
+    const int16_t* input = indexes.data();
+    int16_t minimum = 32767, maximum = -32768;
+    for (int i = 0; i < size; ++i) {
+        minimum = std::min(minimum, input[i]);
+        maximum = std::max(maximum, input[i]);
+    }
+    py::array_t<int8_t> result({ size }, { sizeof(int8_t) });
+    int8_t* output = result.mutable_data();
+    if (maximum < 0) {
+        std::fill_n(output, size, int8_t{0});
+        return result;
+    }
+    if (maximum > 255 || !m_cdfs[1] || static_cast<size_t>(maximum) >= m_cdfs[1]->size()) {
+        throw std::invalid_argument("masked entropy index exceeds the configured tables");
+    }
+    auto active = std::make_shared<std::vector<uint8_t>>(size);
+    uint8_t* packed = active->data();
+    if (minimum >= 0) {
+        // The narrowing copy and min/max reductions can use CPU vector lanes.
+        for (int i = 0; i < size; ++i) packed[i] = static_cast<uint8_t>(input[i]);
+    } else {
+        int count = 0;
+        for (int i = 0; i < size; ++i) {
+            bool present = input[i] >= 0;
+            output[i] = static_cast<int8_t>(present);
+            if (present) packed[count++] = static_cast<uint8_t>(input[i]);
+        }
+        active->resize(count);
+    }
+    std::shared_ptr<std::vector<int8_t>> values;
+    {
+        py::gil_scoped_release release;
+        decode_y(active, static_cast<int>(active->size()));
+        values = get_decoded_tensor_cpp();
+    }
+    if (minimum >= 0) {
+        std::copy_n(values->data(), size, output);
+    } else {
+        int position = 0;
+        for (int i = 0; i < size; ++i) {
+            if (output[i]) output[i] = values->data()[position++];
+        }
+    }
+    return result;
 }
 
 void RansDecoder::decode_z(const int total_size, const int cdf_offset, const int ch)
@@ -392,8 +461,10 @@ void RansDecoder::set_cdf(const std::shared_ptr<std::vector<int32_t>>& cdfs,
         vec_cdfs->at(i) = std::move(t);
     }
 
-    for (int i = 0; i < MAX_EC_PARALLEL; i++) {
-        m_decoders[i]->set_cdf(vec_cdfs, max_value, index);
+    m_cdfs.at(index) = vec_cdfs;
+    m_max_value.at(index) = max_value;
+    for (const auto& decoder : m_decoders) {
+        decoder->set_cdf(vec_cdfs, max_value, index);
     }
 }
 
@@ -415,7 +486,18 @@ void RansDecoder::set_cdf(const py::array_t<int32_t>& cdfs, const py::array_t<in
 
 void RansDecoder::set_entropy_coder_parallel(int n)
 {
-    assert(n >= 1 && n <= MAX_EC_PARALLEL);
+    if (n < 1 || n > MAX_EC_PARALLEL) {
+        throw std::invalid_argument("entropy parallelism must be between 1 and 8");
+    }
+    while (m_decoders.size() < static_cast<size_t>(n)) {
+        auto decoder = std::make_shared<RansDecoderLib>();
+        for (int index = 0; index < 2; ++index) {
+            if (m_cdfs[index]) {
+                decoder->set_cdf(m_cdfs[index], m_max_value[index], index);
+            }
+        }
+        m_decoders.push_back(std::move(decoder));
+    }
     m_entropy_coder_parallel = n;
 }
 

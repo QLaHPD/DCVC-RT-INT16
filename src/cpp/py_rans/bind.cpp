@@ -13,6 +13,7 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(MLCodec_extensions_cpp, m)
 {
+    m.attr("uf_entropy_revision") = "lazy-skip-v2";
     py::class_<RansEncoder>(m, "RansEncoder")
         .def(py::init<>())
         .def("encode_y", py::overload_cast<const py::array_t<int16_t>&>(&RansEncoder::encode_y))
@@ -30,6 +31,7 @@ PYBIND11_MODULE(MLCodec_extensions_cpp, m)
         .def(py::init<>())
         .def("set_stream", py::overload_cast<const py::array_t<uint8_t>&>(&RansDecoder::set_stream))
         .def("decode_y", py::overload_cast<const py::array_t<uint8_t>&>(&RansDecoder::decode_y))
+        .def("decode_y_with_skip", &RansDecoder::decode_y_with_skip)
         .def("decode_z", &RansDecoder::decode_z)
         .def("get_decoded_tensor", &RansDecoder::get_decoded_tensor)
         .def("set_cdf",

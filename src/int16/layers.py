@@ -8,19 +8,26 @@ from . import ops
 
 
 class Layers:
+    supports_byte_input = True
+    supports_partial_output = True
+
     def __init__(self, model, prepared, device):
         self.names = {id(module): name for name, module in model.named_modules()}
         self.values = {name: value.to(device) for name, value in prepared['tensors'].items()
                        if not name.startswith(('tables.z_', 'tables.y_'))}
+        self._parameters = {}
         self._fused_ffns = {}
         self._fused_blocks = {}
         self._native_blocks = {}
         self._native_block = None
+        self._native_packed_block = None
+        self._packed_chains = {}
         post_native = False
         if torch.device(device).type == 'cuda':
             import uf_int16_cuda
             post_native = callable(getattr(uf_int16_cuda, 'conv2d_post', None))
             self._native_block = getattr(uf_int16_cuda, 'depth_conv_block', None)
+            self._native_packed_block = getattr(uf_int16_cuda, 'depth_conv_block_packed', None)
         for module in model.modules():
             if (post_native and type(module).__name__ in ('DepthConvBlock', 'SpatialPriorAdaptor')
                     and len(module.dc) == 4 and len(module.ffn) == 3
@@ -59,19 +66,57 @@ class Layers:
             self._fused_ffns[id(module)] = (self.values[prefix+'.weight'],
                                            self.values.get(prefix+'.bias'), module[2])
 
-    def parameter(self, name, qp):
-        return self.values[name][qp:qp+1, :, None, None]
+        if callable(self._native_packed_block):
+            for module in model.modules():
+                if not isinstance(module, nn.Sequential):
+                    continue
+                children = list(module)
+                entries = []
+                for index, child in enumerate(children):
+                    current = self._native_blocks.get(id(child))
+                    following = (self._native_blocks.get(id(children[index+1]))
+                                 if index+1 < len(children) else None)
+                    eligible, channels = False, 0
+                    if current is not None and following is not None and children[index+1].adaptor is None:
+                        weights = current[0]
+                        channels, depth = weights[2].shape[0], weights[1].shape[0]
+                        eligible = (channels >= 384 and channels <= 32768 and channels % 32 == 0
+                                    and depth >= 256 and depth % 32 == 0
+                                    and following[0][0].shape[1] == channels)
+                    entries.append((eligible, channels))
+                if any(eligible for eligible, _ in entries):
+                    self._packed_chains[id(module)] = entries
 
-    def __call__(self, module, *args, for_reset=False):
+    def parameter(self, name, qp):
+        key = (name, qp)
+        if key not in self._parameters:
+            self._parameters[key] = self.values[name][qp:qp+1, :, None, None]
+        return self._parameters[key]
+
+    def __call__(self, module, *args, for_reset=False, output_frames=None,
+                 _packed_input=None, _pack_output=False):
         x = args[0]
-        if x.dtype != torch.int16:
-            raise TypeError(f'Integer layer received {x.dtype}')
         name = type(module).__name__
+        source_bytes = x.dtype != torch.int16
+        if source_bytes and (x.dtype != torch.uint8 or not x.is_cuda or
+                             name not in ('Encoder', 'IntraEncoder')):
+            raise TypeError(f'Integer layer received {x.dtype}')
         if isinstance(module, nn.Sequential):
             fused = self._fused_ffns.get(id(module))
             if fused is not None:
                 weight, bias, projection = fused
                 return self(projection, ops.conv2d_wsilu4(x, weight, bias, self.values['tables.wsilu']))
+            chain = self._packed_chains.get(id(module))
+            if chain is not None and self._native_packed_block is not None and x.shape[2]*x.shape[3] >= 128:
+                packed = None
+                for child, (eligible, channels) in zip(module, chain):
+                    emit = eligible and x.shape[0]*channels*x.shape[2]*x.shape[3] <= 8*1024*1024
+                    result = self(child, x, _packed_input=packed, _pack_output=emit)
+                    if emit:
+                        x, packed = result
+                    else:
+                        x, packed = result, None
+                return x
             for child in module:
                 x = self(child, x)
             return x
@@ -90,11 +135,17 @@ class Layers:
         if name in ('DepthConvBlock', 'SpatialPriorAdaptor'):
             if len(args) == 2:
                 x = torch.cat(args, dim=1)
+                _packed_input = None
             if module.adaptor is not None:
                 x = self(module.adaptor, x)
+                _packed_input = None
             native = self._native_blocks.get(id(module))
             if native is not None:
                 weights, biases, shortcut = native
+                if self._native_packed_block is not None and (_pack_output or _packed_input is not None):
+                    out, packed = self._native_packed_block(x, weights, biases,
+                        self.values['tables.wsilu'], shortcut, _packed_input, _pack_output)
+                    return (out, packed) if _pack_output else out
                 return self._native_block(x, weights, biases, self.values['tables.wsilu'], shortcut)
             fused = self._fused_blocks.get(id(module))
             if fused is not None:
@@ -115,11 +166,13 @@ class Layers:
         if name == 'ResidualBlockWithStride2':
             return self(module.conv, self(module.down, F.pixel_unshuffle(x, 2)))
         if name == 'IntraEncoder':
-            return self(module.enc_2, ops.multiply(self(module.enc_1, F.pixel_unshuffle(x, 8)), args[1]))
+            source = ops.from_bytes_unshuffle(x) if source_bytes else F.pixel_unshuffle(x, 8)
+            return self(module.enc_2, ops.multiply(self(module.enc_1, source), args[1]))
         if name == 'IntraDecoder':
             return F.pixel_shuffle(self(module.dec_2, ops.multiply(self(module.dec_1, x), args[1])), 8)
         if name == 'Encoder':
-            out = self(module.conv1, torch.cat((F.pixel_unshuffle(x, 8), args[1]), dim=1))
+            source = ops.from_bytes_unshuffle(x) if source_bytes else F.pixel_unshuffle(x, 8)
+            out = self(module.conv1, torch.cat((source, args[1]), dim=1))
             if hasattr(module, 'conv2'):
                 out = self(module.conv2, out)
             return self(module.down, ops.multiply(out, args[2]))
@@ -136,6 +189,10 @@ class Layers:
             other = ops.multiply(args[1], args[2]) if len(args)==3 else args[1]
             return self(module.conv, torch.cat((x, other), dim=1))
         if name == 'ReconHead':
+            maximum = 1 if hasattr(module, 'head') else 8
+            count = maximum if output_frames is None else output_frames
+            if type(count) is not int or not 1 <= count <= maximum:
+                raise ValueError('Invalid UF reconstruction frame count')
             if hasattr(module, 'head'):  # LD
                 out = self(module.head, self(module.conv, x))
                 return out if for_reset else F.pixel_shuffle(out, 8)
@@ -143,14 +200,14 @@ class Layers:
                 if for_reset:
                     return self(module.conv2[-1], self(module.conv1[-1], x))
                 frames = []
-                for index in range(8):
+                for index in range(count):
                     if index % 2 == 0:
                         shared = self(module.conv1[index//2], x)
                     frames.append(F.pixel_shuffle(self(module.conv2[index], shared), 8))
                 return frames
             if for_reset:
                 return self(module.conv[-1], x)
-            return [F.pixel_shuffle(self(child, x), 8) for child in module.conv]
+            return [F.pixel_shuffle(self(child, x), 8) for child in module.conv[:count]]
         if name in ('FeatureAdaptorI', 'FeatureExtractor', 'HyperEncoder', 'HyperDecoder',
                     'IntraHyperEncoder', 'IntraHyperDecoder', 'IntraSpatialPrior', 'IntraYPriorFusion',
                     'SpatialPrior'):

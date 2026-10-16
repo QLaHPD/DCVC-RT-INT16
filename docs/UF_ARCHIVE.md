@@ -83,20 +83,23 @@ fast configurations). Candidates must reach the requested PSNR; ordering is
 encoding seconds, then bitstream bytes, then trial number for deterministic ties.
 Time and size are competing objectives, so time has priority.
 
-The selector fills `--runtime int16 --model_structure htl --resolution 144` and
-`--qp_i`, `--qp_p`, `--reset_interval`, `--intra_period`, `--skip_thres`.
+The selector fills `--runtime int16 --model_structure htl` and `--qp_i`,
+`--qp_p`, `--reset_interval`, `--intra_period`, `--skip_thres`. Any explicit
+`--resolution` is preserved; when omitted, it defaults to the benchmark's
+144p short edge. For example, `--target-psnr 30 --resolution 480` selects
+parameters from the calibration table and encodes at a 480p short edge.
 Explicit codec parameters, including aliases `--qi`, `--qp`, and
 `--force_intra_period`, constrain selection and are retained. If no measured
 candidate qualifies, the command fails before downloading or loading models.
-Explicitly requesting another runtime, model structure or resolution also fails;
+Explicitly requesting another runtime or model structure also fails;
 omit `--target-psnr` for unrestricted manual settings. Audio, process count,
 source FPS and other options retain their usual behavior.
 
 The selected trial, parameters and measured size/time/PSNR are printed in a
 `target_psnr_selected` event. PSNR comes from the benchmark source, and speed
-comes from the benchmark hardware. Different content, frame rates, prepared
-models or hardware can change both quality and performance. No per-video PSNR
-measurement or search is added, and the selector does not change the output
+comes from the benchmark hardware. Different resolutions, content, frame rates,
+prepared models or hardware can change both quality and performance. No per-video
+PSNR measurement or search is added, and the selector does not change the output
 format or pipeline identity beyond the actual selected codec settings.
 
 ### Skip completed channel entries before resolving videos

@@ -65,8 +65,7 @@ class SchedulingTests(unittest.TestCase):
         finally:
             gates.close(); other.close()
         self.assertFalse(directory.exists())
-        for config, devices in ((None, [0, 0]),
-                                (dict(runtime='fp16', variant='htl'), [0, 0]),
+        for config, devices in ((dict(runtime='fp16', variant='htl'), [0, 0]),
                                 (dict(runtime='int16', variant='ld'), [0, 0]),
                                 (dict(runtime='int16', variant='hts'), [0, 0]),
                                 (dict(runtime='int16', variant='htl'), [0, 1]),
@@ -74,6 +73,13 @@ class SchedulingTests(unittest.TestCase):
             scope = EncodeGates(config, devices)
             self.assertIsNone(scope.temporary)
             scope.close()
+        # Decode resolves the runtime per archive; eligible native codecs attach
+        # this path after reading their metadata.
+        decode = EncodeGates(None, [0, 0])
+        try:
+            self.assertIn('gpu_gate', decode.job({'source': 'archive'}, 0))
+        finally:
+            decode.close()
 
     def test_owner_death_releases_waiting_process(self):
         context = multiprocessing.get_context('spawn')
@@ -143,6 +149,50 @@ class SchedulingTests(unittest.TestCase):
             self.assertLessEqual(records[0]['end'], records[1]['start'])
             self.assertFalse(Path(records[0]['gate']).parent.exists())
             self.assertTrue(all('gpu_gate' not in job for job in jobs))
+
+    def test_decoder_holds_gate_through_gpu_completion_and_errors(self):
+        import torch
+        from src.int16.model import IntegerModel
+        events = []
+        class Gate:
+            def __enter__(self): events.append('enter')
+            def __exit__(self, *exc): events.append('exit')
+        model = SimpleNamespace(gpu_gate=Gate(), device=torch.device('cuda:0'),
+                                _decompress=Mock(return_value='decoded'))
+        sps = dict(width=256, height=144)
+        with patch('torch.cuda.synchronize', side_effect=lambda *_: events.append('sync')):
+            self.assertEqual(IntegerModel.decompress(model, b'bits', sps, 10, 1), 'decoded')
+            self.assertEqual(events, ['enter', 'sync', 'exit'])
+            events.clear(); model._decompress.side_effect = ValueError('decode failed')
+            with self.assertRaisesRegex(ValueError, 'decode failed'):
+                IntegerModel.decompress(model, b'bits', sps, 10, 1)
+            self.assertEqual(events, ['enter', 'sync', 'exit'])
+            events.clear(); model._decompress.side_effect = None
+            IntegerModel.decompress(model, b'bits', dict(width=128, height=128), 10, 1)
+            self.assertEqual(events, [])
+            model.device = torch.device('cpu')
+            IntegerModel.decompress(model, b'bits', sps, 10, 1)
+            self.assertEqual(events, [])
+
+    def test_batch_decode_passes_gate_to_checked_codec_without_gpu(self):
+        from src.archive.workflow import checked_codec
+        from src.archive.decode import _decode_entry
+        options = SimpleNamespace(runtime='auto', model_path_i=None, model_path_p=None,
+                                  prepared_i=None, prepared_p=None, device='cuda', cuda_idx=0)
+        codec = SimpleNamespace(set_gpu_gate=Mock())
+        metadata = dict(pipeline=dict(runtime='int16', variant='htl'))
+        job = dict(options=options, gpu_gate='/tmp/test-uf-gpu.lock')
+        writer = Mock()
+        with patch('src.archive.workflow.run_decode', return_value=0):
+            _decode_entry(writer, job, None, None, 2, None)
+        self.assertEqual(options.cuda_idx, 2)
+        self.assertEqual(options._gpu_gate, job['gpu_gate'])
+        with patch('src.archive.workflow.model_paths', return_value=('image', 'video')), \
+                patch('src.archive.workflow.make_codec', return_value=codec):
+            self.assertIs(checked_codec(metadata, options), codec)
+        codec.set_gpu_gate.assert_called_once_with(job['gpu_gate'])
+        self.assertNotIn('gpu_gate', metadata['pipeline'])
+        self.assertNotIn('_gpu_gate', metadata['pipeline'])
 
     def test_stream_workers_share_gate_without_gpu_or_network(self):
         from src.archive.stream_pipeline import execute_stream_jobs

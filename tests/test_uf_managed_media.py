@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import numpy as np
 
 from src.archive.frame_source import FrameSource, packet_index
@@ -71,6 +71,58 @@ class ManagedMediaTests(unittest.TestCase):
             out=io.BytesIO();write_sps(out,dict(sps_id=0,width=2,height=2));write_ip(out,True,0,0,0,0,b'x')
             with self.assertRaises(ValueError):
                 packet_index(io.BufferedReader(io.BytesIO(out.getvalue())),dict(width=2,height=2,frames=frames,packets=packets),8)
+
+    def test_seek_uses_partial_decode_hook_and_rejects_wrong_counts(self):
+        path = self.root/'video.bin'
+        with path.open('wb') as out:
+            write_sps(out, dict(sps_id=0, width=2, height=2))
+            write_ip(out, True, 0, 10, 0, 0, bytes([10]))
+            write_ip(out, False, 0, 10, 0, 0, bytes(range(11, 19)))
+        data = dict(pipeline=self.config, video=dict(width=2, height=2, frames=4, packets=2))
+        fake = FakeCodec()
+        requests = []
+        def partial(bits, sps, qp, ec, reset, count):
+            requests.append(count)
+            return {'x_hat': list(bits)[:count]}, count
+        fake.decode_video = partial
+        with patch('src.archive.storage.load_bundle', return_value=(self.root, data)), \
+             patch('src.archive.workflow.checked_codec', return_value=fake):
+            source = FrameSource(path, self.args)
+            self.addCleanup(source.close)
+            self.assertEqual(source.seek(3).raw, bytes([13])*6)
+            self.assertEqual(requests, [3])
+            source.next_packet, source.cached_packet = 0, -1
+            fake.decode_video = lambda *args: ({'x_hat': [11, 12, 13]}, 2)
+            with self.assertRaisesRegex(ValueError, 'chunk length'):
+                source.seek(3)
+            source.next_packet, source.cached_packet = 0, -1
+            fake.decode_video = lambda *args: ({'x_hat': [11]}, 3)
+            with self.assertRaisesRegex(ValueError, 'chunk length'):
+                source.seek(3)
+
+    def test_seek_skips_intermediate_pixel_heads_and_conversion(self):
+        path = self.root/'video.bin'
+        with path.open('wb') as out:
+            write_sps(out, dict(sps_id=0, width=2, height=2))
+            write_ip(out, True, 0, 10, 0, 0, bytes([10]))
+            for first in (11, 19, 27):
+                write_ip(out, False, 0, 10, 0, 1, bytes(range(first, first+8)))
+        data = dict(pipeline=self.config, video=dict(width=2, height=2, frames=25, packets=4))
+        fake = FakeCodec()
+        fake.skip_video = Mock(return_value=True)
+        fake.raw_frame = Mock(wraps=fake.raw_frame)
+        with patch('src.archive.storage.load_bundle', return_value=(self.root, data)), \
+             patch('src.archive.workflow.checked_codec', return_value=fake):
+            source = FrameSource(path, self.args)
+            self.addCleanup(source.close)
+            self.assertEqual(source.seek(24).raw, bytes([34])*6)
+            self.assertEqual(fake.skip_video.call_count, 2)
+            self.assertEqual(fake.raw_frame.call_count, 8)
+            self.assertEqual(fake.video.calls, [tuple(range(27, 35))])
+            self.assertEqual(source.seek(0).raw, bytes([10])*6)
+            self.assertEqual(fake.raw_frame.call_count, 9)
+            self.assertEqual(source.seek(16).raw, bytes([26])*6)
+            self.assertEqual(fake.skip_video.call_count, 3)
 
     def test_thumbnail_resume_integrity_decode_and_exact_cleanup(self):
         from PIL import Image

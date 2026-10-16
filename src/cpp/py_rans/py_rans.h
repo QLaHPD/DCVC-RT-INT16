@@ -44,6 +44,8 @@ public:
 
 private:
     std::vector<std::shared_ptr<RansEncoderLib>> m_encoders;
+    std::vector<std::shared_ptr<std::vector<std::vector<RansSymbol>>>> m_rans_symbols;
+    std::vector<std::shared_ptr<std::vector<int8_t>>> m_max_value;
     int m_entropy_coder_parallel{ 1 };
 };
 
@@ -58,6 +60,8 @@ public:
 
     void decode_y(const std::shared_ptr<std::vector<uint8_t>>& indexes, const int indexSize);
     void decode_y(const py::array_t<uint8_t>& indexes);
+    py::array_t<int8_t> decode_y_with_skip(
+        const py::array_t<int16_t, py::array::c_style | py::array::forcecast>& indexes);
     // if is_stream_nhmw, ch is channel number
     // otherwise, ch is per channel element number
     void decode_z(const int total_size, const int cdf_offset, const int ch);
@@ -75,5 +79,7 @@ private:
     std::shared_ptr<std::vector<int8_t>> m_decoded_tensor;
     int m_current_decoded_tensor_size{ 0 };
     std::vector<std::shared_ptr<RansDecoderLib>> m_decoders;
+    std::vector<std::shared_ptr<std::vector<std::vector<int32_t>>>> m_cdfs;
+    std::vector<std::shared_ptr<std::vector<int8_t>>> m_max_value;
     int m_entropy_coder_parallel{ 1 };
 };

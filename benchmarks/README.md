@@ -19,6 +19,9 @@ PSNR at least the target, choosing minimum encoding time, then minimum bytes
 for a time tie, then trial number. Restricting selection to the 2D size/PSNR
 frontier would discard potentially faster choices. This is a speed-first
 selection, not simultaneous independent minimization of size and time.
+The selected codec parameters can be used with any explicit `--resolution`;
+without one, the selector defaults to the benchmark's 144p short edge.
+The recorded PSNR, speed and sizes remain measurements at 256×144.
 
 For `--target-psnr 30`, trial **783** is selected:
 
@@ -60,6 +63,10 @@ CPU input work remains concurrent. HT-S, LD and smaller frames keep concurrent
 GPU execution. Use `--gpu-scheduling concurrent` to measure without chunk
 coordination. Saved `--model-source` controls retain their original scheduling.
 The report records the scheduling used by each worker.
+For a saved model that already supports the GPU gate, add
+`--reference-gpu-gate` to coordinate its encoding too. The report records
+encoding and decoding coordination separately. Current HT-L workers also
+coordinate decode chunks; older saved models keep their own decode behavior.
 
 With `--verify`, a final worker barrier keeps verification outside every
 worker's measured encode interval. `aggregate_verification_fps` separately
@@ -75,6 +82,10 @@ implementation with the same benchmark. Add `--layers-source` and
 `--native-library` to restore the saved layer dispatcher and native extension
 as well. The report records source and native-library SHA-256 hashes, so a
 control run can prove that it used the previous implementation.
+Use `--integer-codec-source` to restore its checkpoint initialization and
+source conversion, `--ops-source` for its arithmetic dispatcher, and
+`--entropy-library` for its saved `MLCodec_extensions_cpp` library. Worker
+reports include the entropy-library hash separately from the CUDA-library hash.
 Use `--archive-source /path/to/saved/archive/codec.py` to also restore the
 original shared encode/decode wrapper, including its pixel validation. The
 report records the loaded model, layer and archive implementation modules.

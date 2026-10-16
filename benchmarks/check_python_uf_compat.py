@@ -7,7 +7,6 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
-import types
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -34,13 +33,12 @@ def main():
         old_native = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(old_native)
 
-    current_layers = Layers.__call__
-    old_layers = current_layers
+    old_layers = Layers
     if args.reference_layers:
         spec = importlib.util.spec_from_file_location('src.int16._compat_layers', args.reference_layers)
         layer_reference = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(layer_reference)
-        old_layers = layer_reference.Layers.__call__
+        old_layers = layer_reference.Layers
 
     spec = importlib.util.spec_from_file_location('src.int16._compat_reference', args.reference_model)
     reference = importlib.util.module_from_spec(spec)
@@ -57,12 +55,19 @@ def main():
         previous = implementation is reference.IntegerModel
         native = old_native if previous else current_native
         sys.modules['uf_int16_cuda'] = native
-        Layers.__call__ = old_layers if previous else current_layers
         for model in (codec.image, codec.video):
+            # Switch the whole Python implementation, including helpers called
+            # by compress/decompress, rather than only their outer wrappers.
+            model.__class__ = implementation
+            model.layers.__class__ = old_layers if previous else Layers
             model._prior_native = native if all(hasattr(native, n) for n in
                 ('prior_encode', 'prior_indexes', 'prior_restore')) else None
-            for name in ('_prior', 'compress', 'decompress'):
-                setattr(model, name, types.MethodType(getattr(implementation, name), model))
+            # This callable is cached when weights are loaded. Swap it too so
+            # every reference block uses the saved native library.
+            if hasattr(model.layers, '_native_block'):
+                model.layers._native_block = getattr(native, 'depth_conv_block', None)
+            if hasattr(model.layers, '_native_packed_block'):
+                model.layers._native_packed_block = getattr(native, 'depth_conv_block_packed', None)
     source = Path(args.input).resolve()
     media = probe(source)
     cases = [dict(skip=0, reset=0, intra=-1, frames=17, resolution=64, qi=36, qp=30),
@@ -89,6 +94,8 @@ def main():
             validations.append(codec.decode(paths[mode], metadata))
         assert validations[0]['decoded_yuv_sha256'] == validations[1]['decoded_yuv_sha256'], f'changed pixels: {case}'
         record = dict(variant=args.variant, case=case, video=metadata,
+                      current_native_sha256=hashlib.sha256(Path(current_native.__file__).read_bytes()).hexdigest(),
+                      reference_native_sha256=hashlib.sha256(Path(old_native.__file__).read_bytes()).hexdigest(),
                       bitstream_sha256=hashlib.sha256(paths['current'].read_bytes()).hexdigest(),
                       decoded_yuv_sha256=validations[0]['decoded_yuv_sha256'],
                       current_decodes_reference=True, reference_decodes_current=True)

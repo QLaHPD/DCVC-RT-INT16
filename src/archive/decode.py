@@ -39,6 +39,7 @@ def _decode_entry(writer,job,_config,_paths,device,_instance,event_queue=None):
     install(event_queue)
     options = job['options']
     options.cuda_idx = 0 if device=='cpu' else device
+    options._gpu_gate = job.get('gpu_gate')
     try:
         result = run_decode(options)
         writer.send('encoded' if result==0 else 'failed')

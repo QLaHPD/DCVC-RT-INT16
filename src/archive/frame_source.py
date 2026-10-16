@@ -124,18 +124,42 @@ class FrameSource:
                     qp, ec, reset, bits = read_ip_remaining(self.stream)
                     if packet.nal_type == NalType.NAL_I:
                         result = self.codec.image.decompress(bits, packet.sps, qp, ec)
+                        expected = 1
                         if self.codec.video is not None:
                             self.codec.video.clear_dpb()
                             self.codec.video.add_ref_feature_from_frame(result['x_hat'], apply_feature_adaptor=False)
                     else:
-                        result = self.codec.video.decompress(bits, packet.sps, qp, ec, reset)
+                        skip_video = getattr(self.codec, 'skip_video', None)
+                        if (self.next_packet < target and skip_video is not None
+                                and skip_video(bits, packet.sps, qp, ec, reset)):
+                            self.next_packet += 1
+                            continue
+                        decode_video = getattr(self.codec, 'decode_video', None)
+                        maximum = 1 if self.metadata['pipeline']['variant']=='ld' else 8
+                        if decode_video is not None:
+                            result, expected = decode_video(bits, packet.sps, qp, ec, reset, packet.count)
+                            if expected not in (maximum, packet.count):
+                                raise ValueError('Unexpected UF decoder chunk length')
+                        else:
+                            result = self.codec.video.decompress(bits, packet.sps, qp, ec, reset)
+                            expected = maximum
                     frames = result['x_hat'] if isinstance(result['x_hat'], list) else [result['x_hat']]
-                    expected = 1 if packet.nal_type == NalType.NAL_I else (1 if self.metadata['pipeline']['variant']=='ld' else 8)
                     if len(frames) != expected:
                         raise ValueError('Unexpected UF decoder chunk length')
-                    if any(torch.is_tensor(f) and not torch.isfinite(f).all() for f in frames):
+                    if any(torch.is_tensor(f) and f.is_floating_point() and
+                           not torch.isfinite(f).all() for f in frames):
                         raise ValueError('Decoder produced non-finite pixels')
-                    self.cached = [self.codec.raw_frame(f, packet.sps['width'], packet.sps['height']) for f in frames[:packet.count]]
+                    if self.next_packet < target:
+                        self.next_packet += 1
+                        continue
+                    valid = frames[:packet.count]
+                    raw_frames = getattr(self.codec, 'raw_frames', None)
+                    if raw_frames is not None:
+                        raw = raw_frames(valid, packet.sps['width'], packet.sps['height'])
+                        size = packet.sps['width']*packet.sps['height']*3//2
+                        self.cached = [raw[index*size:(index+1)*size] for index in range(len(valid))]
+                    else:
+                        self.cached = [self.codec.raw_frame(f, packet.sps['width'], packet.sps['height']) for f in valid]
                     self.cached_packet = self.next_packet
                     self.next_packet += 1
         packet = self.packets[target]
