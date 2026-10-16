@@ -89,6 +89,13 @@ Existing outputs can be reviewed separately:
 
 ### Thumbnails and seekable playback
 
+UF and RT thumbnails share the `.dcvci` extension but use different containers
+and networks. UF inventory recognizes structurally complete RT intra-image
+containers, excludes them from UF validation/cleanup, and emits one
+`inventory_skipped_rt_images` summary per scan. Unknown or truncated images
+still produce `inventory_error`; direct UF decoding remains strict. RT files
+and their originals are preserved and require the RT tooling.
+
 Add `--thumbnail_codec dcvc-intra --thumbnail_qp 45` to the same encode/stream
 command. Images become `original.jpg_qI45.dcvci`, using UF's intra network and
 recorded runtime/model identities. Images-only input does not need a video model.

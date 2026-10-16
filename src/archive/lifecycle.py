@@ -68,12 +68,16 @@ def inventory(roots, sources=None, base_root=None):
                     entry['ineligible'] += 1
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 event('inventory_error', manifest=str(manifest), error=str(exc))
-    from src.archive.thumbnails import read_image
+    from src.archive.thumbnails import read_image, is_legacy_rt_image
+    skipped_rt_images = set()
     for root in roots:
         if not root.exists(): continue
         for path in root.rglob('*.dcvci'):
             if any(part.startswith('.') for part in path.relative_to(root).parts): continue
             try:
+                if is_legacy_rt_image(path):
+                    skipped_rt_images.add(str(path.absolute()))
+                    continue
                 data,_ = read_image(path, verify_payload=False)
                 source = Path(data['source']['path'])
                 if base_root and data['source'].get('relative_path'):
@@ -92,6 +96,9 @@ def inventory(roots, sources=None, base_root=None):
                 else: entry['ineligible'] += 1
             except (OSError,ValueError,KeyError,TypeError) as exc:
                 event('inventory_error',manifest=str(path),error=str(exc))
+    if skipped_rt_images:
+        event('inventory_skipped_rt_images', count=len(skipped_rt_images), codec='dcvc-rt',
+              message=f'Skipped {len(skipped_rt_images)} RT thumbnails; excluded from UF validation and cleanup')
     return channels
 
 

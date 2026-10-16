@@ -21,6 +21,38 @@ class ImagePool(SharedWorkPool):
         return Path(channel_out) / '.dcvc-uf-image-work'
 
 
+def is_legacy_rt_image(path):
+    """Recognize an RT SPS + one I-frame container without decoding its payload.
+
+    RT and UF share the .dcvci suffix. Only a complete RT container is excluded
+    from UF inventory; unknown/truncated files must still reach UF error handling.
+    This does not validate neural pixels or authorize cleanup of an RT original.
+    """
+    from src.utils.stream_helper import read_uchars, read_uint_adaptive
+
+    with open(path, 'rb') as stream:
+        try:
+            sps_header = read_uchars(stream, 1)[0]
+            if sps_header >> 4 != 0:
+                return False
+            height = read_uint_adaptive(stream)
+            width = read_uint_adaptive(stream)
+            sps_flags = read_uchars(stream, 1)[0]
+            if height <= 0 or width <= 0 or sps_flags & ~0x05:
+                return False
+            frame_header = read_uchars(stream, 1)[0]
+            if frame_header >> 4 != 1 or (frame_header & 0x0f) != (sps_header & 0x0f):
+                return False
+            qp = read_uchars(stream, 1)[0]
+            if qp >= 64:
+                return False
+            payload_size = read_uint_adaptive(stream)
+            remaining = os.fstat(stream.fileno()).st_size - stream.tell()
+            return payload_size > 0 and payload_size == remaining
+        except (struct.error, EOFError, IndexError):
+            return False
+
+
 def read_image(path, verify_payload=True):
     with open(path, 'rb') as stream:
         if stream.read(8) != MAGIC:
