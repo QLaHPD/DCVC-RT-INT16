@@ -54,6 +54,17 @@ shutdown. Model initialization and verification decoding are excluded from
 that number and reported separately. Two workers share the GPU, so aggregate
 throughput need not exceed one worker's throughput.
 
+The default `--gpu-scheduling auto` follows the archive CLI: INT16 HT-L workers
+sharing a GPU coordinate complete encode chunks for frames at least 144p.
+CPU input work remains concurrent. HT-S, LD and smaller frames keep concurrent
+GPU execution. Use `--gpu-scheduling concurrent` to measure without chunk
+coordination. Saved `--model-source` controls retain their original scheduling.
+The report records the scheduling used by each worker.
+
+With `--verify`, a final worker barrier keeps verification outside every
+worker's measured encode interval. `aggregate_verification_fps` separately
+measures all verification decodes across their combined elapsed span.
+
 `--verify` decodes in memory, hashes each frame and discards its pixels; no raw
 YUV or other decoded media is written. Cross-decoding checks also keep only
 pixel hashes. For the normal archive CLI, use `main.py verify --input_file
@@ -64,6 +75,9 @@ implementation with the same benchmark. Add `--layers-source` and
 `--native-library` to restore the saved layer dispatcher and native extension
 as well. The report records source and native-library SHA-256 hashes, so a
 control run can prove that it used the previous implementation.
+Use `--archive-source /path/to/saved/archive/codec.py` to also restore the
+original shared encode/decode wrapper, including its pixel validation. The
+report records the loaded model, layer and archive implementation modules.
 `check_python_uf_compat.py` compares
 that saved implementation with the current model, requiring identical streams
 and decoded pixel hashes in both decoding directions. It covers skip on/off,

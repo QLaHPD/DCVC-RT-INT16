@@ -197,6 +197,8 @@ def encode_job(job, config, paths, device, instance):
                   variant=config['variant'], qi=config['qp_i'], qp=config['qp_p'])
             stage = Path(tempfile.mkdtemp(prefix='uf-encode-', dir=memory_stage_root()))
             codec = make_codec(config, paths, device)
+            if job.get('gpu_gate') and hasattr(codec, 'set_gpu_gate'):
+                codec.set_gpu_gate(job['gpu_gate'])
             last = [0.0]
             policy = job.get('buffer_policy') if remote else None
             if policy is not None: policy.claim()
@@ -380,6 +382,8 @@ def execute_jobs(args, jobs, config, paths, worker_entry=None):
     failed_channels = set()
     active = []
     free_devices = [devices[index % len(devices)] for index in range(args.procs)]
+    from src.int16.scheduling import EncodeGates
+    gpu_gates = EncodeGates(config, free_devices)
     try:
         while not exhausted or active:
             while not exhausted and len(active) < args.procs:
@@ -389,6 +393,7 @@ def execute_jobs(args, jobs, config, paths, worker_entry=None):
                     exhausted = True
                     break
                 device = free_devices.pop(0)
+                job = gpu_gates.job(job, device)
                 reader, writer = context.Pipe(duplex=False)
                 process = context.Process(target=worker_entry, args=(writer, job, config, paths,
                                           device, args.shared_instance),
@@ -421,6 +426,7 @@ def execute_jobs(args, jobs, config, paths, worker_entry=None):
                 process.kill()
                 process.join()
             reader.close()
+        gpu_gates.close()
     return outcomes, failed_channels
 
 

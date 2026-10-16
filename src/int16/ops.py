@@ -45,15 +45,30 @@ def multiply(x, scale):
 
 
 def reciprocal(x):
+    if x.is_cuda and x.dtype == torch.int16 and x.numel():
+        import uf_int16_cuda
+        fused = getattr(uf_int16_cuda, 'reciprocal', None)
+        if fused is not None:
+            return fused(x)
     return saturate(divide_round(torch.full_like(x, FEATURE_SCALE**2, dtype=torch.int64),
                                 x.to(torch.int64).clamp_min(FEATURE_SCALE // 2)))
 
 
 def symbols(x):
+    if x.is_cuda and x.dtype == torch.int16 and x.numel():
+        import uf_int16_cuda
+        fused = getattr(uf_int16_cuda, 'symbols', None)
+        if fused is not None:
+            return fused(x)
     return divide_round(x, FEATURE_SCALE).clamp(-128, 127).to(torch.int8)
 
 
 def from_symbols(x):
+    if x.is_cuda and x.dtype == torch.int8 and x.numel():
+        import uf_int16_cuda
+        fused = getattr(uf_int16_cuda, 'from_symbols', None)
+        if fused is not None:
+            return fused(x)
     return saturate(x.to(torch.int64) * FEATURE_SCALE)
 
 
@@ -117,3 +132,20 @@ def conv2d_wsilu4(x, weight, bias, lut):
         if fused is not None:
             return fused(x, weight, bias, lut)
     return wsilu4(conv2d(x, weight, bias), lut)
+
+
+def conv2d_post(x, weight, bias, lut=None, residual=None, shortcut=None):
+    """Pointwise convolution with the original activation/add saturation order."""
+    if x.is_cuda and x.shape[1] <= 32768:
+        import uf_int16_cuda
+        fused = getattr(uf_int16_cuda, 'conv2d_post', None)
+        if fused is not None:
+            return fused(x, weight, bias, lut, residual, shortcut)
+    out = conv2d(x, weight, bias)
+    if lut is not None:
+        out = lookup(out, lut)
+    if residual is not None:
+        out = add(out, residual)
+    if shortcut is not None:
+        out = add(out, shortcut)
+    return out

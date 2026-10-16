@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import torch
 
 from src.int16 import ops
@@ -69,6 +70,21 @@ class CudaIntegerTests(unittest.TestCase):
         values = torch.arange(256,dtype=torch.uint8)
         self.assertTrue(torch.equal(ops.from_bytes(values),ops.from_bytes(values.cuda()).cpu()))
 
+    def test_multiply_full_range_and_broadcast_fast_paths(self):
+        values = torch.arange(-32768, 32768, dtype=torch.int16).reshape(1, 1, 256, 256)
+        for value in (-32768, -8192, -513, -512, -511, -1, 0, 1,
+                      255, 256, 511, 512, 513, 8192, 32767):
+            scale = torch.tensor([value], dtype=torch.int16).reshape(1, 1, 1, 1)
+            self.assertTrue(torch.equal(ops.multiply(values, scale),
+                                        ops.multiply(values.cuda(), scale.cuda()).cpu()))
+        gen = torch.Generator().manual_seed(1041)
+        values = torch.randint(-32768, 32768, (2, 17, 5, 7), dtype=torch.int16, generator=gen)
+        for shape in ((1, 17, 1, 1), (2, 17, 1, 1), (2, 17, 5, 7),
+                      (1, 1, 5, 7), (2, 1, 1, 7), (2, 17, 1, 7)):
+            scale = torch.randint(-32768, 32768, shape, dtype=torch.int16, generator=gen)
+            self.assertTrue(torch.equal(ops.multiply(values, scale),
+                                        ops.multiply(values.cuda(), scale.cuda()).cpu()))
+
     def test_cuda_matches_cpu_including_overflow_and_odd_tiles(self):
         torch.manual_seed(19)
         cases = [(2, 35, 19, 3, 7, 1, 1, 0, 1), (1, 6, 9, 7, 9, 3, 2, 1, 3),
@@ -127,6 +143,52 @@ class CudaIntegerTests(unittest.TestCase):
                 args=(x.cuda(),w.cuda(),b.cuda(),1,1,0,0,1)
                 self.assertTrue(torch.equal(reference,native.conv2d(*args).cpu()))
                 self.assertTrue(torch.equal(reference,native.conv2d_baseline(*args).cpu()))
+
+
+class BoundaryIntegerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest('CUDA not available')
+        try:
+            import uf_int16_cuda
+        except ImportError:
+            raise unittest.SkipTest('UF integer CUDA extension not built')
+        if not all(callable(getattr(uf_int16_cuda, name, None)) for name in
+                   ('symbols', 'from_symbols', 'reciprocal')):
+            raise unittest.SkipTest('Rebuild UF integer extension for boundary operations')
+        cls.native = uf_int16_cuda
+
+    def test_symbol_boundaries_full_range_and_views(self):
+        for name, dtype, start, stop in (('symbols', torch.int16, -32768, 32768),
+                                         ('from_symbols', torch.int8, -128, 128)):
+            values = torch.arange(start, stop, dtype=dtype).reshape(-1, 8)
+            operation = getattr(ops, name)
+            gpu_values = values.cuda()
+            for cpu, gpu in ((values, gpu_values), (values.t(), gpu_values.t()),
+                             (values[1::2], gpu_values[1::2])):
+                self.assertTrue(torch.equal(operation(cpu), operation(gpu).cpu()))
+
+    def test_reciprocal_full_range_and_views(self):
+        values = torch.arange(-32768, 32768, dtype=torch.int16).reshape(256, 256)
+        gpu = values.cuda()
+        for cpu, device in ((values, gpu), (values.t(), gpu.t()),
+                            (values[1::2, ::3], gpu[1::2, ::3])):
+            self.assertTrue(torch.equal(ops.reciprocal(cpu), ops.reciprocal(device).cpu()))
+
+    def test_boundary_older_extension_and_dtype_fallback(self):
+        for name, dtype, values in (
+                ('symbols', torch.int16, [-32768, -768, -256, 0, 256, 768, 32767]),
+                ('from_symbols', torch.int8, [-128, -65, -64, 0, 63, 64, 127]),
+                ('reciprocal', torch.int16, [-32768, 0, 255, 256, 257, 32767])):
+            operation = getattr(ops, name)
+            for kind in (dtype, torch.int64):
+                cpu = torch.tensor(values, dtype=kind)
+                with patch.object(self.native, name, None):
+                    self.assertTrue(torch.equal(operation(cpu), operation(cpu.cuda()).cpu()))
+                self.assertTrue(torch.equal(operation(cpu), operation(cpu.cuda()).cpu()))
+            empty = torch.empty(0, dtype=dtype)
+            self.assertTrue(torch.equal(operation(empty), operation(empty.cuda()).cpu()))
 
 
 if __name__ == '__main__':

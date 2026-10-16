@@ -234,6 +234,8 @@ def execute_stream_jobs(args, config, paths, binary, counts):
     producer = AheadJobs(stream_jobs(args, binary, counts, cancel_event=stop, config=config), stop)
     devices = ['cpu'] if args.device == 'cpu' else (args.cuda_idx or [0])
     free = [devices[i % len(devices)] for i in range(args.procs)]
+    from src.int16.scheduling import EncodeGates
+    gpu_gates = EncodeGates(config, free)
     active, outcomes, failed = [], [], set()
     pending = warm = None
     exhausted = False
@@ -263,6 +265,7 @@ def execute_stream_jobs(args, config, paths, binary, counts):
                 if prepared:
                     job['prepared_download'] = prepared.descriptor()
                 device = free.pop(0)
+                job = gpu_gates.job(job, device)
                 reader, writer = context.Pipe(duplex=False)
                 process = context.Process(target=_job_entry, args=(writer,job,config,paths,device,args.shared_instance),
                                           kwargs={'event_queue':event_queue()})
@@ -304,5 +307,6 @@ def execute_stream_jobs(args, config, paths, binary, counts):
             if process.is_alive(): process.kill(); process.join()
             item['reader'].close()
         if warm: warm.close()
+        gpu_gates.close()
         producer.close()
     return outcomes, failed

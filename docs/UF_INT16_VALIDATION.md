@@ -1,5 +1,156 @@
 # UF integer validation on Jetson Orin
 
+## Python convolution dispatch and integer boundaries — 2026-10-16
+
+This round compares against the preceding local `packed-v5` implementation,
+saved with its source and native library in
+`runs/python-speed-20261016-round4/baseline/`. It measures further gains on top
+of the preceding optimization round.
+
+Common pointwise projections now fetch two 32-element reduction fragments
+together. Shape selection uses the measured 32/64-column tiles and a two-warp
+block for small square projections. The four-channel activation reduction
+retains the smaller register set where that is faster. Rejected kernel trials
+and per-shape timings are retained in the local run directory. The existing
+16 MiB input-packing and 8 MiB receptive-field limits remain in force.
+
+Symbol quantization, symbol restoration and reciprocal calculation each use
+one integer CUDA pass. Multiplication has scalar, full-tensor and per-channel
+broadcast paths that avoid general index calculations. Each INT16 product and
+its rounding offset fit INT32; convolution dot products still accumulate
+exactly into INT64. All original rounding and saturation boundaries remain.
+CPU tensors, other input dtypes and older native libraries retain their
+previous operations.
+
+Canonical depth/residual blocks can dispatch their five convolutions through
+one native call, using references to the existing prepared weights. This
+reduces Python dispatch; the GPU kernels and intermediate saturation points
+remain separate. An isolated HT-L comparison measured 111.32 versus
+111.36 FPS with the older Python dispatcher, so that change alone has no
+detectable HT-L throughput benefit in this workload.
+
+The native revision is `dispatch-v6`. The existing extension was rebuilt with
+`MAX_JOBS=1` and `TORCH_CUDA_ARCH_LIST=8.7`. No dependencies, additional model
+copies, arithmetic identities, prepared identities or bitstream fields were
+added. GPU scheduling uses the preceding implementation's per-invocation
+HT-L gate.
+
+The same Orin Nano at 1.02 GHz, local moving FFV1 input, HT-L INT16,
+QI10/QP14, reset 2, intra -1, skip 0.2 and 30 source FPS were used. Values
+are medians of three repetitions after a 17-frame warmup. Timing includes
+FFmpeg input and bitstream writes; initialization and verification are
+separate. Both workers finish timed encoding before either starts decoding.
+
+| Dimensions | Frames per worker | Workers | Previous FPS | New FPS | Gain |
+|---|---:|---:|---:|---:|---:|
+| 256×144 | 257 | 1 | 100.27 | 111.32 | 11.0% |
+| 256×144 | 257 | 2, aggregate | 101.48 | 112.69 | 11.0% |
+| 512×288 | 129 | 1 | 27.65 | 29.47 | 6.6% |
+| 512×288 | 129 | 2, aggregate | 27.96 | 29.80 | 6.6% |
+
+The sustained two-worker run used 1,025 frames per worker and three measured
+repetitions. Aggregate throughput improved 104.74 → 116.40 FPS (11.1%),
+again with identical streams and pixel hashes. Measured peak RSS was about
+1.20 GiB per worker at 144p and 1.24 GiB at 288p. Verification throughput
+improved 89.64 → 96.23 FPS at 144p and 25.17 → 26.50 FPS at 288p with one
+worker; two-worker verification improved 81.07 → 87.51 and 22.79 → 24.02 FPS.
+
+The same settings with 129 frames per worker also checked the other UF modes:
+
+| Mode | Workers | Previous FPS | New FPS | Gain |
+|---|---:|---:|---:|---:|
+| HT-S | 1 | 123.96 | 134.29 | 8.3% |
+| HT-S | 2, aggregate | 121.29 | 134.69 | 11.0% |
+| LD | 1 | 66.01 | 75.28 | 14.0% |
+| LD | 2, aggregate | 74.45 | 77.75 | 4.4% |
+
+All measured streams and decoded pixel hashes match the saved implementation.
+All 125 regression tests and all 12 HT-L/HT-S/LD cross-decoding cases passed.
+The checks include full INT16 conversion ranges, every INT8 symbol value,
+multiply broadcasts, noncontiguous views, reduction tails, maximal accumulation
+and each residual saturation boundary. The normal CLI also encoded, verified
+and resumed two local clips with `--fps 4 --procs 2` (34 and 137 frames),
+matching the previous decoded hashes. Original synthetic inputs were retained.
+Verification hashes decoded frames in memory and writes no decoded media.
+Reports, native/source fingerprints and the completion audit are under
+`runs/python-speed-20261016-round4/`. These synthetic measurements exclude
+network throughput and model initialization.
+
+## Python packed matrices and residual fusion — 2026-10-16
+
+This round compares against published commit `878742e`, including its saved
+Python model, layer dispatcher and `ffn-v4` CUDA library. Large pointwise
+convolutions can pack INT16 input into channel-last order once and read matrix
+fragments directly, avoiding repeated shared-memory transposes and block
+barriers. Measured shape rules retain the shared-memory path for smaller
+matrices and large square matrices where packing loses time. Each channel-last
+packing buffer is bounded to 16 MiB; spatial receptive-field packing retains
+its existing 8 MiB bound.
+
+Activation lookup and residual additions now run in the convolution epilogue.
+Convolution rounding/saturation and each residual saturation remain separate,
+in their original order. A specialized 3×3 depthwise kernel avoids the general
+grouped-convolution loops. Reconstruction is queued before waiting for the
+existing CPU rANS worker, allowing those operations to overlap.
+
+HT-L workers sharing a GPU now coordinate complete encode chunks within their
+invocation. Both input workers remain active. This applies to INT16 frames
+with a short edge of at least 144 pixels; LD and HT-S retain concurrent GPU
+execution. Each invocation has its own temporary lock directory and a separate
+lock per shared GPU. Locks are released when a worker exits, including abnormal
+termination. Scheduling paths are absent from archive identities and metadata.
+
+Verification also has a fused integer conversion to cropped YUV420 bytes,
+preserving luma rounding and chroma averaging/flooring. Integer pixels require
+no finite-value reduction. Decoded frames are hashed in memory and discarded;
+verification writes no decoded media. CPU inference and older native libraries
+retain the original operations. Prepared weights, entropy tables, arithmetic
+identity and bitstream format are unchanged; no additional models or libraries
+are required.
+
+The native kernel revision is `packed-v5`. Rebuild the existing extension with
+`MAX_JOBS=1` using the command below. The complete regression suite passed all
+119 tests, including independent CPU comparisons for packed matrix tails,
+batching, maximal accumulation/cancellation, residual saturation order,
+noncontiguous views, two-byte storage offsets, depthwise borders and every
+INT16 pixel value. CPU-only process checks cover archive/stream coordination,
+namespace cleanup, worker death and GPU completion before releasing a slot.
+
+Measured on the same Orin Nano at 1.02 GHz, with HT-L INT16, QI10/QP14,
+reset 2, intra -1 and skip 0.2. Local moving FFV1 input uses 30 source FPS.
+Values are medians of three repetitions after a 17-frame warmup. Timing
+includes FFmpeg input and bitstream writes; initialization and verification
+are excluded. A worker barrier now prevents verification from overlapping
+another worker's final encode. The control restores the original archive
+wrapper as well as its model, layers and CUDA library.
+
+| Dimensions | Frames per worker | Workers | Previous FPS | New FPS | Gain |
+|---|---:|---:|---:|---:|---:|
+| 256×144 | 257 | 1 | 84.84 | 100.45 | 18.4% |
+| 256×144 | 257 | 2, aggregate | 78.01 | 101.70 | 30.4% |
+| 512×288 | 129 | 1 | 22.48 | 27.76 | 23.5% |
+| 512×288 | 129 | 2, aggregate | 20.37 | 27.96 | 37.3% |
+
+Without chunk coordination, the new kernels measured 92.72 aggregate FPS at
+144p and 25.29 at 288p. Final peak RSS was approximately 1.22 GiB per worker
+at 144p and 1.27 GiB at 288p. The original control and optimized decoder
+verified 69.56 → 89.31 FPS at 144p and 20.15 → 25.22 FPS at 288p with one
+worker; aggregate two-worker verification improved 65.13 → 81.03 and
+18.24 → 22.76 FPS respectively.
+
+The sustained two-worker check used 1,025 frames per worker and three measured
+repetitions with the same verification barrier. Aggregate throughput improved
+80.03 → 104.91 FPS (31.1%), with identical streams and decoded hashes.
+
+The final implementation passed all 12 HT-L/HT-S/LD cross-decoding cases using
+noisy synthetic input and the saved older native library in both directions.
+Measured streams and pixel hashes match. The normal CLI also encoded and
+verified two local files with `--fps 4 --procs 2` (34 and 137 frames), retained
+both originals, and resumed both archives without re-encoding. Full local
+profiles, candidates, frozen baselines, hashes and measurements are under
+`runs/python-speed-20261016-round3/`. Real channel throughput also depends on
+source decoding and network throughput.
+
 ## Python integer convolutions — 2026-10-16
 
 Further optimization of the Python INT16 runtime combines pointwise convolution

@@ -26,6 +26,89 @@ __device__ __forceinline__ void uf_split(const int16_t* p,uint32_t& lo,uint32_t&
     lo=__byte_perm(a,b,0x6420); hi=__byte_perm(a,b,0x7531);
 }
 
+// Pointwise MMA consumes channel-last input directly, avoiding shared-memory
+// transposes and block barriers. Inputs are packed once per convolution.
+template<int BN, bool REDUCE4, int STEPS=1, int WARPS=4>
+__global__ __launch_bounds__(WARPS*32) void uf_mma_direct(int16_t* __restrict__ out,const int16_t* __restrict__ x,
+    const int16_t* __restrict__ weight,const int16_t* bias,int M,int N,int K,const int16_t* lut,
+    const int16_t* residual,const int16_t* shortcut) {
+#if __CUDA_ARCH__ >= 800
+    const int warp=threadIdx.x/32,lane=threadIdx.x%32;
+    const int group=lane/4,quad=lane%4,m0=blockIdx.y*(WARPS*16),n0=blockIdx.x*BN;
+    uint32_t ll[BN/8][4]={},cross[BN/8][4]={},hh[BN/8][4]={};
+    for(int base=0;base<K;base+=32*STEPS) {
+        uint32_t al[STEPS][4]={},ah[STEPS][4]={};
+        #pragma unroll
+        for(int step=0;step<STEPS;++step) {
+            #pragma unroll
+            for(int r=0;r<4;++r) {
+                int m=m0+warp*16+group+(r%2)*8;
+                if(m<M && base+step*32<K)
+                    uf_split(weight+static_cast<int64_t>(m)*K+base+step*32+quad*4+(r/2)*16,al[step][r],ah[step][r]);
+            }
+        }
+        #pragma unroll
+        for(int tile=0;tile<BN/8;++tile) {
+            uint32_t bl[STEPS][2]={},bh[STEPS][2]={};
+            int n=n0+tile*8+group;
+            #pragma unroll
+            for(int step=0;step<STEPS;++step) {
+                #pragma unroll
+                for(int r=0;r<2;++r)
+                    if(n<N && base+step*32<K)
+                        uf_split(x+(static_cast<int64_t>(blockIdx.z)*N+n)*K+base+step*32+quad*4+r*16,bl[step][r],bh[step][r]);
+            }
+            #pragma unroll
+            for(int step=0;step<STEPS;++step) {
+                uf_mma_bytes<false,false>(ll[tile],al[step],bl[step]);
+                uf_mma_bytes<true,false>(cross[tile],ah[step],bl[step]);
+                uf_mma_bytes<false,true>(cross[tile],al[step],bh[step]);
+                uf_mma_bytes<true,true>(hh[tile],ah[step],bh[step]);
+            }
+        }
+    }
+    #pragma unroll
+    for(int tile=0;tile<BN/8;++tile) {
+        #pragma unroll
+        for(int r=0;r<4;++r) {
+            int m=m0+warp*16+group+(r/2)*8,n=n0+tile*8+quad*2+r%2;
+            int64_t sum=static_cast<int64_t>(ll[tile][r])+
+                static_cast<int64_t>(static_cast<int32_t>(cross[tile][r]))*256+
+                static_cast<int64_t>(static_cast<int32_t>(hh[tile][r]))*65536;
+            if constexpr(REDUCE4) {
+                int value=(m<M && n<N)?lut[static_cast<int>(finish(sum,bias?bias[m]:0))+32768]:0;
+                value+=__shfl_xor_sync(0xffffffff,value,4);
+                value+=__shfl_xor_sync(0xffffffff,value,8);
+                if(group%4==0 && m<M && n<N)
+                    out[(static_cast<int64_t>(blockIdx.z)*(M/4)+m/4)*N+n]=
+                        value<-32768?-32768:(value>32767?32767:value);
+            } else if(m<M && n<N) {
+                int64_t index=(static_cast<int64_t>(blockIdx.z)*M+m)*N+n;
+                out[index]=postprocess(finish(sum,bias?bias[m]:0),lut,residual,shortcut,index);
+            }
+        }
+    }
+#else
+    for(int i=threadIdx.x;i<(WARPS*16)*BN;i+=blockDim.x) {
+        int m=blockIdx.y*(WARPS*16)+i/BN,n=blockIdx.x*BN+i%BN;
+        if(m>=M || n>=N) continue;
+        if constexpr(REDUCE4) { if(m%4) continue; }
+        int value=0;
+        for(int row=0;row<(REDUCE4?4:1);++row) {
+            int64_t sum=0;
+            for(int k=0;k<K;++k)
+                sum+=static_cast<int64_t>(x[(static_cast<int64_t>(blockIdx.z)*N+n)*K+k])*weight[static_cast<int64_t>(m+row)*K+k];
+            int16_t rounded=finish(sum,bias?bias[m+row]:0);
+            if constexpr(REDUCE4) value+=lut[static_cast<int>(rounded)+32768];
+            else value=rounded;
+        }
+        int64_t index=(static_cast<int64_t>(blockIdx.z)*(REDUCE4?M/4:M)+(REDUCE4?m/4:m))*N+n;
+        int16_t rounded=value<-32768?-32768:(value>32767?32767:value);
+        out[index]=REDUCE4?rounded:postprocess(rounded,lut,residual,shortcut,index);
+    }
+#endif
+}
+
 template<bool POINTWISE>
 __device__ int16_t uf_mma_input(const int16_t* x,int batch,int k,int n,int K,
     int H,int W,int OW,int KH,int KW,int SH,int SW,int PH,int PW) {
@@ -37,25 +120,27 @@ __device__ int16_t uf_mma_input(const int16_t* x,int batch,int k,int n,int K,
     return x[((static_cast<int64_t>(batch)*(K/area)+k/area)*H+y)*W+col];
 }
 
-template<bool POINTWISE, int A_PADDING=0, int TILE_N=32, int TILE_K=32, bool REDUCE4=false>
+template<bool POINTWISE, int A_PADDING=0, int TILE_N=32, int TILE_K=32, bool REDUCE4=false,
+         int B_PADDING=2>
 __global__ __launch_bounds__(128) void uf_mma_conv(int16_t* out,const int16_t* x,
     const int16_t* weight,const int16_t* bias,int M,int N,int K,int H,int W,int OW,
-    int KH,int KW,int SH,int SW,int PH,int PW,const int16_t* lut) {
-    constexpr int BM=64, BN=TILE_N, BK=TILE_K;
+    int KH,int KW,int SH,int SW,int PH,int PW,const int16_t* lut,
+    const int16_t* residual,const int16_t* shortcut) {
+    constexpr int BM=64, BN=TILE_N, BK=TILE_K, THREADS=128;
 #if __CUDA_ARCH__ >= 800
     __shared__ __align__(4) int16_t a_tile[BM][BK+A_PADDING];
-    __shared__ __align__(4) int16_t b_tile[BN][BK+2];
+    __shared__ __align__(4) int16_t b_tile[BN][BK+B_PADDING];
     const int tid=threadIdx.x,warp=tid/32,lane=tid%32;
     const int group=lane/4,quad=lane%4,m0=blockIdx.y*BM,n0=blockIdx.x*BN;
     uint32_t ll[BN/8][4]={},cross[BN/8][4]={},hh[BN/8][4]={};
     for(int k0=0;k0<K;k0+=BK) {
         #pragma unroll
-        for(int i=tid;i<BM*BK;i+=128) {
+        for(int i=tid;i<BM*BK;i+=THREADS) {
             const int m=m0+i/BK,k=k0+i%BK;
             a_tile[i/BK][i%BK]=(m<M && k<K)?weight[static_cast<int64_t>(m)*K+k]:0;
         }
         #pragma unroll
-        for(int i=tid;i<BK*BN;i+=128) {
+        for(int i=tid;i<BK*BN;i+=THREADS) {
             const int k=k0+i/BN,n=n0+i%BN;
             b_tile[i%BN][i/BN]=(k<K && n<N)?uf_mma_input<POINTWISE>(x,blockIdx.z,k,n,K,H,W,OW,KH,KW,SH,SW,PH,PW):0;
         }
@@ -98,7 +183,8 @@ __global__ __launch_bounds__(128) void uf_mma_conv(int16_t* out,const int16_t* x
                     out[(static_cast<int64_t>(blockIdx.z)*(M/4)+m/4)*N+n]=
                         value<-32768?-32768:(value>32767?32767:value);
             } else if(m<M && n<N) {
-                out[(static_cast<int64_t>(blockIdx.z)*M+m)*N+n]=finish(sum,bias?bias[m]:0);
+                int64_t index=(static_cast<int64_t>(blockIdx.z)*M+m)*N+n;
+                out[index]=postprocess(finish(sum,bias?bias[m]:0),lut,residual,shortcut,index);
             }
         }
     }
@@ -117,8 +203,9 @@ __global__ __launch_bounds__(128) void uf_mma_conv(int16_t* out,const int16_t* x
             if constexpr(REDUCE4) value+=lut[static_cast<int>(rounded)+32768];
             else value=rounded;
         }
-        out[(static_cast<int64_t>(blockIdx.z)*(REDUCE4?M/4:M)+(REDUCE4?m/4:m))*N+n]=
-            value<-32768?-32768:(value>32767?32767:value);
+        int64_t index=(static_cast<int64_t>(blockIdx.z)*(REDUCE4?M/4:M)+(REDUCE4?m/4:m))*N+n;
+        int16_t rounded=value<-32768?-32768:(value>32767?32767:value);
+        out[index]=REDUCE4?rounded:postprocess(rounded,lut,residual,shortcut,index);
     }
 #endif
 }

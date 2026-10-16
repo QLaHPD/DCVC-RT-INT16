@@ -35,6 +35,12 @@ def worker(options, index, processes, barrier, connection):
             reference_layers = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(reference_layers)
             layers_backend.Layers = reference_layers.Layers
+        if options.archive_source:
+            import src.archive.codec as archive_backend
+            spec = importlib.util.spec_from_file_location('src.archive._benchmark_codec', options.archive_source)
+            reference_archive = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(reference_archive)
+            archive_backend.Codec = reference_archive.Codec
         import src.int16.codec as backend
         from src.archive.media import FrameReader, decoder_thread_budget, dimensions, probe
         import uf_int16_cuda
@@ -56,6 +62,10 @@ def worker(options, index, processes, barrier, connection):
             prepared_i=next((ROOT / 'checkpoints').glob('cvpr2026_image.*.int16.pt')),
             prepared_p=next((ROOT / 'checkpoints').glob(f'cvpr2026_video_{options.variant}.*.int16.pt')),
             skip_threshold=options.skip_thres)
+        coordinated = (options.gpu_scheduling == 'auto' and processes > 1 and options.variant == 'htl'
+                       and not options.model_source and min(width, height) >= 144)
+        if coordinated:
+            codec.set_gpu_gate(Path(options.output)/'gpu.lock')
         torch.cuda.synchronize(codec.device)
         initialization_seconds = time.monotonic() - initialized
         threads = options.input_threads or decoder_thread_budget(processes)
@@ -83,15 +93,23 @@ def worker(options, index, processes, barrier, connection):
         assert len({r['bitstream_sha256'] for r in runs}) == 1, 'nondeterministic bitstream'
         validation = None
         if options.verify:
+            # Keep verification GPU work outside every worker's encode interval.
+            barrier.wait(timeout=180)
+            validation_started = time.monotonic()
             validation = codec.decode(output / '0.bin', dict(
                 width=width, height=height, frames=runs[0]['frames'], packets=runs[0]['packets']))
+            validation.update(started=validation_started, finished=time.monotonic())
         connection.send(dict(worker=index, initialization_seconds=initialization_seconds,
                              peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,
                              torch_version=torch.__version__, cuda_version=torch.version.cuda,
                              gpu=torch.cuda.get_device_name(codec.device),
+                             model_module=type(codec.image).__module__,
+                             layers_module=type(codec.image.layers).__module__,
+                             archive_module=codec.encode.__module__,
                              kernel_revision=getattr(uf_int16_cuda, 'kernel_revision', None),
                              native_library_sha256=hashlib.sha256(Path(uf_int16_cuda.__file__).read_bytes()).hexdigest(),
                              model_preamble=codec.preamble.hex(),
+                             gpu_scheduling='serialized' if coordinated else 'concurrent',
                              input_threads=threads, width=width, height=height,
                              runs=runs, validation=validation))
     except BaseException:
@@ -111,6 +129,7 @@ def main():
     parser.add_argument('--frames', type=int, default=257)
     parser.add_argument('--repeat', type=int, default=3)
     parser.add_argument('--procs', type=int, nargs='+', default=[1, 2])
+    parser.add_argument('--gpu-scheduling', choices=('auto', 'concurrent'), default='auto')
     parser.add_argument('--input-threads', type=int)
     parser.add_argument('--qp-i', type=int, default=10)
     parser.add_argument('--qp-p', type=int, default=14)
@@ -118,6 +137,7 @@ def main():
     parser.add_argument('--intra-period', type=int, default=-1)
     parser.add_argument('--skip-thres', type=float, default=0.2)
     parser.add_argument('--verify', action='store_true', help='Decode in memory and record pixel hashes; never save decoded video')
+    parser.add_argument('--archive-source', help='Saved src/archive/codec.py for a complete older verification path')
     parser.add_argument('--model-source', help='Saved src/int16/model.py for comparison against an older implementation')
     parser.add_argument('--layers-source', help='Saved src/int16/layers.py for a complete older implementation')
     parser.add_argument('--native-library', help='Saved uf_int16_cuda extension for a complete older implementation')
@@ -129,8 +149,11 @@ def main():
     model_source = Path(options.model_source) if options.model_source else ROOT / 'src/int16/model.py'
     report = dict(options=vars(options), groups=[],
                   input_sha256=hashlib.sha256(Path(options.input).read_bytes()).hexdigest(),
+                  benchmark_source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   model_source_sha256=hashlib.sha256(model_source.read_bytes()).hexdigest())
     layers_source = Path(options.layers_source) if options.layers_source else ROOT / 'src/int16/layers.py'
+    archive_source = Path(options.archive_source) if options.archive_source else ROOT / 'src/archive/codec.py'
+    report['archive_source_sha256'] = hashlib.sha256(archive_source.read_bytes()).hexdigest()
     report['layers_source_sha256'] = hashlib.sha256(layers_source.read_bytes()).hexdigest()
     context = multiprocessing.get_context('spawn')
     for processes in options.procs:
@@ -175,6 +198,10 @@ def main():
                      aggregate_pipeline_fps=aggregate,
                      median_aggregate_pipeline_fps=statistics.median(aggregate),
                      total_seconds=time.monotonic()-started)
+        if options.verify:
+            validations = [w['validation'] for w in workers]
+            elapsed = max(v['finished'] for v in validations)-min(v['started'] for v in validations)
+            group['aggregate_verification_fps'] = sum(v['decoded_frames'] for v in validations)/elapsed
         report['groups'].append(group)
         (output / 'results.json').write_text(json.dumps(report, indent=2)+'\n')
         print(json.dumps({k: v for k, v in group.items() if k != 'workers'}), flush=True)

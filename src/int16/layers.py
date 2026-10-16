@@ -13,7 +13,40 @@ class Layers:
         self.values = {name: value.to(device) for name, value in prepared['tensors'].items()
                        if not name.startswith(('tables.z_', 'tables.y_'))}
         self._fused_ffns = {}
+        self._fused_blocks = {}
+        self._native_blocks = {}
+        self._native_block = None
+        post_native = False
+        if torch.device(device).type == 'cuda':
+            import uf_int16_cuda
+            post_native = callable(getattr(uf_int16_cuda, 'conv2d_post', None))
+            self._native_block = getattr(uf_int16_cuda, 'depth_conv_block', None)
         for module in model.modules():
+            if (post_native and type(module).__name__ in ('DepthConvBlock', 'SpatialPriorAdaptor')
+                    and len(module.dc) == 4 and len(module.ffn) == 3
+                    and type(module.dc[1]).__name__ == 'WSiLU'
+                    and type(module.ffn[1]).__name__ == 'WSiLUChunkAdd'):
+                convolutions = (module.dc[0], module.dc[3], module.ffn[0], module.ffn[2])
+                if all(isinstance(conv, nn.Conv2d) and conv.kernel_size == (1, 1)
+                       and conv.stride == (1, 1) and conv.padding == (0, 0)
+                       and conv.dilation == (1, 1) and conv.groups == 1
+                       and conv.padding_mode == 'zeros' for conv in convolutions):
+                    params = []
+                    for conv in convolutions:
+                        prefix = self.names[id(conv)]
+                        params.extend((self.values[prefix+'.weight'], self.values.get(prefix+'.bias')))
+                    self._fused_blocks[id(module)] = (module.dc[2], *params)
+                    depth = module.dc[2]
+                    if (callable(self._native_block) and isinstance(depth, nn.Conv2d)
+                            and depth.kernel_size == (3, 3) and depth.stride == (1, 1)
+                            and depth.padding == (1, 1) and depth.dilation == (1, 1)
+                            and depth.groups == depth.in_channels == depth.out_channels
+                            and depth.padding_mode == 'zeros'):
+                        blocks = (module.dc[0], depth, module.dc[3], module.ffn[0], module.ffn[2])
+                        prefixes = [self.names[id(conv)] for conv in blocks]
+                        self._native_blocks[id(module)] = (
+                            [self.values[prefix+'.weight'] for prefix in prefixes],
+                            [self.values.get(prefix+'.bias') for prefix in prefixes], module.shortcut)
             if not isinstance(module, nn.Sequential) or len(module) != 3:
                 continue
             conv = module[0]
@@ -59,6 +92,19 @@ class Layers:
                 x = torch.cat(args, dim=1)
             if module.adaptor is not None:
                 x = self(module.adaptor, x)
+            native = self._native_blocks.get(id(module))
+            if native is not None:
+                weights, biases, shortcut = native
+                return self._native_block(x, weights, biases, self.values['tables.wsilu'], shortcut)
+            fused = self._fused_blocks.get(id(module))
+            if fused is not None:
+                depth, w0, b0, w1, b1, w2, b2, w3, b3 = fused
+                lut = self.values['tables.wsilu']
+                out = self(depth, ops.conv2d_post(x, w0, b0, lut=lut))
+                out = ops.conv2d_post(out, w1, b1, residual=x)
+                expanded = ops.conv2d_wsilu4(out, w2, b2, lut)
+                return ops.conv2d_post(expanded, w3, b3, residual=out,
+                                       shortcut=x if module.shortcut else None)
             out = ops.add(self(module.dc, x), x)
             out = ops.add(self(module.ffn, out), out)
             return ops.add(out, x) if module.shortcut else out

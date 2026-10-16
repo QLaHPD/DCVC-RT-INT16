@@ -25,6 +25,7 @@ class IntegerModel:
         from src.models.entropy_models import EntropyCoder
         self.variant = prepared['variant']
         self.reconstruct_on_encode = reconstruct_on_encode
+        self.gpu_gate = None
         self.device = torch.device(device)
         self.model = make_model(self.variant, meta=True)
         self.layers = Layers(self.model, prepared, self.device)
@@ -207,6 +208,16 @@ class IntegerModel:
 
     @torch.no_grad()
     def compress(self, x, qp, *args):
+        if self.gpu_gate is None or self.device.type != 'cuda' or min(x.shape[-2:]) < 144:
+            return self._compress(x, qp, *args)
+        with self.gpu_gate:
+            try:
+                return self._compress(x, qp, *args)
+            finally:
+                # Release the run's GPU slot only after queued reconstruction.
+                torch.cuda.synchronize(self.device)
+
+    def _compress(self, x, qp, *args):
         image = self.variant == 'image'
         reset = False if image else args[0]
         x = pad_right_bottom(x, 16)
@@ -228,8 +239,9 @@ class IntegerModel:
         self.coder.encoder.encode_z(z.permute(0,2,3,1).contiguous().cpu().numpy(),
                                     qp*m.z_channel, m.z_channel)
         self.coder.encoder.flush()
-        bits = self.coder.encoder.get_encoded_stream().tobytes()
+        # The rANS worker can finish while reconstruction is queued on the GPU.
         frames = self._reconstruct(y_hat, qp, reset, self.reconstruct_on_encode)
+        bits = self.coder.encoder.get_encoded_stream().tobytes()
         return {'bit_stream': bits, 'x_hat': frames, 'ec_parallel': 1}
 
     @torch.no_grad()

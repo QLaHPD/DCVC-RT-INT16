@@ -147,7 +147,7 @@ class Codec:
                 if len(frames) != (1 if is_i else self.chunk_size):
                     raise ValueError('UF decoder returned an unexpected chunk length')
                 for frame in frames[:total-count]:
-                    if not torch.isfinite(frame).all():
+                    if frame.is_floating_point() and not torch.isfinite(frame).all():
                         raise ValueError('Decoder produced non-finite pixels')
                     raw = self.raw_frame(frame, sps['width'], sps['height'])
                     digest.update(raw)

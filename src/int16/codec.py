@@ -54,6 +54,13 @@ class IntegerCodec(Codec):
         if self.video is not None:
             self.video.skip_threshold = threshold
 
+    def set_gpu_gate(self, path):
+        from .scheduling import GpuGate
+        gate = GpuGate(path) if path and self.device.type == 'cuda' and self.variant == 'htl' else None
+        self.image.gpu_gate = gate
+        if self.video is not None:
+            self.video.gpu_gate = gate
+
     def tensor(self, frames):
         values = torch.from_numpy(np.concatenate(frames, axis=0)).unsqueeze(0).to(self.device)
         return ops.from_bytes(values)
@@ -67,6 +74,11 @@ class IntegerCodec(Codec):
 
     @staticmethod
     def raw_frame(frame, width, height):
+        if frame.is_cuda:
+            import uf_int16_cuda
+            fused = getattr(uf_int16_cuda, 'raw_frame', None)
+            if fused is not None:
+                return fused(frame, width, height).cpu().numpy().tobytes()
         values = frame[0, :, :height, :width].long()
         y = ops.divide_round((values[0]+ops.FEATURE_SCALE//2)*255, ops.FEATURE_SCALE)
         uv = values[1:]
