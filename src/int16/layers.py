@@ -12,6 +12,19 @@ class Layers:
         self.names = {id(module): name for name, module in model.named_modules()}
         self.values = {name: value.to(device) for name, value in prepared['tensors'].items()
                        if not name.startswith(('tables.z_', 'tables.y_'))}
+        self._fused_ffns = {}
+        for module in model.modules():
+            if not isinstance(module, nn.Sequential) or len(module) != 3:
+                continue
+            conv = module[0]
+            if (not isinstance(conv, nn.Conv2d) or type(module[1]).__name__ != 'WSiLUChunkAdd'
+                    or conv.kernel_size != (1, 1) or conv.stride != (1, 1)
+                    or conv.padding != (0, 0) or conv.dilation != (1, 1)
+                    or conv.groups != 1 or conv.padding_mode != 'zeros'):
+                continue
+            prefix = self.names[id(conv)]
+            self._fused_ffns[id(module)] = (self.values[prefix+'.weight'],
+                                           self.values.get(prefix+'.bias'), module[2])
 
     def parameter(self, name, qp):
         return self.values[name][qp:qp+1, :, None, None]
@@ -22,6 +35,10 @@ class Layers:
             raise TypeError(f'Integer layer received {x.dtype}')
         name = type(module).__name__
         if isinstance(module, nn.Sequential):
+            fused = self._fused_ffns.get(id(module))
+            if fused is not None:
+                weight, bias, projection = fused
+                return self(projection, ops.conv2d_wsilu4(x, weight, bias, self.values['tables.wsilu']))
             for child in module:
                 x = self(child, x)
             return x

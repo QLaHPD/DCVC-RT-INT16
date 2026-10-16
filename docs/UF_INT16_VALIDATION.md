@@ -1,5 +1,110 @@
 # UF integer validation on Jetson Orin
 
+## Python integer convolutions — 2026-10-16
+
+Further optimization of the Python INT16 runtime combines pointwise convolution
+with WSiLU and its four-channel reduction. Convolution rounding and saturation
+still happen before each activation lookup, followed by the original sum and
+saturation. Small spatial convolutions now materialize their receptive fields
+once before the integer matrix kernel, with temporary storage capped at 8 MiB.
+Pointwise tile selection was also adjusted using measured kernel timings.
+Prepared weights, CDFs, arithmetic identity and bitstream format are unchanged.
+CPU inference and older native extensions retain the original operations.
+
+Same Orin Nano and 1.02 GHz GPU, same local moving FFV1 synthetic input and
+HT-L INT16 settings as the preceding optimization round: QI10/QP14, reset 2, intra -1,
+skip 0.2 and 30 source FPS. Each value is the median of three runs after a
+17-frame warmup, including FFmpeg input and bitstream writes and excluding
+model initialization and verification. The larger test resizes that local
+source to 512×288. Two workers share the GPU and process separate copies.
+
+| Dimensions | Frames per worker | Workers | Previous FPS | New FPS | Gain |
+|---|---:|---:|---:|---:|---:|
+| 256×144 | 257 | 1 | 80.64 | 84.64 | 4.9% |
+| 256×144 | 257 | 2, aggregate | 74.28 | 77.98 | 5.0% |
+| 512×288 | 129 | 1 | 20.74 | 22.47 | 8.3% |
+| 512×288 | 129 | 2, aggregate | 19.03 | 20.37 | 7.0% |
+
+The 144p control restored the saved previous Python model, layer dispatcher
+and native library, reproducing 80.62 FPS and 74.20 aggregate FPS. The 288p
+baseline also used that complete previous implementation. Native library and
+Python source hashes are recorded by the benchmark. The fused activation
+alone measured 80.95 / 74.65 FPS; the spatial packing and tile selection account
+for most of this round's improvement.
+
+All measured bitstreams and decoded YUV hashes match the previous version.
+The 12 HT-L/HT-S/LD cross-decoding cases additionally restore the older layer
+dispatcher and CUDA library, and match the saved original fixture hashes in
+both decoding directions. They cover skip off/on, resets, repeated I-frames,
+partial chunks and padding at changed dimensions. Full-range CUDA arithmetic
+is checked against the independent CPU reference, including partial tiles,
+batching, ties, overflow bounds and saturation between the fused operations.
+All 107 regression tests passed. Two-worker archive CLI encoding and resume
+also passed with `--fps 4`; both archives contain 34 frames. The raw synthetic
+CLI decode outputs were hashed and removed. Benchmarks and cross-decoding
+checks decode in memory and retain only hashes; use `main.py verify` for
+subsequent archive checks without writing decoded media.
+
+Rebuild the existing `uf_int16_cuda` extension with `MAX_JOBS=1` after updating.
+The native kernel revision is `ffn-v4`; its arithmetic version stays v1.
+Reproduction commands and complete comparison options are in the
+[benchmark instructions](../benchmarks/README.md#local-python-throughput).
+Local profiles, tile trials, frozen baseline source/library, stream fixtures
+and raw measurements are under `runs/python-speed-20261016/`.
+
+## Python fused spatial partitions — 2026-10-15
+
+The Python INT16 runtime now uses fused CUDA partition operations for symbol
+quantization, entropy indexes and latent reconstruction. Encoding transfers all
+spatial partitions together, then removes skipped symbols on the CPU. Decoding
+transfers indexes and skip flags together. The arithmetic ID, prepared model
+identities, rANS tables and bitstream format remain unchanged. CPU inference
+and older extensions without these operations retain the original path.
+
+Measured on the local Orin Nano with its GPU at 1.02 GHz, using a local FFV1
+`testsrc2` synthetic video: 257 frames, 256×144, 30 source FPS, HT-L INT16,
+QI10/QP14, reset interval 2, intra period -1 and skip threshold 0.2.
+Medians below use three repetitions after a 17-frame warmup. FPS includes
+FFmpeg input, bounded prefetch and bitstream writes; it excludes model loading
+and verification decoding. Two workers process separate copies concurrently
+on the same GPU; their aggregate FPS uses the elapsed span across both workers.
+
+| Workers | Before (FPS) | Fused partitions (FPS) | Improvement |
+|---:|---:|---:|---:|
+| 1 | 72.98 | 80.31 | 10.0% |
+| 2, aggregate | 69.46 | 74.21 | 6.8% |
+
+Every measured stream is byte-for-byte identical to its saved pre-change
+baseline (10,891 bytes), and decoded YUV SHA-256 hashes match. The 12 additional
+cross-decoding cases cover HT-L/HT-S/LD, skip off/on, frequent resets, repeated
+I-frames, partial final chunks and changed input dimensions. For every case,
+the new decoder reads the original implementation's stream and the original
+decoder reads the new stream with identical pixels. All 103 regression tests
+passed, including full-range arithmetic and independent CPU checks of the
+new partition kernels.
+
+A separate check decoded the saved 257-frame pre-change file directly with the
+new decoder and matched its original pixel hash. Forcing the original path
+also reproduced the original bitstream and pixels through the older-extension
+fallback. The normal archive CLI encoded and batch-decoded two local synthetic
+videos with two workers and `--fps 4`; both outputs contained 34 frames and had
+identical decoded hashes. Synthetic sources have no YouTube `info.json`; use
+`--allow-missing-metadata --keep-originals` when checking their archive inventory.
+The baseline control rerun reproduced 72.63 FPS (one worker) and 69.52 FPS
+(two workers), consistent with the initial baseline above.
+
+Rebuild the existing extension to enable the fast path:
+
+```bash
+MAX_JOBS=1 ./scripts/uf-python -m pip install --no-build-isolation ./src/int16/native
+```
+
+See [the reproducible synthetic benchmark](../benchmarks/README.md#local-python-throughput).
+Local raw measurements, pre-change model source and compatibility fixtures are
+under `runs/python-speed-20261015/`. These FPS figures describe this workload
+and hardware; download/network throughput and other resolutions were not part
+of this measurement.
+
 ## HT-L 144p indexing and CUDA tiles — 2026-09-12
 
 Compared with `07ffd08` using the same initialized HT-L model, QI36/QP30,

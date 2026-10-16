@@ -37,10 +37,10 @@ __device__ int16_t uf_mma_input(const int16_t* x,int batch,int k,int n,int K,
     return x[((static_cast<int64_t>(batch)*(K/area)+k/area)*H+y)*W+col];
 }
 
-template<bool POINTWISE, int A_PADDING=0, int TILE_N=32, int TILE_K=32>
+template<bool POINTWISE, int A_PADDING=0, int TILE_N=32, int TILE_K=32, bool REDUCE4=false>
 __global__ __launch_bounds__(128) void uf_mma_conv(int16_t* out,const int16_t* x,
     const int16_t* weight,const int16_t* bias,int M,int N,int K,int H,int W,int OW,
-    int KH,int KW,int SH,int SW,int PH,int PW) {
+    int KH,int KW,int SH,int SW,int PH,int PW,const int16_t* lut) {
     constexpr int BM=64, BN=TILE_N, BK=TILE_K;
 #if __CUDA_ARCH__ >= 800
     __shared__ __align__(4) int16_t a_tile[BM][BK+A_PADDING];
@@ -84,10 +84,20 @@ __global__ __launch_bounds__(128) void uf_mma_conv(int16_t* out,const int16_t* x
         #pragma unroll
         for(int r=0;r<4;++r) {
             int m=m0+warp*16+group+(r/2)*8,n=n0+tile*8+quad*2+r%2;
-            if(m<M && n<N) {
-                int64_t sum=static_cast<int64_t>(ll[tile][r])+
-                    static_cast<int64_t>(static_cast<int32_t>(cross[tile][r]))*256+
-                    static_cast<int64_t>(static_cast<int32_t>(hh[tile][r]))*65536;
+            int64_t sum=static_cast<int64_t>(ll[tile][r])+
+                static_cast<int64_t>(static_cast<int32_t>(cross[tile][r]))*256+
+                static_cast<int64_t>(static_cast<int32_t>(hh[tile][r]))*65536;
+            if constexpr(REDUCE4) {
+                // Round/saturate each convolution output before its LUT lookup.
+                // Adjacent channel rows occupy lanes four places apart. All
+                // lanes participate, including spatial and channel tail lanes.
+                int value=(m<M && n<N)?lut[static_cast<int>(finish(sum,bias?bias[m]:0))+32768]:0;
+                value+=__shfl_xor_sync(0xffffffff,value,4);
+                value+=__shfl_xor_sync(0xffffffff,value,8);
+                if(group%4==0 && m<M && n<N)
+                    out[(static_cast<int64_t>(blockIdx.z)*(M/4)+m/4)*N+n]=
+                        value<-32768?-32768:(value>32767?32767:value);
+            } else if(m<M && n<N) {
                 out[(static_cast<int64_t>(blockIdx.z)*M+m)*N+n]=finish(sum,bias?bias[m]:0);
             }
         }
@@ -97,10 +107,18 @@ __global__ __launch_bounds__(128) void uf_mma_conv(int16_t* out,const int16_t* x
     for(int i=threadIdx.x;i<BM*BN;i+=blockDim.x) {
         int m=blockIdx.y*BM+i/BN,n=blockIdx.x*BN+i%BN;
         if(m>=M || n>=N) continue;
-        int64_t sum=0;
-        for(int k=0;k<K;++k)
-            sum+=static_cast<int64_t>(uf_mma_input<POINTWISE>(x,blockIdx.z,k,n,K,H,W,OW,KH,KW,SH,SW,PH,PW))*weight[static_cast<int64_t>(m)*K+k];
-        out[(static_cast<int64_t>(blockIdx.z)*M+m)*N+n]=finish(sum,bias?bias[m]:0);
+        if constexpr(REDUCE4) { if(m%4) continue; }
+        int value=0;
+        for(int row=0;row<(REDUCE4?4:1);++row) {
+            int64_t sum=0;
+            for(int k=0;k<K;++k)
+                sum+=static_cast<int64_t>(uf_mma_input<POINTWISE>(x,blockIdx.z,k,n,K,H,W,OW,KH,KW,SH,SW,PH,PW))*weight[static_cast<int64_t>(m+row)*K+k];
+            int16_t rounded=finish(sum,bias?bias[m+row]:0);
+            if constexpr(REDUCE4) value+=lut[static_cast<int>(rounded)+32768];
+            else value=rounded;
+        }
+        out[(static_cast<int64_t>(blockIdx.z)*(REDUCE4?M/4:M)+(REDUCE4?m/4:m))*N+n]=
+            value<-32768?-32768:(value>32767?32767:value);
     }
 #endif
 }

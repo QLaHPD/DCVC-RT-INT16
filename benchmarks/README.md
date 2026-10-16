@@ -29,3 +29,51 @@ For `--target-psnr 30`, trial **783** is selected:
 These are reference measurements, not a promise that arbitrary videos reach
 the same PSNR or encode at the same speed. The selector does not retrain models,
 measure input quality, or run an extra encode/decode pass.
+
+## Local Python throughput
+
+`benchmark_python_uf.py` measures the INT16 Python path with FFmpeg input,
+bounded frame prefetch and bitstream writes. It uses existing prepared UF
+checkpoints and never downloads media or models. Generate a moving synthetic
+video and run one and two synchronized workers:
+
+```bash
+mkdir -p runs/python-speed
+ffmpeg -v error -f lavfi -i testsrc2=size=256x144:rate=30 -frames:v 257 -c:v ffv1 -threads 1 runs/python-speed/synthetic.mkv
+./scripts/uf-python benchmarks/benchmark_python_uf.py --input runs/python-speed/synthetic.mkv --output runs/python-speed/measured --verify
+```
+
+The output directory must be new. The default settings are HT-L, 144p,
+QI10/QP14, reset interval 2, skip threshold 0.2, three measured repetitions
+and a 17-frame warmup. `--procs 1 2` selects worker counts; `--variant`,
+`--resolution`, `--fps` and codec options permit other workloads.
+`results.json` records each worker's FPS, startup time, peak RSS, stream hashes
+and optional decoded pixel hashes. Aggregate pipeline FPS divides total frames
+by the elapsed span across all workers, including FFmpeg input startup and
+shutdown. Model initialization and verification decoding are excluded from
+that number and reported separately. Two workers share the GPU, so aggregate
+throughput need not exceed one worker's throughput.
+
+`--verify` decodes in memory, hashes each frame and discards its pixels; no raw
+YUV or other decoded media is written. Cross-decoding checks also keep only
+pixel hashes. For the normal archive CLI, use `main.py verify --input_file
+ARCHIVE.uf.json` for the same bounded verification without an output video.
+
+`--model-source /path/to/saved/model.py` runs an earlier saved Python model
+implementation with the same benchmark. Add `--layers-source` and
+`--native-library` to restore the saved layer dispatcher and native extension
+as well. The report records source and native-library SHA-256 hashes, so a
+control run can prove that it used the previous implementation.
+`check_python_uf_compat.py` compares
+that saved implementation with the current model, requiring identical streams
+and decoded pixel hashes in both decoding directions. It covers skip on/off,
+frequent resets, repeated I-frames, partial final chunks and changed dimensions:
+
+```bash
+./scripts/uf-python benchmarks/check_python_uf_compat.py --input runs/python-speed/synthetic.mkv --reference-model /path/to/saved/model.py --output runs/python-speed/compat-htl --variant htl
+```
+
+Run separate invocations with `--variant hts` and `--variant ld` to cover the
+other UF topologies without holding multiple codec models in memory. Use
+`--reference-layers` and `--reference-native` with saved files to cross-decode
+against the complete older implementation, including its original CUDA kernels.

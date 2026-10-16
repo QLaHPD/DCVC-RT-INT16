@@ -107,3 +107,13 @@ def conv2d(x, weight, bias=None, stride=(1, 1), padding=(0, 0), groups=1):
         return conv2d_reference(x, weight, bias, stride, padding, groups)
     from uf_int16_cuda import conv2d as native_conv
     return native_conv(x, weight, bias, *stride, *padding, groups)
+
+
+def conv2d_wsilu4(x, weight, bias, lut):
+    """Pointwise convolution and WSiLUChunkAdd, preserving both saturations."""
+    if x.is_cuda and x.shape[1] <= 32768:
+        import uf_int16_cuda
+        fused = getattr(uf_int16_cuda, 'conv2d_wsilu4', None)
+        if fused is not None:
+            return fused(x, weight, bias, lut)
+    return wsilu4(conv2d(x, weight, bias), lut)

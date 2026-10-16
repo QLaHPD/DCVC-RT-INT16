@@ -58,9 +58,19 @@ __global__ void general(int16_t* out, const int16_t* x, const int16_t* weight,
     out[index]=finish(sum,bias?bias[oc]:0);
 }
 
-template<int A_PADDING=0, int TILE_N=32, int TILE_K=32>
+__global__ void unfold_int16(int16_t* out,const int16_t* x,int count,int ci,int h,int w,
+    int oh,int ow,int kh,int kw,int sh,int sw,int ph,int pw) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=count) return;
+    int n=i%(oh*ow),k=(i/(oh*ow))%(ci*kh*kw),batch=i/(ci*kh*kw*oh*ow);
+    int iy=(n/ow)*sh+(k%(kh*kw))/kw-ph,ix=(n%ow)*sw+k%kw-pw;
+    out[i]=(iy>=0 && iy<h && ix>=0 && ix<w)?x[((batch*ci+k/(kh*kw))*h+iy)*w+ix]:0;
+}
+
+template<int A_PADDING=0, int TILE_N=32, int TILE_K=32, bool REDUCE4=false, bool PACK=false>
 static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tensor& weights,
-    const c10::optional<torch::Tensor>& bias, int sh,int sw,int ph,int pw,int groups,bool use_mma) {
+    const c10::optional<torch::Tensor>& bias, int sh,int sw,int ph,int pw,int groups,bool use_mma,
+    const c10::optional<torch::Tensor>& table=c10::nullopt) {
     TORCH_CHECK(input.is_cuda() && weights.device()==input.device(), "CUDA device mismatch");
     TORCH_CHECK(input.scalar_type()==at::kShort && weights.scalar_type()==at::kShort, "int16 required");
     TORCH_CHECK(input.dim()==4 && weights.dim()==4, "4D tensors required");
@@ -76,7 +86,14 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
     TORCH_CHECK(weight.size(1)*static_cast<int64_t>(kh)*kw < (INT64_MAX/1073741824LL)-1, "dot product overflow");
     int oh=(h+2*ph-kh)/sh+1,ow=(w+2*pw-kw)/sw+1;
     TORCH_CHECK(x.size(0)*static_cast<int64_t>(co)*oh*ow<=INT32_MAX,"convolution output exceeds indexing bounds");
-    auto out=torch::empty({x.size(0),co,oh,ow},x.options());
+    const int16_t* lut=nullptr;
+    if constexpr(REDUCE4) {
+        TORCH_CHECK(co%4==0 && groups==1 && kh==1 && kw==1 && sh==1 && sw==1 && ph==0 && pw==0 && ci<=32768,
+                    "fused WSiLU4 requires a pointwise convolution with groups of four output channels");
+        TORCH_CHECK(table.has_value() && table->device()==x.device() && table->scalar_type()==at::kShort &&
+                    table->dim()==1 && table->numel()==65536 && table->is_contiguous(), "invalid activation table");
+        lut=table->data_ptr<int16_t>();
+    }
     torch::Tensor bias_contiguous;
     const int16_t* ptr=nullptr;
     if(bias.has_value()) {
@@ -86,14 +103,29 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
     auto stream=c10::cuda::getCurrentCUDAStream();
     bool point=kh==1 && kw==1 && sh==1 && sw==1 && ph==0 && pw==0;
     int64_t reduction=static_cast<int64_t>(ci)*kh*kw;
+    if constexpr(PACK) {
+        // Materialize small receptive fields once instead of redoing spatial
+        // division/padding for every output-channel tile. Bound scratch to 8 MiB.
+        int64_t elements=x.size(0)*reduction*oh*ow;
+        if(use_mma && !point && groups==1 && co>=128 && reduction>=256 &&
+           reduction<=32768 && elements<=4*1024*1024) {
+            auto packed=torch::empty({x.size(0),reduction,oh,ow},x.options());
+            unfold_int16<<<(elements+255)/256,256,0,stream>>>(packed.data_ptr<int16_t>(),
+                x.data_ptr<int16_t>(),elements,ci,h,w,oh,ow,kh,kw,sh,sw,ph,pw);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return uf_conv_impl<16,32,64>(packed,weight.view({co,reduction,1,1}),bias,
+                                          1,1,0,0,1,true);
+        }
+    }
+    auto out=torch::empty({x.size(0),REDUCE4?co/4:co,oh,ow},x.options());
     if(use_mma && groups==1 && reduction<=32768) {
         dim3 grid((oh*ow+TILE_N-1)/TILE_N,(co+63)/64,x.size(0));
         if(point)
-            uf_mma_conv<true,A_PADDING,TILE_N,TILE_K><<<grid,128,0,stream>>>(out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),
-                weight.data_ptr<int16_t>(),ptr,co,oh*ow,reduction,h,w,ow,kh,kw,sh,sw,ph,pw);
+            uf_mma_conv<true,A_PADDING,TILE_N,TILE_K,REDUCE4><<<grid,128,0,stream>>>(out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),
+                weight.data_ptr<int16_t>(),ptr,co,oh*ow,reduction,h,w,ow,kh,kw,sh,sw,ph,pw,lut);
         else
-            uf_mma_conv<false,A_PADDING,TILE_N,TILE_K><<<grid,128,0,stream>>>(out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),
-                weight.data_ptr<int16_t>(),ptr,co,oh*ow,reduction,h,w,ow,kh,kw,sh,sw,ph,pw);
+            uf_mma_conv<false,A_PADDING,TILE_N,TILE_K,REDUCE4><<<grid,128,0,stream>>>(out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),
+                weight.data_ptr<int16_t>(),ptr,co,oh*ow,reduction,h,w,ow,kh,kw,sh,sw,ph,pw,lut);
     } else if(point && groups==1)
         pointwise<<<dim3((h*w+15)/16,(co+15)/16,x.size(0)),dim3(16,16),0,stream>>>(
             out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),weight.data_ptr<int16_t>(),ptr,h*w,ci,co);
@@ -111,11 +143,12 @@ torch::Tensor uf_conv(const torch::Tensor& x,const torch::Tensor& w,
         // Wider spatial tiles reuse weights on large, exactly tiled planes.
         // Otherwise reduce barrier frequency with 64-element K tiles.
         const int64_t spatial=x.size(2)*x.size(3);
-        if(spatial>=256 && spatial%64==0 && x.size(1)<=1024 && w.size(0)<=x.size(1))
-            return uf_conv_impl<16,64,32>(x,w,b,sh,sw,ph,pw,g,true);
+        if(spatial>=256 && spatial<=1024 && spatial%64==0 && x.size(1)>=384 &&
+           x.size(1)<=1024 && w.size(0)<=x.size(1))
+            return uf_conv_impl<16,64,64>(x,w,b,sh,sw,ph,pw,g,true);
         return uf_conv_impl<16,32,64>(x,w,b,sh,sw,ph,pw,g,true);
     }
-    return uf_conv_impl(x,w,b,sh,sw,ph,pw,g,true);
+    return uf_conv_impl<0,32,32,false,true>(x,w,b,sh,sw,ph,pw,g,true);
 }
 torch::Tensor uf_conv_generic(const torch::Tensor& x,const torch::Tensor& w,
     const c10::optional<torch::Tensor>& b,int sh,int sw,int ph,int pw,int g) {
@@ -124,4 +157,28 @@ torch::Tensor uf_conv_generic(const torch::Tensor& x,const torch::Tensor& w,
 torch::Tensor uf_conv_baseline(const torch::Tensor& x,const torch::Tensor& w,
     const c10::optional<torch::Tensor>& b,int sh,int sw,int ph,int pw,int g) {
     return uf_conv_impl(x,w,b,sh,sw,ph,pw,g,true);
+}
+
+template<bool REDUCE4>
+static torch::Tensor pointwise_tiled(const torch::Tensor& x,const torch::Tensor& w,
+    const c10::optional<torch::Tensor>& b,const c10::optional<torch::Tensor>& lut,int tile) {
+    TORCH_CHECK(x.dim()==4 && w.dim()==4 && w.size(2)==1 && w.size(3)==1,"pointwise tensors required");
+    switch(tile) {
+    case 1: return uf_conv_impl<16,16,64,REDUCE4>(x,w,b,1,1,0,0,1,true,lut);
+    case 2: return uf_conv_impl<16,32,64,REDUCE4>(x,w,b,1,1,0,0,1,true,lut);
+    case 3: return uf_conv_impl<16,64,32,REDUCE4>(x,w,b,1,1,0,0,1,true,lut);
+    case 4: return uf_conv_impl<16,64,64,REDUCE4>(x,w,b,1,1,0,0,1,true,lut);
+    case 5: return uf_conv_impl<16,32,128,REDUCE4>(x,w,b,1,1,0,0,1,true,lut);
+    default: TORCH_CHECK(false,"unsupported pointwise tile");
+    }
+}
+
+torch::Tensor uf_conv_tiled(const torch::Tensor& x,const torch::Tensor& w,
+    const c10::optional<torch::Tensor>& b,int tile) {
+    return pointwise_tiled<false>(x,w,b,c10::nullopt,tile);
+}
+
+torch::Tensor uf_conv_wsilu4(const torch::Tensor& x,const torch::Tensor& w,
+    const c10::optional<torch::Tensor>& b,const torch::Tensor& lut,int tile) {
+    return pointwise_tiled<true>(x,w,b,lut,tile?tile:2);
 }

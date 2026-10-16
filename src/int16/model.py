@@ -39,6 +39,12 @@ class IntegerModel:
         self._position_shape = None
         self._positions = None
         self.skip_threshold = 0
+        self._prior_native = None
+        if self.device.type == 'cuda':
+            import uf_int16_cuda
+            if all(hasattr(uf_int16_cuda, name) for name in
+                   ('prior_encode', 'prior_indexes', 'prior_restore')):
+                self._prior_native = uf_int16_cuda
         self.clear_dpb()
 
     def clear_dpb(self):
@@ -94,6 +100,7 @@ class IntegerModel:
         reduced = run(m.y_spatial_prior_reduction, params) if self.variant != 'ld' else None
         restored = torch.zeros(shape, dtype=torch.int16, device=self.device)
         pending = []
+        native = self._prior_native
         for part, position in enumerate(positions):
             if part:
                 if self.variant == 'ld':
@@ -105,6 +112,27 @@ class IntegerModel:
                         scales, means = next_params.chunk(2, dim=1)
                     else:
                         means = run(m.y_spatial_prior, run(adaptor, restored, reduced))
+            if native is not None:
+                table = run.values['tables.scale_index']
+                if encode:
+                    pending.append(native.prior_encode(y, scales, means, restored,
+                                                       position, table, self.skip_threshold))
+                else:
+                    # One fixed-size transfer contains both indexes and skip flags.
+                    indexes = native.prior_indexes(scales, position, table,
+                                                    self.skip_threshold).cpu().numpy()
+                    if self.skip_threshold:
+                        active = indexes >= 0
+                        symbols = np.zeros(indexes.size, dtype=np.int8)
+                        if active.any():
+                            self.coder.decoder.decode_y(indexes[active].astype(np.uint8))
+                            symbols[active] = self.coder.decoder.get_decoded_tensor()
+                    else:
+                        self.coder.decoder.decode_y(indexes.astype(np.uint8))
+                        symbols = self.coder.decoder.get_decoded_tensor()
+                    native.prior_restore(torch.from_numpy(symbols).to(self.device),
+                                         means, restored, position)
+                continue
             selected_scales = scales.reshape(-1).index_select(0, position)
             selected_means = means.reshape(-1).index_select(0, position).long()
             if self.skip_threshold:
@@ -137,6 +165,16 @@ class IntegerModel:
                 pending.append(packed.cpu().numpy().copy())
             restored.view(-1).index_copy_(0, position,
                 ops.saturate(symbols.long()*ops.FEATURE_SCALE + selected_means))
+        if native is not None and encode:
+            # All partitions can finish on the GPU before entropy input is read.
+            # Removing skipped entries on the CPU avoids GPU nonzero/any syncs.
+            packed = torch.cat(pending).cpu().numpy()
+            pending = []
+            offset = 0
+            for position in positions:
+                part = packed[offset:offset + position.numel()]
+                pending.append((part[part != 65536] if self.skip_threshold else part).astype(np.int16))
+                offset += position.numel()
         return ops.multiply(restored, q_dec), pending
 
     def _params(self, z, qp, height, width):
