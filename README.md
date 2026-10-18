@@ -68,7 +68,8 @@ first; peer claims are revisited every five seconds until the batch finishes.
 
 Video resume defaults to `--resume-check fast`: completion records, saved codec
 settings and artifact sizes are checked without rereading video/audio payloads.
-Existing originals must match their saved size and modification time. Use
+Existing originals must match their saved size and modification time, accounting
+for whole-second timestamps exposed by SSHFS/SFTP mounts. Use
 `--resume-check full` to reread originals and artifacts for SHA-256 checks.
 Fast resume cannot detect content changes that preserve those metadata values;
 explicit verification and original deletion still use full checks.

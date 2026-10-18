@@ -226,7 +226,9 @@ Completed videos use `--resume-check fast` by default for `join`, `encode` and
 `stream`. This validates the committed manifest, pipeline compatibility, required
 audio/video, safe artifact paths, and each artifact's existence and recorded size.
 An original that still exists must be a regular file with the recorded size and
-nanosecond modification time. Missing originals remain supported for completed
+modification time. Timestamps are compared exactly when both have fractional
+seconds; when either is rounded to whole seconds (as with SSHFS/SFTP), their
+whole-second values must match. Missing originals remain supported for completed
 archives. These checks read metadata, not original or artifact payloads, avoiding
 full-file transfers over network mounts. Peer completions and worker race checks
 use the same policy. This local option is not part of the saved channel profile.

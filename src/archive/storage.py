@@ -225,7 +225,16 @@ def validate_resume_source(path, source_info, *, verify_hashes=True):
     if verify_hashes:
         unchanged = sha256(path) == source_info['sha256'] and identity(path) == before
     else:
-        unchanged = all(before[key] == source_info.get(key) for key in ('size', 'mtime_ns'))
+        saved_mtime = source_info.get('mtime_ns')
+        current_mtime = before['mtime_ns']
+        same_mtime = current_mtime == saved_mtime
+        # SFTP v3/SSHFS can expose whole seconds even when the encoding host
+        # recorded nanoseconds. Compare at the coarser available precision;
+        # retain exact comparisons when both timestamps have fractional parts.
+        second = 1_000_000_000
+        if type(saved_mtime) is int and (current_mtime % second == 0 or saved_mtime % second == 0):
+            same_mtime = current_mtime // second == saved_mtime // second
+        unchanged = before['size'] == source_info.get('size') and same_mtime
     if not unchanged:
         raise ValueError('Original changed since the existing archive was produced')
 

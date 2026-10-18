@@ -112,6 +112,28 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(self.status('full'), 'failed')
         self.assertEqual(self.worker_status('full'), 'failed')
 
+    def test_fast_resume_accepts_whole_second_timestamps_in_either_direction(self):
+        whole_second = 1_768_943_251_000_000_000
+        fractional = whole_second + 823_494_434
+        for saved, current in ((fractional, whole_second), (whole_second, fractional)):
+            with self.subTest(saved=saved, current=current):
+                self.record['source']['mtime_ns'] = saved
+                os.utime(self.source, ns=(current, current))
+                self.save()
+                with self.no_payload_reads():
+                    self.assertEqual(self.status(), 'resumed')
+                    self.assertEqual(self.worker_status(), 'resumed')
+
+    def test_fast_resume_rejects_distinct_seconds_or_fractional_timestamps(self):
+        saved = 1_768_943_251_823_494_434
+        self.record['source']['mtime_ns'] = saved
+        self.save()
+        for current in (saved + 1, 1_768_943_252_000_000_000):
+            with self.subTest(current=current):
+                os.utime(self.source, ns=(current, current))
+                self.assertEqual(self.status(), 'failed')
+                self.assertEqual(self.worker_status(), 'failed')
+
     def test_full_detects_same_size_artifact_corruption_and_reader_stays_strict(self):
         (self.parent / 'source.bin').write_bytes(b'X' * len(self.payloads['video.bin']))
         self.assertEqual(self.status(), 'resumed')
