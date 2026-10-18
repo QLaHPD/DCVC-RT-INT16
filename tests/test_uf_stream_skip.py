@@ -77,5 +77,20 @@ class StreamSkipTests(unittest.TestCase):
         self.assertEqual(fetch.call_count,2)
         self.assertEqual(self.counts['resumed'],1)
 
+    def test_full_resume_hashes_existing_stream_artifacts(self):
+        from src.archive.storage import sha256
+        self.args.resume_check = 'full'
+        self.record['artifacts']['video.bin']['sha256'] = sha256(self.bin)
+        self.save()
+        with patch('src.archive.streaming.metadata', return_value=self.listing) as fetch:
+            self.assertEqual(list(stream_jobs(self.args, 'yt-dlp', self.counts, config=self.config)), [])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(self.counts['resumed'], 1)
+        self.bin.write_bytes(b'changed!')  # Same length; only full mode detects this.
+        with patch('src.archive.streaming.metadata', side_effect=[self.listing, RuntimeError('resolution attempted')]) as fetch:
+            list(stream_jobs(self.args, 'yt-dlp', self.counts, config=self.config))
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(self.counts['failed'], 1)
+
 
 if __name__ == '__main__': unittest.main()

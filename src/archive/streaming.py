@@ -154,7 +154,7 @@ def upload_timestamp(info):
     raise ValueError('Remote video has no publication timestamp or upload date')
 
 
-def existing_stream_archives(channel_out, completed=None, config=None):
+def existing_stream_archives(channel_out, completed=None, config=None, resume_check='fast'):
     """One metadata snapshot per channel, preserving prior naming on resume."""
     archives = {}
     for path in Path(channel_out).glob('*.uf.json'):
@@ -165,7 +165,7 @@ def existing_stream_archives(channel_out, completed=None, config=None):
             raise ValueError(f'Multiple archives for {url}: {archives[url]} and {path}')
         archives[url] = path
         if completed is not None and config is not None and not path.is_symlink():
-            from src.archive.storage import has_completion_record, artifact_path
+            from src.archive.storage import has_completion_record, artifact_path, sha256
             artifacts = data.get('artifacts', {})
             if data.get('pipeline') != config or not has_completion_record(data) or 'video.bin' not in artifacts:
                 continue
@@ -174,6 +174,7 @@ def existing_stream_archives(channel_out, completed=None, config=None):
             try:
                 if all(not (artifact := artifact_path(path.parent, data, name)).is_symlink()
                        and artifact.is_file() and artifact.stat().st_size == record['size']
+                       and (resume_check != 'full' or sha256(artifact) == record['sha256'])
                        for name, record in artifacts.items()):
                     completed.add(url)
             except (OSError, ValueError, KeyError, TypeError):
@@ -192,7 +193,8 @@ def stream_jobs(args, binary, counts, cancel_event=None, config=None):
         if channel not in archives:
             completed[channel] = set()
             archives[channel] = existing_stream_archives(Path(args.output_root).resolve()/channel,
-                                                         completed[channel], config)
+                                                         completed[channel], config,
+                                                         getattr(args, 'resume_check', 'fast'))
         return completed[channel]
     for url in args.source_urls:
         if cancel_event is not None and cancel_event.is_set(): return
@@ -254,6 +256,7 @@ def stream_jobs(args, binary, counts, cancel_event=None, config=None):
                 if final is None:
                     final = legacy.with_name(f'{video_id}_{upload_timestamp(info)}.uf.json')
                 job = dict(source=video_id, relative=channel+'/'+video_id, final=str(final), remote=remote,
+                           resume_check=getattr(args, 'resume_check', 'fast'),
                            hwaccel=getattr(args,'ff_hwaccel','none'), layout='flat', filename_style='rt', legacy=str(legacy), lease_key=legacy.name,lease_seconds=getattr(args,'shared_lease_seconds',900),
                            input_threads=args.input_threads or decoder_thread_budget(1),
                            prefetch_frames=args.prefetch_frames if args.prefetch_frames is not None else 8)
@@ -388,6 +391,7 @@ def catalog_jobs(args, binary, counts, cancel_event):
             if final is None:
                 final = legacy.with_name(f'{video_id}_{upload_timestamp(info)}.uf.json')
             job = dict(source=video_id, relative=folder + '/' + video_id, final=str(final), remote=remote,
+                       resume_check=getattr(args, 'resume_check', 'fast'),
                        hwaccel=args.ff_hwaccel, layout='flat', filename_style='rt', legacy=str(legacy),
                        lease_key=legacy.name, lease_seconds=args.shared_lease_seconds,
                        input_threads=options.input_threads, prefetch_frames=options.prefetch_frames,
@@ -455,6 +459,7 @@ def run_stream(args):
     failed = set()
     if existing:
         event('resume_check_started', total=len(existing),
+              resume_check=getattr(args, 'resume_check', 'fast'),
               message=f'Checking {len(existing):,} existing video archives before streaming remaining videos')
         for profile in args._stream_profiles.values():
             jobs = [job for owner, job in existing if owner is profile]

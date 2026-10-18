@@ -94,6 +94,8 @@ def build_parser():
     encode.add_argument('--shared-work', action='store_true', help='Accepted for RT command compatibility; UF always uses cooperative claims')
     encode.add_argument('--shared-instance')
     encode.add_argument('--shared-lease-seconds', type=int, default=900)
+    encode.add_argument('--resume-check', choices=('fast', 'full'), default='fast',
+                        help='Completed videos: fast checks metadata and sizes (default); full rereads originals and artifacts for SHA-256')
     encode.add_argument('--allow-missing-metadata', action='store_true', help='Permit cleanup without matching info.json files')
     encode.add_argument('--ui', choices=('auto', 'plain', 'tui'), default='auto', help='Timestamped events, also persisted beside archives')
     policy = encode.add_mutually_exclusive_group()

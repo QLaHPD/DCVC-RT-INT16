@@ -175,7 +175,8 @@ def has_completion_record(metadata):
     return bool(validation.get('decoded_yuv_sha256')) or (
         validation.get('mode') == 'artifact-hashes' and validation.get('decode_performed') is False)
 
-def load_bundle(path, expected=None):
+def load_bundle(path, expected=None, *, verify_hashes=True):
+    """Validate a committed archive; only resume may opt out of payload hashing."""
     manifest = manifest_path(path)
     if manifest.is_symlink():
         raise ValueError('Archive manifest must not be a symlink')
@@ -203,10 +204,30 @@ def load_bundle(path, expected=None):
     for name, info in data['artifacts'].items():
         if Path(name).name != name:
             raise ValueError(f'Unsafe artifact name: {name}')
+        if (not isinstance(info, dict) or type(info.get('size')) is not int or info['size'] < 0
+                or not isinstance(info.get('sha256'), str)
+                or not re.fullmatch(r'[0-9a-f]{64}', info['sha256'])):
+            raise ValueError(f'Invalid archive artifact record: {name}')
         artifact = artifact_path(root, data, name)
-        if artifact.is_symlink() or not artifact.is_file() or artifact.stat().st_size != info['size'] or sha256(artifact) != info['sha256']:
+        if (artifact.is_symlink() or not artifact.is_file()
+                or artifact.stat().st_size != info['size']
+                or (verify_hashes and sha256(artifact) != info['sha256'])):
             raise ValueError(f'Archive artifact missing or changed: {artifact}')
     return root, data
+
+
+def validate_resume_source(path, source_info, *, verify_hashes=True):
+    """Check an existing original without reading its payload in fast resume."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f'Original is not a regular file: {path}')
+    before = identity(path)
+    if verify_hashes:
+        unchanged = sha256(path) == source_info['sha256'] and identity(path) == before
+    else:
+        unchanged = all(before[key] == source_info.get(key) for key in ('size', 'mtime_ns'))
+    if not unchanged:
+        raise ValueError('Original changed since the existing archive was produced')
 
 
 def publish_flat(stage, manifest, metadata, heartbeat, lease_key):

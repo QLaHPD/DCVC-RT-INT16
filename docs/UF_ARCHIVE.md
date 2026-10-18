@@ -222,6 +222,23 @@ are processed before waiting. Cancellation retains originals and committed
 outputs. `join` always keeps originals and exits after the batch completes or
 its failures have been reported; cleanup remains an explicit separate command.
 
+Completed videos use `--resume-check fast` by default for `join`, `encode` and
+`stream`. This validates the committed manifest, pipeline compatibility, required
+audio/video, safe artifact paths, and each artifact's existence and recorded size.
+An original that still exists must be a regular file with the recorded size and
+nanosecond modification time. Missing originals remain supported for completed
+archives. These checks read metadata, not original or artifact payloads, avoiding
+full-file transfers over network mounts. Peer completions and worker race checks
+use the same policy. This local option is not part of the saved channel profile.
+
+Use `--resume-check full` to hash every completed artifact and existing original
+with SHA-256 as before. Full mode permits a changed original modification time
+when its content hash still matches. Fast mode cannot detect same-size artifact
+corruption or original content changes that also preserve the recorded mtime.
+Neither resume mode performs neural decoding. Explicit `verify`, playback,
+publication recovery and original deletion retain their full integrity checks;
+fast resume never grants approval to delete originals.
+
 The existing claim namespaces, pipeline identities, archive layouts and atomic
 publication rules are unchanged. Helpers must share the physical output and
 coordination directories. Their mount paths may differ.

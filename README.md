@@ -66,6 +66,13 @@ originals. IDs and channel URLs can be mixed after `--channels`; a configured
 channel folder can also be passed directly as `--root`. Completed archives count
 first; peer claims are revisited every five seconds until the batch finishes.
 
+Video resume defaults to `--resume-check fast`: completion records, saved codec
+settings and artifact sizes are checked without rereading video/audio payloads.
+Existing originals must match their saved size and modification time. Use
+`--resume-check full` to reread originals and artifacts for SHA-256 checks.
+Fast resume cannot detect content changes that preserve those metadata values;
+explicit verification and original deletion still use full checks.
+
 The same saved settings are inherited by `encode --root ROOT --channels ID_OR_URL`
 on one machine and `stream --root ROOT --channels ID_OR_URL` for remote input.
 Explicit codec settings must match the folder. Worker count, GPU and model paths

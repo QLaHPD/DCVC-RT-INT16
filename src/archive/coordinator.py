@@ -6,7 +6,7 @@ from pathlib import Path
 import time
 
 from src.archive.profiles import Profiles, canonical, resolve_selectors
-from src.archive.storage import SharedWorkPool, event, identity, load_bundle, sha256
+from src.archive.storage import SharedWorkPool, event, load_bundle, validate_resume_source
 
 
 def job_key(job):
@@ -41,7 +41,9 @@ def validate_completed(job, config):
         path = existing_archive(job)
         if path is None:
             raise ValueError('Completed archive disappeared; rerun to rediscover the batch')
-        _, metadata = load_bundle(path, config)
+        resume_check = job.get('resume_check', 'fast')
+        verify_hashes = resume_check == 'full'
+        _, metadata = load_bundle(path, config, verify_hashes=verify_hashes)
         if 'video.bin' not in metadata['artifacts'] or metadata['video']['frames'] < 1:
             raise ValueError('Archive has no completed video')
         source_info = metadata['source']
@@ -56,11 +58,10 @@ def validate_completed(job, config):
             raise ValueError('Existing streamed archive has URL identity; it cannot verify this local original')
         else:
             source = Path(job['source'])
-            if source.exists():
-                before = identity(source)
-                if source.is_symlink() or sha256(source) != source_info['sha256'] or identity(source) != before:
-                    raise ValueError('Original changed since the existing archive was produced')
+            if source.exists() or source.is_symlink():
+                validate_resume_source(source, source_info, verify_hashes=verify_hashes)
         event('already_encoded', job_key=job_key(job), source=job['source'], archive=str(path),
+              resume_check=resume_check,
               _progress_log=str(Path(job['final']).parent / '.uf-progress.jsonl'))
         return 'resumed'
     except Exception as exc:
@@ -127,6 +128,7 @@ def archived_job(path, metadata, options):
         raise ValueError(f'Unsafe saved original relative path in {path}')
     job = dict(source=str(source), relative=str(relative), final=str(final),
                lease_key=metadata.get('lease_key', final.name), lease_seconds=options.shared_lease_seconds,
+               resume_check=getattr(options, 'resume_check', 'fast'),
                completed_only=True)
     if remote:
         job['remote'] = {'url': remote}
@@ -190,6 +192,7 @@ def run_local(args):
     existing_count = sum(len(group['existing']) for group in groups)
     if existing_count:
         event('resume_check_started', total=existing_count,
+              resume_check=getattr(args, 'resume_check', 'fast'),
               message=f'Checking {existing_count:,} existing video archives before encoding remaining videos')
         for group in groups:
             statuses = check_completed(group['existing'], group['config'], args.procs)

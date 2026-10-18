@@ -18,7 +18,7 @@ from src.archive.media import (VIDEO_EXTENSIONS, FrameReader, decoder_thread_bud
 from src.archive.storage import (SharedWorkPool, Heartbeat, atomic_json, bundle_path, event,
                                  identity, load_bundle, sha256, sync_directory, artifact_path, control_path,
                                  archive_location, archive_lease, publish_flat, recover_flat,
-                                 memory_stage_root, completed_disk_stage)
+                                 memory_stage_root, completed_disk_stage, validate_resume_source)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -141,7 +141,8 @@ def discover(args):
         final = output / relative.parent / (stem + '.uf.json')
         jobs.append({'source': str(source), 'relative': str(relative), 'final': str(final),
                      'input_threads': input_threads, 'prefetch_frames': prefetch_frames,
-                     'hwaccel':getattr(args,'ff_hwaccel','none'), 'lease_seconds':getattr(args,'shared_lease_seconds',900), 'layout': 'flat', 'filename_style': 'rt', 'legacy': str(legacy), 'lease_key': legacy.name})
+                     'hwaccel':getattr(args,'ff_hwaccel','none'), 'lease_seconds':getattr(args,'shared_lease_seconds',900), 'layout': 'flat', 'filename_style': 'rt', 'legacy': str(legacy), 'lease_key': legacy.name,
+                     'resume_check':getattr(args, 'resume_check', 'fast')})
     return jobs
 
 
@@ -172,13 +173,14 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
         with Heartbeat(lease) as pulse:
             existing = final if final.exists() else (legacy if legacy and legacy.exists() else None)
             if existing is not None:
-                _, previous = load_bundle(existing, config)
+                resume_check = job.get('resume_check', 'fast')
+                verify_hashes = resume_check == 'full'
+                _, previous = load_bundle(existing, config, verify_hashes=verify_hashes)
                 if remote and previous['source'].get('url') != remote['url']:
                     raise ValueError('Existing archive has a different source URL')
                 if not remote:
-                    if source.exists():
-                        if previous['source']['sha256'] != sha256(source):
-                            raise ValueError('Original changed since the existing archive was produced')
+                    if source.exists() or source.is_symlink():
+                        validate_resume_source(source, previous['source'], verify_hashes=verify_hashes)
                     elif not (job.get('allow_missing_original')
                               and previous['source'].get('relative_path') == job['relative']):
                         raise ValueError('Original disappeared before archive verification')
@@ -186,7 +188,7 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
                 finish_thumbnail(remote,final,config,paths,device,instance)
                 os.environ['UF_JOB_KEY'] = str(final)
                 os.environ['UF_PROGRESS_LOG'] = str(parent / '.uf-progress.jsonl')
-                event('already_encoded', source=str(source), archive=str(existing))
+                event('already_encoded', source=str(source), archive=str(existing), resume_check=resume_check)
                 return 'resumed'
             prepared_source = job.get('prepared_source') if not remote else None
             if prepared_source is not None:
