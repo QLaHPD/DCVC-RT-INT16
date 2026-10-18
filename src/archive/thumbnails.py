@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import struct
 import tempfile
+import time
+from collections import deque
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -128,11 +130,17 @@ def image_pipeline(config):
         image['integer']={**config['integer'],'video':'0'*64}
     return image
 
-def encode_images(jobs, config, paths, device, instance=None, codec=None, source_base=None):
+def encode_images(jobs, config, paths, device, instance=None, codec=None, source_base=None,
+                  wait_for_peers=False, track_progress=True):
     from src.archive.workflow import make_codec
     config = image_pipeline(config)
+    def image_event(name, **values):
+        event(name, progress_auxiliary=not track_progress, **values)
     failed = set()
-    for source, target in jobs:
+    pending = deque(jobs)
+    stalled = 0
+    while pending:
+        source, target = pending.popleft()
         source,target = Path(source),Path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         os.environ['UF_PROGRESS_LOG'] = str(target.parent/'.thumbnail-progress.jsonl')
@@ -141,7 +149,18 @@ def encode_images(jobs, config, paths, device, instance=None, codec=None, source
         pool.ensure_pipeline(target.parent,config)
         lease,_ = pool.try_acquire(target.parent,target.name)
         if lease is None:
-            failed.add(str(target.parent)); event('claimed_by_peer',source=str(source)); continue
+            image_event('claimed_by_peer',source=str(source))
+            if wait_for_peers:
+                pending.append((source, target))
+                stalled += 1
+                if stalled >= len(pending):
+                    image_event('waiting_for_peers', total=len(pending), message='Waiting for peer-owned UF thumbnails; checking every 5 seconds')
+                    time.sleep(5)
+                    stalled = 0
+            else:
+                failed.add(str(target.parent))
+            continue
+        stalled = 0
         try:
             with Heartbeat(lease) as pulse:
                 before, digest = identity(source),sha256(source)
@@ -149,11 +168,11 @@ def encode_images(jobs, config, paths, device, instance=None, codec=None, source
                     old,_ = read_image(target)
                     if old['source']['sha256'] != digest or old['pipeline'] != config:
                         raise ValueError('Existing intra image has different source or configuration')
-                    event('already_encoded',source=str(source),archive=str(target)); continue
+                    image_event('already_encoded',source=str(source),archive=str(target)); continue
                 if codec is None:
                     codec = make_codec(config,paths,device)
                 reader = ImageReader(source)
-                event('encode_started',source=str(source),message=f'{reader.original_width}x{reader.original_height} -> {reader.original_width}x{reader.original_height} (intra image)')
+                image_event('encode_started',source=str(source),message=f'{reader.original_width}x{reader.original_height} -> {reader.original_width}x{reader.original_height} (intra image)')
                 with tempfile.TemporaryDirectory(prefix='uf-image-',dir=memory_stage_root()) as temporary:
                     payload = Path(temporary)/'intra.bin'
                     result = codec.encode(reader,payload,config['qp_i'],config['qp_i'],intra_period=1,max_frames=1)
@@ -180,9 +199,9 @@ def encode_images(jobs, config, paths, device, instance=None, codec=None, source
                         sync_directory(target.parent)
                     finally:
                         shutil.rmtree(disk_stage)
-                event('encode_completed',source=str(source),archive=str(target),**result)
+                image_event('encode_completed',source=str(source),archive=str(target),**result)
         except Exception as exc:
-            failed.add(str(target.parent)); event('encode_failed',source=str(source),error=str(exc))
+            failed.add(str(target.parent)); image_event('encode_failed',source=str(source),error=str(exc))
         finally:
             lease.release()
     return failed
@@ -244,11 +263,11 @@ def cleanup_image(args):
         lease.release()
 
 
-def _pass_entry(writer,jobs,config,paths,device,instance,events,source_base):
+def _pass_entry(writer,jobs,config,paths,device,instance,events,source_base,wait_for_peers=False):
     from src.archive.dashboard import install
     install(events)
     try:
-        writer.send(encode_images(jobs,config,paths,device,instance,source_base=source_base))
+        writer.send(encode_images(jobs,config,paths,device,instance,source_base=source_base,wait_for_peers=wait_for_peers))
     finally:
         writer.close()
 
@@ -264,7 +283,7 @@ def run_pass(args,config,paths):
     context = multiprocessing.get_context('spawn')
     parent,child = context.Pipe(duplex=False)
     process = context.Process(target=_pass_entry,args=(child,jobs,config,paths,
-          'cpu' if args.device=='cpu' else args.cuda_idx[0],args.shared_instance,event_queue(),Path(args.base_root).resolve() if args.base_root else Path(args.input_file).absolute().parent))
+          'cpu' if args.device=='cpu' else args.cuda_idx[0],args.shared_instance,event_queue(),Path(args.base_root).resolve() if args.base_root else Path(args.input_file).absolute().parent,True))
     try:
         process.start(); child.close()
         while process.is_alive() and not parent.poll(1): pass

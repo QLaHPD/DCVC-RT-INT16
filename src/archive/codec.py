@@ -50,6 +50,11 @@ class Codec:
     def tensor_for_encode(self, frames):
         return self.tensor(frames)
 
+    def reset_video(self):
+        """Drop references from the previous archive while retaining model weights."""
+        if self.video is not None:
+            self.video.clear_dpb()
+
     def write_preamble(self, stream):
         pass
 

@@ -181,6 +181,9 @@ def existing_stream_archives(channel_out, completed=None, config=None):
     return archives
 
 def stream_jobs(args, binary, counts, cancel_event=None, config=None):
+    if hasattr(args, '_stream_catalog'):
+        yield from catalog_jobs(args, binary, counts, cancel_event)
+        return
     from src.archive.media import decoder_thread_budget
     seen = set()
     archives, completed = {}, {}
@@ -264,24 +267,215 @@ def stream_jobs(args, binary, counts, cancel_event=None, config=None):
     event('run_discovered', total=scheduled)
 
 
+def stream_catalog(args, binary):
+    """Resolve channel identities before any encoder or downloader starts."""
+    entries, failures, seen = [], [], set()
+    for url in args.source_urls:
+        listing = metadata(url, binary, args.cookies, flat=True)
+        pending = [(listing, listing.get('channel_id'))]
+        youtube = 'twitch.tv' not in url.lower()
+        while pending:
+            entry, hint = pending.pop()
+            if not entry:
+                continue
+            if entry.get('_type') in ('playlist', 'multi_video'):
+                sub = entry if entry.get('entries') is not None else metadata(
+                    entry['url'], binary, args.cookies, flat=True)
+                hint = sub.get('channel_id') or hint
+                pending.extend((item, hint) for item in reversed(sub.get('entries') or []))
+                continue
+            try:
+                video_id = safe_id(entry.get('id')) if youtube else safe_component(entry.get('id'))
+                video_url = ('https://www.youtube.com/watch?v=' + video_id if youtube else
+                             entry.get('webpage_url') or entry.get('url') or
+                             'https://www.twitch.tv/videos/' + video_id.lstrip('v'))
+                if video_url in seen:
+                    continue
+                seen.add(video_url)
+                channel = entry.get('channel_id') or hint
+                if not channel:
+                    # Identity-only extraction; no media bytes are downloaded.
+                    entry = metadata(video_url, binary, args.cookies)
+                    channel = entry.get('channel_id') or entry.get('uploader_id')
+                channel = safe_id(channel, channel=True) if youtube else safe_component(channel)
+                # Keep only identity data in the catalog. Full format lists are
+                # resolved by the bounded producer immediately before encoding.
+                entries.append(dict(channel=channel, url=video_url, id=video_id))
+            except Exception as exc:
+                failures.append((str(entry.get('id') or url), f'{type(exc).__name__}: {exc}'))
+    return entries, failures
+
+
+def stream_folders(args, catalog):
+    """Match provider channel identities to selected local folder names."""
+    from src.archive.profiles import folder_aliases
+    root = Path(args.output_root).resolve()
+    aliases = {folder.name: folder_aliases(folder) for folder in sorted(root.iterdir())
+               if folder.is_dir() and not folder.is_symlink() and not folder.name.startswith('.')
+               and not folder.name.endswith('.uf')} if root.is_dir() else {}
+    selected = getattr(args, '_selected_stream_folders', None)
+    mapping = {}
+    for channel in dict.fromkeys(item['channel'] for item in catalog):
+        matches = [name for name, values in aliases.items() if channel in values
+                   and (selected is None or name in selected)]
+        if len(matches) > 1:
+            raise ValueError(f'Ambiguous channel {channel}: {", ".join(matches)}; select a folder ID with --channels')
+        mapping[channel] = matches[0] if matches else channel
+    for item in catalog:
+        item['folder'] = mapping[item['channel']]
+
+
+def stream_selector_sources(args):
+    from src.archive.profiles import channel_url, folder_aliases, resolve_selectors
+    selectors = getattr(args, '_stream_selectors', None)
+    if not selectors:
+        return
+    root = Path(args.output_root).resolve()
+    pairs = resolve_selectors(root, selectors, args, allow_new=True, return_pairs=True)
+    args._selected_stream_folders = list(dict.fromkeys(name for _, name in pairs))
+    urls = []
+    for selector, name in pairs:
+        if selector.startswith(('http://', 'https://')):
+            url = channel_url(selector)
+            urls.append(url + ('/videos' if 'youtube.com/' in url else '/videos?filter=archives&sort=time'))
+            continue
+        aliases = folder_aliases(root / name) if (root / name).is_dir() else set()
+        youtube_id = next((value for value in sorted(aliases | {name})
+                           if re.fullmatch(r'UC[A-Za-z0-9_-]{22}', value)), None)
+        if youtube_id:
+            urls.append('https://www.youtube.com/channel/' + youtube_id + '/videos')
+            continue
+        provider_urls = sorted(value for value in aliases if value.startswith('https://twitch.tv/'))
+        if provider_urls:
+            url = provider_urls[0]
+        else:
+            if name.isdigit():
+                raise ValueError(f'No Twitch URL saved for channel ID {name}; pass its channel URL')
+            url = 'https://www.twitch.tv/' + safe_component(name)
+        urls.append(url + '/videos?filter=archives&sort=time')
+    args.source_urls = list(dict.fromkeys(urls))
+
+
+def catalog_jobs(args, binary, counts, cancel_event):
+    for item in args._stream_catalog:
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        video_id, video_url, channel = item['id'], item['url'], item['channel']
+        folder = item['folder']
+        profile = args._stream_profiles[folder]
+        options = profile['options']
+        try:
+            event('stream_resolving', video_id=video_id)
+            info = metadata(video_url, binary, args.cookies, cancel_event=cancel_event)
+            if info.get('is_live') or info.get('live_status') == 'is_upcoming':
+                counts['skipped'] = counts.get('skipped', 0) + 1
+                event('stream_skipped_live', job_key=video_url, source=video_url, video_id=video_id)
+                continue
+            actual = info.get('channel_id') or info.get('uploader_id')
+            if actual != channel:
+                raise ValueError(f'Provider channel changed during discovery: {channel} -> {actual}')
+            video, audio = select_formats(info, args.source_max_height)
+            original = dict(width=int(video['width']), height=int(video['height']),
+                            fps=float(video.get('fps') or info.get('fps') or 30),
+                            duration=float(info.get('duration') or 0), audio=audio is not None)
+            remote = dict(url=video_url, media=original, binary=binary, cookies=args.cookies,
+                          video_format=video['format_id'], audio_format=audio['format_id'] if audio else None,
+                          public_metadata=info, thumbnail=info.get('thumbnail'),
+                          thumbnail_headers=info.get('http_headers'), write_thumbnail=args.write_thumbnail,
+                          thumbnail_codec=options.thumbnail_codec, thumbnail_qp=options.thumbnail_qp)
+            legacy = Path(args.output_root).resolve() / folder / (video_id + '.uf')
+            final = profile['archive_urls'].get(video_url)
+            if final is None:
+                final = legacy.with_name(f'{video_id}_{upload_timestamp(info)}.uf.json')
+            job = dict(source=video_id, relative=folder + '/' + video_id, final=str(final), remote=remote,
+                       hwaccel=args.ff_hwaccel, layout='flat', filename_style='rt', legacy=str(legacy),
+                       lease_key=legacy.name, lease_seconds=args.shared_lease_seconds,
+                       input_threads=options.input_threads, prefetch_frames=options.prefetch_frames,
+                       _config=profile['config'], _paths=profile['paths'])
+            event('stream_selected', video_id=video_id, channel_id=channel,
+                  video_format=remote['video_format'], audio_format=remote['audio_format'], archive=str(final))
+            yield job
+        except Exception as exc:
+            counts['failed'] += 1
+            event('encode_failed', job_key=video_url, source=video_url, error=f'{type(exc).__name__}: {exc}')
+
+
 def run_stream(args):
-    from src.archive.workflow import pipeline
+    from src.archive.profiles import Profiles
+    from src.archive.coordinator import archived_job, check_completed
     from src.archive.stream_pipeline import execute_stream_jobs
-    if args.max_frames:
-        raise ValueError('Streaming requires full videos; omit --max_frames')
     binary = shutil.which(args.ytdlp_bin)
     if not binary:
         raise ValueError('yt-dlp not found; pass --yt-dlp /path/to/yt-dlp')
     args._cleanup_sources = set()
-    config,paths = pipeline(args)
+    stream_selector_sources(args)
+    catalog, discovery_failures = stream_catalog(args, binary)
+    stream_folders(args, catalog)
+    profiles = Profiles(args)
+    args._stream_profiles = {}
+    existing = []
+    # Every discovered channel is preflighted before any video worker starts.
+    selected_channels = list(dict.fromkeys([item['folder'] for item in catalog]
+                                          + getattr(args, '_selected_stream_folders', [])))
+    for channel in selected_channels:
+        profile = profiles.load(Path(args.output_root).resolve() / channel)
+        if profile['config']['max_frames'] is not None:
+            raise ValueError(f'{channel}: streaming requires full videos; omit --max_frames')
+        urls = {}
+        for path, data in profile['archives']:
+            url = data['source'].get('url')
+            if url:
+                if url in urls:
+                    raise ValueError(f'Multiple archives for {url} in {profile["root"]}')
+                urls[url] = path if path.name.endswith('.uf.json') else path.parent
+            existing.append((profile, archived_job(path, data, profile['options'])))
+        profile['archive_urls'] = urls
+        args._stream_profiles[channel] = profile
+    # Lifecycle and explicit cleanup stay scoped to the selected channels.
+    args.channel_ids = list(args._stream_profiles)
+    args._channel_profiles = {str(profile['root']): profile['paths'] for profile in args._stream_profiles.values()}
+    archived_urls = {url for profile in args._stream_profiles.values() for url in profile['archive_urls']}
+    pending = [item for item in catalog if item['url'] not in archived_urls]
+    if args.max_videos:
+        pending = pending[:args.max_videos]
+    args._stream_catalog = pending
+    from copy import copy
+    from src.archive.thumbnails import discover as discover_images, run_pass
+    thumbnail_passes = []
+    for channel, profile in args._stream_profiles.items():
+        options = copy(profile['options'])
+        options.base_root, options.output_root = args.output_root, args.output_root
+        options.channel_ids, options.input_file = [channel], None
+        options._cleanup_sources = args._cleanup_sources
+        options._thumbnail_jobs = discover_images(options) if options.thumbnail_codec == 'dcvc-intra' else []
+        thumbnail_passes.append((options, profile))
+    image_count = sum(len(options._thumbnail_jobs) for options, _ in thumbnail_passes)
+    event('run_discovered', total=len(existing) + len(pending) + len(discovery_failures) + image_count)
     counts = {'encoded':0,'resumed':0,'busy':0,'failed':0}
-    outcomes,failed = execute_stream_jobs(args,config,paths,binary,counts)
+    failed = set()
+    if existing:
+        event('resume_check_started', total=len(existing),
+              message=f'Checking {len(existing):,} existing video archives before streaming remaining videos')
+        for profile in args._stream_profiles.values():
+            jobs = [job for owner, job in existing if owner is profile]
+            for job, status in zip(jobs, check_completed(jobs, profile['config'], args.procs)):
+                counts[status] += 1
+                if status == 'failed':
+                    failed.add(str(Path(job['final']).parent))
+        event('resume_check_completed', total=len(existing), resumed=counts['resumed'], failed=counts['failed'])
+    for key, error in discovery_failures:
+        counts['failed'] += 1
+        event('encode_failed', job_key='discovery:' + key, source=key, error=error)
+    outcomes,worker_failures = execute_stream_jobs(args,None,None,binary,counts)
+    failed.update(worker_failures)
     for result in outcomes: counts[result if result in counts else 'failed'] += 1
+    for options, profile in thumbnail_passes:
+        failed.update(run_pass(options, profile['config'], profile['paths']))
     event('stream_finished',**counts)
     from src.archive.lifecycle import finish
     from src.archive.dashboard import command_queue
     finish(args,command_queue(),failed)
-    return int(counts['failed'] > 0)
+    return int(counts['failed'] > 0 or bool(failed))
 
 
 def store_thumbnail(remote, output_base):
@@ -322,7 +516,7 @@ def finish_thumbnail(remote,final,config,paths,device,instance,codec=None):
                 if config.get('runtime')=='int16':
                     image_codec.preamble = image_codec.preamble[:40]+bytes(32)
             encode_images([(image,image.with_name(f'{image.name}_qI{qp}.dcvci'))],
-                          {**config,'qp_i':qp,'qp_p':qp},paths,device,instance,codec=image_codec)
+                          {**config,'qp_i':qp,'qp_p':qp},paths,device,instance,codec=image_codec,track_progress=False)
     except Exception as exc:
         event('thumbnail_failed',source=str(final),error=str(exc))
 

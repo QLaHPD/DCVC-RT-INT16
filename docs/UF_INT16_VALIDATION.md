@@ -1,5 +1,85 @@
 # UF integer validation on Jetson Orin
 
+## Shared-folder join implementation — 2026-10-18
+
+Added `join --root ... --channels ID_OR_URL ...`, per-channel profile inheritance
+for local encoding and streaming, preflight mismatch reporting, and cooperative
+waiting for peer completions/expired leases. Resume checks count completed video
+archives first without initializing encoder models. Streaming thumbnail events
+are excluded from video totals; local image passes retain their own progress.
+
+Review is limited to Python syntax parsing, `git diff --check` and manual
+control-flow inspection, as requested. No automated tests, live join execution,
+new model loads, downloads or performance measurements were performed for this
+feature. Runtime and multi-machine acceptance remain unverified. The existing
+Os Pingos encoding was left running; its saved metadata was read to confirm the
+field names and canonical relative paths used by profile recovery.
+
+## Resume check ordering update — 2026-10-17
+
+Subsequent local INT16 runs check existing video archives in a separate first
+phase. Each check updates progress; all checks finish before unfinished videos
+are scheduled. The existing pipeline, artifact and original-file integrity
+checks remain in place. Completed commits are validated on CPU without taking
+an encoding claim or initializing encoder models; pending encoding retains
+ownership checks. This ordering update applies on the next run.
+
+The measurements below describe the earlier optimization snapshot, which
+scheduled unfinished videos first. Its source snapshots and results are preserved.
+
+## Persistent local encoding workers — 2026-10-17
+
+Evidence, the `16af9cf` control snapshot, final Python sources and measurements
+are in `runs/python-speed-20261017T190837Z-persistent/`, summarized by
+`analysis.json`. Native libraries remain `packed-v9` and `lazy-skip-v2`.
+
+Local INT16 encoding now reuses one checked model pair per worker. Loading is
+lazy, so already-completed archives require no model initialization. Video
+references are released between jobs; mask caches retain one resolution.
+Failed workers are replaced. At most one extra input per worker is hashed and
+probed on CPU while current encoding runs. A device/inode/size/mtime/ctime
+fingerprint guards reuse of that preparation, and the full final source hash
+check remains. The scheduler maps prepared checkpoints, keeps their checked
+identities, and releases each tensor set before opening the next checkpoint.
+Unfinished inputs start first on resume; completed inputs still receive all
+existing archive/source integrity checks. FP16 and streaming retain their
+existing worker lifecycle.
+
+These CLI measurements use two workers on the same 1.02 GHz Orin, QI10/QP14,
+reset 2, skip 0.2, 144p short edge and 4 FPS. Twelve moving FFV1 clips contain
+1,100 frames total, several aspect ratios, and PCM source audio. Times include
+startup, model loading, FFmpeg input, Opus mono 6 kbps audio and publication:
+
+| Model | Fresh worker per video | Final persistent workers | End-to-end FPS before → after |
+|---|---:|---:|---:|
+| HT-L, median of two runs | 57.995 s | 22.780 s | 18.97 → 48.29 |
+| HT-S, one run | 54.014 s | 20.154 s | 20.36 → 54.58 |
+
+The HT-L short-video workload is 2.55× faster. The benefit depends on clip length
+and startup's share of total runtime. Warmed long-video encoding remains approximately
+123 FPS with two workers on the measured 513-frame fixture.
+
+A 96-video, 8,800-frame run initialized models exactly twice, with each PID
+encoding 48 videos. After initial warmup, worker RSS stayed at approximately
+958–962 MiB across repeated size changes. The scheduler's retained RSS fell
+from 566.0 to 392.9 MiB. Relative to model reuse alone, source preparation and
+scheduler checkpoint changes reduced that batch from 101.483 to 97.641 s
+(86.71 → 90.13 FPS). Median publication-to-next-`encode_started` time fell
+from 138.6 to 4.9 ms; this metric ends before input decoding and the first
+neural packet.
+
+Every measured HT-L/HT-S video bitstream matched its fresh-worker control,
+including all 96 videos in both longer batches. All twelve compared audio
+outputs reconstructed to identical PCM hashes through pipes. No decoded media
+files were saved. A completed twelve-video batch resumed in 4.715 s with zero
+model loads. A mixed batch resumed twelve archives and encoded its one new
+video with one model load; the new video was scheduled first.
+
+Two isolated GPU scheduling candidates were measured for three repetitions:
+releasing the gate before collecting entropy bytes, and splitting the gate
+around entropy work. They measured 122.58 and 122.30 FPS against 122.66 FPS for
+the existing schedule, with identical streams. The production gate is unchanged.
+
 ## Python checkpoint storage, partial output and seeking — 2026-10-16
 
 These changes follow `packed-v9`. Controls, frozen source files, library

@@ -32,6 +32,7 @@ class State:
         self.code = 0
         self.total = 0
         self.done = 0
+        self.completed = set()
         self.slots = {}
         self.started = {}
 
@@ -49,7 +50,7 @@ class State:
                 dashboard._plain._refresh_global()
         elif kind == 'backend_finished':
             self.finished, self.code = True, record.get('code', 0)
-        elif key and kind in ('encode_started', 'encode_progress', 'validation_started'):
+        elif key and not record.get('progress_auxiliary') and kind in ('encode_started', 'encode_progress', 'validation_started'):
             if key not in self.slots:
                 used = set(self.slots.values())
                 self.slots[key] = next(i for i in range(len(used)+1) if i not in used)
@@ -58,7 +59,10 @@ class State:
             row = self.active[key]
             name = Path(row.get('source', key)).name
             dashboard.set_worker_text(self.slots[key], f"{name}: {'validating' if kind == 'validation_started' else 'encode'} {row.get('frames',0):,} frames {row.get('fps',0):.2f} FPS")
-        if kind in ('encode_completed', 'already_encoded', 'encode_failed'):
+        terminal = kind in ('encode_completed', 'already_encoded', 'encode_failed', 'stream_skipped_live') or (
+            kind == 'job_settled' and record.get('status') in ('encoded', 'resumed', 'failed'))
+        if terminal and not record.get('progress_auxiliary') and key and key not in self.completed:
+            self.completed.add(key)
             self.done += 1
             if key in self.slots:
                 dashboard.clear_worker(self.slots.pop(key))

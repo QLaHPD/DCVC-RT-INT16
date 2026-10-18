@@ -50,6 +50,28 @@ remains on `int16-managed`.
 Keep model files, native binaries, caches, datasets and outputs out of Git. The
 existing RT runtime and its prepared INT16 files remain in their original location.
 
+Local INT16 encoding reuses each worker's loaded models across videos and
+prepares the next inputs on CPU, with `--procs` limiting model copies. See
+[worker and buffering details](docs/UF_ARCHIVE.md#encode-and-stream).
+
+### Join or update a saved channel folder
+
+```bash
+./scripts/uf-python main.py join --root /mounted/YOUTUBE --channels UCzjtGnD7qqeaHW3nvDVrjQA --procs 2
+```
+
+Mount the same channel storage on each helper and run the command there. `join`
+encodes existing originals, inherits each channel's saved UF settings, and retains
+originals. IDs and channel URLs can be mixed after `--channels`; a configured
+channel folder can also be passed directly as `--root`. Completed archives count
+first; peer claims are revisited every five seconds until the batch finishes.
+
+The same saved settings are inherited by `encode --root ROOT --channels ID_OR_URL`
+on one machine and `stream --root ROOT --channels ID_OR_URL` for remote input.
+Explicit codec settings must match the folder. Worker count, GPU and model paths
+are local; matching prepared models must already exist on the helper. See
+[configuration inheritance and helper setup](docs/UF_ARCHIVE.md#join-and-saved-channel-settings).
+
 ### Choose settings by benchmark PSNR
 
 Add `--target-psnr 30` to `encode` or `stream` to select the fastest measured

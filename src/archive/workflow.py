@@ -36,8 +36,14 @@ def pipeline(args, image_only=False):
     if runtime == 'int16':
         from src.int16.prepared import resolve_prepared
         from src.int16.ops import ARITHMETIC_ID
-        prepared_i, data_i = resolve_prepared(image, 'image', args.prepared_i)
-        prepared_p, data_p = (None,{'source_sha256':None,'identity':'0'*64}) if image_only else resolve_prepared(video, args.model_structure, args.prepared_p)
+        def prepared_header(source, variant, path):
+            prepared, data = resolve_prepared(source, variant, path, memory_map=True)
+            # The scheduler only needs these checked identities. Release each
+            # mapped tensor set before reading the next checkpoint.
+            return prepared, {key: data[key] for key in ('source_sha256', 'identity')}
+        prepared_i, data_i = prepared_header(image, 'image', args.prepared_i)
+        prepared_p, data_p = ((None, {'source_sha256': None, 'identity': '0'*64}) if image_only else
+                              prepared_header(video, args.model_structure, args.prepared_p))
         hashes = (data_i['source_sha256'], data_p['source_sha256'])
     else:
         hashes = (sha256(image), None if image_only else sha256(video))
@@ -146,7 +152,7 @@ def _copy_sidecars(source, stage):
             shutil.copy2(sidecar, stage / sidecar.name)
 
 
-def encode_job(job, config, paths, device, instance):
+def encode_job(job, config, paths, device, instance, codec_provider=None):
     source, final = Path(job['source']), Path(job['final'])
     os.environ['UF_JOB_KEY'] = str(final)
     remote = job.get('remote')
@@ -169,14 +175,26 @@ def encode_job(job, config, paths, device, instance):
                 _, previous = load_bundle(existing, config)
                 if remote and previous['source'].get('url') != remote['url']:
                     raise ValueError('Existing archive has a different source URL')
-                if not remote and previous['source']['sha256'] != sha256(source):
-                    raise ValueError('Original changed since the existing archive was produced')
+                if not remote:
+                    if source.exists():
+                        if previous['source']['sha256'] != sha256(source):
+                            raise ValueError('Original changed since the existing archive was produced')
+                    elif not (job.get('allow_missing_original')
+                              and previous['source'].get('relative_path') == job['relative']):
+                        raise ValueError('Original disappeared before archive verification')
                 from src.archive.streaming import finish_thumbnail
                 finish_thumbnail(remote,final,config,paths,device,instance)
+                os.environ['UF_JOB_KEY'] = str(final)
+                os.environ['UF_PROGRESS_LOG'] = str(parent / '.uf-progress.jsonl')
                 event('already_encoded', source=str(source), archive=str(existing))
                 return 'resumed'
-            before = {} if remote else identity(source)
-            source_sha = None if remote else sha256(source)
+            prepared_source = job.get('prepared_source') if not remote else None
+            if prepared_source is not None:
+                from src.archive.workers import source_fingerprint
+                if source_fingerprint(source) != prepared_source['fingerprint']:
+                    prepared_source = None
+            before = {} if remote else (prepared_source['identity'] if prepared_source else identity(source))
+            source_sha = None if remote else (prepared_source['sha256'] if prepared_source else sha256(source))
             if flat:
                 recovered = recover_flat(final, config, pulse, job_id, source, source_sha,
                                          remote['url'] if remote else None)
@@ -184,19 +202,21 @@ def encode_job(job, config, paths, device, instance):
                     event('encode_completed', source=str(source), archive=str(final), recovered=True,
                           **recovered['video'], video_bytes=recovered['artifacts']['video.bin']['size'])
                     return 'encoded'
-            original = remote['media'] if remote else probe(source)
+            original = remote['media'] if remote else (prepared_source['media'] if prepared_source else probe(source))
             width, height = dimensions(original['width'], original['height'], config['resolution'])
             fps = config['fps'] or original['fps']
             if not fps or fps <= 0:
                 raise ValueError('Cannot determine a positive frame rate; pass --fps')
             event('encode_started', source=str(source), device=device,
+                  worker_pid=os.getpid(),
+                  input_prepared=prepared_source is not None,
                   input_threads=job.get('input_threads', 1),
                   prefetch_frames=job.get('prefetch_frames', 0),
                   runtime=config.get('runtime', 'fp16'),
                   resolution=f"{original['width']}x{original['height']} -> {width}x{height}", fps=fps,
                   variant=config['variant'], qi=config['qp_i'], qp=config['qp_p'])
             stage = Path(tempfile.mkdtemp(prefix='uf-encode-', dir=memory_stage_root()))
-            codec = make_codec(config, paths, device)
+            codec = codec_provider() if codec_provider is not None else make_codec(config, paths, device)
             if job.get('gpu_gate') and hasattr(codec, 'set_gpu_gate'):
                 codec.set_gpu_gate(job['gpu_gate'])
             last = [0.0]
@@ -343,39 +363,21 @@ def run_encode(args):
     if getattr(args, 'source_urls', None):
         from src.archive.streaming import run_stream
         return run_stream(args)
-    jobs = discover(args)
-    from src.archive.thumbnails import discover as discover_images
-    args._thumbnail_jobs = discover_images(args) if getattr(args,'thumbnail_codec','keep')=='dcvc-intra' else []
-    config, paths = pipeline(args,image_only=bool(args._thumbnail_jobs) and not jobs)
-    args._validation_jobs = jobs
-    args._cleanup_sources = {str(Path(job['source']).absolute()) for job in jobs}
-    event('run_discovered', total=len(jobs)+len(args._thumbnail_jobs))
-    if not jobs:
-        from src.archive.thumbnails import run_pass
-        image_failures = run_pass(args, config, paths)
-        from src.archive.lifecycle import finish
-        from src.archive.dashboard import command_queue
-        finish(args, command_queue(), image_failures)
-        return int(bool(image_failures))
-    outcomes, failed_channels = execute_jobs(args,jobs,config,paths)
-    from src.archive.thumbnails import run_pass
-    image_failures = run_pass(args, config, paths)
-    failed_channels.update(image_failures)
-    event('archive_run_completed', **{key: outcomes.count(key) for key in ('encoded', 'resumed', 'busy', 'failed')})
-    from src.archive.lifecycle import finish
-    from src.archive.dashboard import command_queue
-    finish(args, command_queue(), failed_channels)
-    return int('failed' in outcomes or bool(image_failures))
+    from src.archive.coordinator import run_local
+    return run_local(args)
 
 
-def execute_jobs(args, jobs, config, paths, worker_entry=None):
-    worker_entry = worker_entry or _job_entry
+def execute_jobs(args, jobs, config, paths, worker_entry=None, job_result=None):
     devices = ['cpu'] if getattr(args, 'device', 'cuda') == 'cpu' else (args.cuda_idx or [0])
     if args.procs < 1:
         raise ValueError('--procs must be positive')
-    # One fresh worker per archive prevents retained native CUDA graphs from
-    # accumulating across unrelated resolutions and releases resources on failure.
     context = multiprocessing.get_context('spawn')
+    if worker_entry is None and config is not None and config.get('runtime') == 'int16':
+        from src.archive.workers import execute_encode_jobs
+        return execute_encode_jobs(args, jobs, config, paths, context, devices, event_queue(), job_result=job_result)
+    worker_entry = worker_entry or _job_entry
+    # One fresh worker per archive prevents retained native CUDA graphs from
+    # accumulating in FP16. Custom decode workers keep their existing lifecycle.
     remaining = iter(jobs)
     exhausted = False
     outcomes = []
@@ -412,6 +414,8 @@ def execute_jobs(args, jobs, config, paths, worker_entry=None):
                         event('worker_failed', source=job['source'], exitcode=process.exitcode)
                         status = 'failed'
                     outcomes.append(status)
+                    if job_result is not None:
+                        job_result(job, status)
                     if status in ('failed', 'busy'):
                         failed_channels.add(str(Path(job['final']).parent))
                     reader.close()

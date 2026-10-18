@@ -77,8 +77,9 @@ sha256 = _shared.file_sha256
 
 
 def event(name, **fields):
+    progress_log = fields.pop('_progress_log', None)
     record = {'time': datetime.now(timezone.utc).isoformat(), 'event': name, **fields}
-    if os.environ.get('UF_JOB_KEY'):
+    if os.environ.get('UF_JOB_KEY') and 'job_key' not in record:
         record['job_key'] = os.environ['UF_JOB_KEY']
     line = json.dumps(record)
     from src.archive.dashboard import event_queue
@@ -87,7 +88,7 @@ def event(name, **fields):
         print(line, flush=True)
     else:
         destination.put(record)
-    log = os.environ.get('UF_PROGRESS_LOG')
+    log = progress_log or os.environ.get('UF_PROGRESS_LOG')
     if log:
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:

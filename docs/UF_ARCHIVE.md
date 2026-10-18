@@ -36,7 +36,7 @@ supplied cookies unchanged. Thumbnails are retained by default; `--no-thumbnail`
 disables their download. A thumbnail download failure does not discard a valid
 video archive.
 
-UF keeps its established codec/input defaults: FP16, HT-S, original dimensions
+New channels use the established codec/input defaults: FP16, HT-S, original dimensions
 and FPS, one process, QP I=36/P=30, and mono Opus at 6 kbps. Pass the desired
 settings explicitly when moving an RT command. `--resolution 144` preserves
 aspect ratio (1280×720 → 256×144); matching dimensions skip scaling. Odd video
@@ -44,9 +44,23 @@ dimensions are made even for YUV420. `--fps 8` samples eight frames per second.
 HT-L/HT-S code eight-frame P packets, so positive `--intra_period` values must be
 1 or multiples of eight; LD accepts any positive interval.
 
+Local INT16 encoding keeps up to `--procs` worker processes alive. Each worker
+loads its checked image/video model pair only when it first needs to encode,
+then reuses those weights across videos. Video references are cleared between
+archives, and resolution-dependent mask caches retain one shape. Failed workers
+are replaced before taking another video. CPU threads hash/probe at most one
+extra local input per worker while the GPU processes current videos. A changed
+input is prepared again; the final source checksum is still checked before
+publication. FP16 and streaming retain their existing process lifecycle.
+On a resumed run, existing video archives undergo all resume
+integrity checks first. Their results enter the progress counter before the
+remaining videos start encoding. Bounded CPU threads check artifact hashes and
+the original checksum when the original still exists, without neural decoding or
+encoder model initialization. Worker reuse does not change saved pipeline settings.
+
 `--opus_frame_ms` defaults to 60, with `--opus_complexity 10 --opus_vbr on`.
-An older UF run used FFmpeg's default 20 ms; specify `--opus_frame_ms 20` when
-resuming that pipeline. Existing valid sibling `.opus` files are reused, including
+An older UF run used FFmpeg's default 20 ms; saved profiles inherit that value
+automatically. Existing valid sibling `.opus` files are reused, including
 when re-encoding only video. `--audio none` prevents source deletion when the
 source contains audio.
 
@@ -58,8 +72,8 @@ local H.264 inputs, with a complete software retry on hardware decode failure.
 
 Streaming instead primes an eight-frame decoded input queue. After the first
 five seconds of encoding, it measures average encoding FPS once and changes the
-queue capacity to `ceil(FPS * 2)` frames, shared by subsequent videos/workers in
-that run. If the first video ends before five seconds, calibration waits for an
+queue capacity to `ceil(FPS * 2)` frames, shared by subsequent videos/workers
+using the same profile. If the first video ends before five seconds, calibration waits for an
 eligible later video. The queue fills ahead as download/decode speed permits;
 it cannot compensate for a persistently slower source. Its YUV444 frame storage
 uses approximately `frames * width * height * 3` bytes (about 15 MiB for 140
@@ -85,8 +99,9 @@ Time and size are competing objectives, so time has priority.
 
 The selector fills `--runtime int16 --model_structure htl` and `--qp_i`,
 `--qp_p`, `--reset_interval`, `--intra_period`, `--skip_thres`. Any explicit
-`--resolution` is preserved; when omitted, it defaults to the benchmark's
-144p short edge. For example, `--target-psnr 30 --resolution 480` selects
+`--resolution` is preserved; for a new channel, omitting it defaults to the
+benchmark's 144p short edge. Saved profiles retain their resolution.
+For example, `--target-psnr 30 --resolution 480` selects
 parameters from the calibration table and encodes at a 480p short edge.
 Explicit codec parameters, including aliases `--qi`, `--qp`, and
 `--force_intra_period`, constrain selection and are retained. If no measured
@@ -104,21 +119,20 @@ format or pipeline identity beyond the actual selected codec settings.
 
 ### Skip completed channel entries before resolving videos
 
-Streaming compares the channel listing with one local archive snapshot per
-channel. A compatible committed `.uf.json` plus all recorded artifacts (including
-`.bin` and required audio) at their expected sizes removes that entry before
-per-video yt-dlp metadata, downloads or worker startup. Completed entries produce
-no individual resume message; the final `resumed` count includes them.
+Streaming resolves the selected channel identities, loads each profile and checks
+its committed archives before starting remaining video downloads or encoders.
+Recorded artifact hashes, required audio and local source checksums where present
+are checked. Each completed entry emits `already_encoded`, increments progress
+once and contributes to the final `resumed` count.
 `--max-videos` applies to remaining work. Nested channel tabs inherit channel IDs.
 If the provider omits the channel ID in the listing, metadata must resolve it
 before the same completion check can run.
 
-This fast startup check does not hash entire bitstreams: use `verify` for full
-integrity verification. Missing/truncated outputs, missing commit records and
-incompatible settings stay on the normal checked worker path. Bare `.bin` names
-and hidden stages are insufficient. Thumbnail downloads are not retried for
-videos removed by this completed-video filter. Concurrent completions after the
-snapshot still pass through the existing worker ownership/resume checks.
+`verify` additionally performs neural decoding. Invalid committed outputs are
+reported as failures and retained; bare `.bin` names and hidden stages are not
+completion evidence. Thumbnail downloads are not retried for completed videos;
+existing local thumbnail originals can resume their saved UF image pass.
+Concurrent peer completions receive the same artifact validation and count once.
 
 ### RAM staging and atomic output
 
@@ -139,8 +153,78 @@ Normal success/failure removes RAM staging; a forced kill can leave RAM files
 until cleanup or reboot. tmpfs follows the operating system's swap policy.
 
 Shared pipeline mismatches now report differing fields. Existing channel
-pipelines that omit `opus_frame_ms` use the historical 20 ms default; resume
-those with `--opus_frame_ms 20`, even though new CLI runs default to 60 ms.
+pipelines that omit `opus_frame_ms` inherit the historical 20 ms default, even
+though new channels default to 60 ms.
+
+## Join and saved channel settings
+
+```bash
+# Help an existing local-file batch on a shared mount.
+./scripts/uf-python main.py join --root /mounted/YOUTUBE \
+  --channels UCzjtGnD7qqeaHW3nvDVrjQA https://www.youtube.com/@anotherchannel \
+  --procs 2 --shared-instance desktop --ui plain
+
+# A configured channel directory can be supplied directly.
+./scripts/uf-python main.py join --root /mounted/YOUTUBE/CHANNEL_ID
+
+# Update local originals later, using the same saved profile on one machine.
+./scripts/uf-python main.py encode --root /mounted/YOUTUBE --channels CHANNEL_ID
+
+# Fetch remote inputs using saved settings, without keeping downloaded videos.
+./scripts/uf-python main.py stream --root /mounted/YOUTUBE \
+  --channels https://www.youtube.com/@anotherchannel --cookies /local/cookies.txt
+```
+
+`--root` is the storage root; `--channels` accepts folder IDs or channel URLs and
+deduplicates selections. Existing `--base_root`, `--output_root` and
+`--channel_ids` remain available, including separate local input/output roots.
+Channel URLs use local `info.json` aliases first, then metadata-only yt-dlp
+resolution when needed. Ambiguous matches fail; select the exact folder ID.
+The command does not establish SSH connections or mount filesystems. Supply your
+existing filesystem mount, including a mount reached through Tailscale SSH.
+
+Settings come from `.dcvc-uf-shared-work/pipeline.json`, or consistent video
+manifests (`*.uf.json` or legacy `*.uf/manifest.json`) if no pipeline file exists.
+Malformed profiles, conflicting manifests and incompatible manual overrides fail
+before encoding begins. `join` requires a saved UF video profile. Ordinary
+`encode` and `stream` keep their defaults for new channels. UF thumbnail settings
+are recovered separately from `.dcvc-uf-image-work/pipeline.json` when present;
+RT images and RT state are not UF profiles.
+
+Inherited fields include runtime, variant, model identities, QPs, FPS, resolution,
+temporal settings, frame limit, and Opus settings. Explicit codec flags must match
+the saved profile; a mismatch reports the channel and differing fields. The
+original numeric PSNR target is not saved: its selected concrete settings are
+reused. Only an explicit `--target-psnr` reruns benchmark selection, and the result
+must still match an existing profile.
+
+Each channel keeps its own profile. `--procs` caps the invocation's total active
+encoders, not workers per channel. Local INT16 jobs with matching profiles share
+persistent workers; profile switches release that pool before loading another.
+Machine-local settings include worker count (default 1), GPU (default 0), device,
+decoder threads/prefetch, model paths, cookies and yt-dlp paths. No host paths or
+credentials are imported from saved profiles.
+
+Install the same Python project/environment on the helper, then copy the matching
+UF prepared `*.int16.pt` files into its `checkpoints/`, or provide `--prepared_i`
+and `--prepared_p`. Content identities and arithmetic are validated. Prepared
+INT16 files are self-contained; float source checkpoints are not required to use
+them. No weights are downloaded or prepared automatically by `join`. FP16 profiles
+require matching local float checkpoints and CUDA. See [setup](UF_LOCAL_SETUP.md).
+
+`join` and local `encode` process originals already present on disk. `stream`
+keeps its remote input behavior. A batch snapshots discovered input entries;
+newly added originals are picked up on the next invocation. All completed video
+archives are checked first, including archives whose originals are absent.
+Live peer claims remain pending, with a five-second poll; expired claims use the
+existing recovery protocol (900-second default lease). Other available channels
+are processed before waiting. Cancellation retains originals and committed
+outputs. `join` always keeps originals and exits after the batch completes or
+its failures have been reported; cleanup remains an explicit separate command.
+
+The existing claim namespaces, pipeline identities, archive layouts and atomic
+publication rules are unchanged. Helpers must share the physical output and
+coordination directories. Their mount paths may differ.
 
 ## Names, resume and shared work
 

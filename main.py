@@ -5,7 +5,7 @@ import argparse
 import math
 import sys
 
-from src.archive.presets import ExplicitCodecOption, apply_target_psnr
+from src.archive.presets import ExplicitCodecOption
 
 from src.archive.workflow import run_encode, run_decode, run_cleanup, run_prepare
 from src.archive.pareto import run_pareto_search
@@ -40,11 +40,14 @@ def skip_threshold(value):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    encode = commands.add_parser('encode', aliases=['stream'], help='Encode a video or directory into resumable UF archives')
+    encode = commands.add_parser('encode', aliases=['stream', 'join'],
+                                 help='Encode originals, stream remote videos, or join a saved channel folder')
     sources = encode.add_mutually_exclusive_group(required=False)
     sources.add_argument('--input_file', '--input-file')
     sources.add_argument('--base_root', '--input_folder')
     sources.add_argument('--source_urls', nargs='+', help='YouTube video or channel URLs; stream without keeping source videos')
+    encode.add_argument('--root', help='Channel storage root (sets local input and output roots; stream sets output only)')
+    encode.add_argument('--channels', nargs='+', help='Channel folder IDs or YouTube/Twitch channel URLs')
     encode.add_argument('--youtube_channels', nargs='+', help='YouTube channel IDs or channel_ID.txt video lists')
     encode.add_argument('--twitch_channels', nargs='+', help='Twitch channel names')
     encode.add_argument('--cookies', help='Cookie file; each yt-dlp call uses a private temporary copy')
@@ -52,21 +55,21 @@ def build_parser():
     encode.add_argument('--source-max-height', type=int, default=480)
     encode.add_argument('--max-videos', type=int)
     encode.add_argument('--no-thumbnail', dest='write_thumbnail', action='store_false')
-    encode.add_argument('--output_root', required=True)
+    encode.add_argument('--output_root')
     encode.add_argument('--channel_ids', nargs='+')
     encode.add_argument('--recursive', action=argparse.BooleanOptionalAction, default=True)
     encode.add_argument('--qi', '--qp_i', action=ExplicitCodecOption, dest='qp_i', type=int, choices=range(64), default=36)
     encode.add_argument('--qp', '--qp_p', action=ExplicitCodecOption, dest='qp_p', type=int, choices=range(64), default=30)
     encode.add_argument('--target-psnr', type=positive, help='Select the fastest measured configuration meeting benchmark PSNR; smaller bytes break ties')
-    encode.add_argument('--fps', type=positive)
+    encode.add_argument('--fps', action=ExplicitCodecOption, type=positive)
     encode.add_argument('--resolution', action=ExplicitCodecOption, type=int, help='Short edge; preserve aspect ratio. Default: original size')
     encode.add_argument('--model_structure', action=ExplicitCodecOption, choices=('hts', 'htl', 'ld'), default='hts')
     encode.add_argument('--model_path_i')
     encode.add_argument('--model_path_p')
     encode.add_argument('--runtime', action=ExplicitCodecOption, choices=('fp16', 'int16'), default='fp16')
     encode.add_argument('--cuda', type=str2bool, default=True)
-    encode.add_argument('--thumbnail_codec', choices=('keep','dcvc-intra'), default='keep')
-    encode.add_argument('--thumbnail_qp', type=int, choices=range(64), default=45)
+    encode.add_argument('--thumbnail_codec', action=ExplicitCodecOption, choices=('keep','dcvc-intra'), default='keep')
+    encode.add_argument('--thumbnail_qp', action=ExplicitCodecOption, type=int, choices=range(64), default=45)
     encode.add_argument('--device', choices=('cuda', 'cpu'), default='cuda', help='CPU is the INT16 reference backend')
     encode.add_argument('--prepared_i', help='Prepared integer image model/table file')
     encode.add_argument('--prepared_p', help='Prepared integer video model/table file')
@@ -81,13 +84,13 @@ def build_parser():
     encode.add_argument('--intra_period', '--force_intra_period', action=ExplicitCodecOption, type=int, default=-1)
     encode.add_argument('--skip_thres', action=ExplicitCodecOption, type=skip_threshold, default=0,
                         help='Do not code latent residuals whose predicted scale is at or below this value')
-    encode.add_argument('--max_frames', type=int)
-    encode.add_argument('--audio', choices=('opus', 'none'), default='opus')
-    encode.add_argument('--opus_channels', choices=('mono', 'stereo'), default='mono')
-    encode.add_argument('--opus_bitrate', default='6k')
-    encode.add_argument('--opus_frame_ms', type=float, choices=(2.5,5,10,20,40,60), default=60)
-    encode.add_argument('--opus_complexity', type=int, choices=range(11), default=10)
-    encode.add_argument('--opus_vbr', choices=('on','off','constrained'), default='on')
+    encode.add_argument('--max_frames', action=ExplicitCodecOption, type=int)
+    encode.add_argument('--audio', action=ExplicitCodecOption, choices=('opus', 'none'), default='opus')
+    encode.add_argument('--opus_channels', action=ExplicitCodecOption, choices=('mono', 'stereo'), default='mono')
+    encode.add_argument('--opus_bitrate', action=ExplicitCodecOption, default='6k')
+    encode.add_argument('--opus_frame_ms', action=ExplicitCodecOption, type=float, choices=(2.5,5,10,20,40,60), default=60)
+    encode.add_argument('--opus_complexity', action=ExplicitCodecOption, type=int, choices=range(11), default=10)
+    encode.add_argument('--opus_vbr', action=ExplicitCodecOption, choices=('on','off','constrained'), default='on')
     encode.add_argument('--shared-work', action='store_true', help='Accepted for RT command compatibility; UF always uses cooperative claims')
     encode.add_argument('--shared-instance')
     encode.add_argument('--shared-lease-seconds', type=int, default=900)
@@ -189,9 +192,10 @@ def main():
             parser.error('decode requires --output_file or --output_folder')
         if args.command == 'decode' and args.input and args.input_folder:
             parser.error('select one of --input_file and --input_folder')
-    if args.command in ('encode', 'stream'):
+    if args.command in ('encode', 'stream', 'join'):
         try:
-            apply_target_psnr(args)
+            from src.archive.profiles import normalize_inputs
+            normalize_inputs(args)
         except ValueError as exc:
             parser.error(str(exc))
         if args.youtube_channels or (args.twitch_channels and not args.base_root):
@@ -207,24 +211,17 @@ def main():
             parser.error('--shared-lease-seconds must be at least 30')
         if args.source_max_height < 0 or args.max_videos is not None and args.max_videos < 1:
             parser.error('source height must be nonnegative and max videos positive')
-        if args.input_threads is None:
-            from src.archive.media import decoder_thread_budget
-            args.input_threads = decoder_thread_budget(args.procs) if args.runtime == 'int16' else 1
-        if args.prefetch_frames is None:
-            args.prefetch_frames = 8 if args.runtime == 'int16' else 0
-        if args.device == 'cpu' and args.runtime != 'int16':
-            parser.error('--device cpu requires --runtime int16')
+        # Profile-dependent defaults and target selection are applied separately
+        # for each channel, after recovering saved codec settings.
         for name in ('resolution', 'max_frames', 'procs', 'input_threads'):
             if getattr(args, name) is not None and getattr(args, name) <= 0:
                 parser.error(f'--{name} must be positive')
         if any(index < 0 for index in args.cuda_idx):
             parser.error('--cuda_idx must be nonnegative')
-        if args.prefetch_frames < 0:
+        if args.prefetch_frames is not None and args.prefetch_frames < 0:
             parser.error('--prefetch_frames must be nonnegative')
         if args.intra_period == 0 or args.intra_period < -1:
             parser.error('--intra_period must be -1 or positive')
-        if args.model_structure != 'ld' and args.intra_period > 1 and args.intra_period % 8:
-            parser.error('--intra_period for HT-S/HT-L must be 1 or a multiple of 8')
         if args.reset_interval < -1:
             parser.error('--reset_interval must be -1, 0 or positive')
     elif args.command == 'pareto-search':
@@ -243,7 +240,7 @@ def main():
         if not args.input_folder and not args.output_folder:
             args.cuda_idx = args.cuda_idx[0]
     try:
-        if args.command in ('encode', 'stream', 'manage'):
+        if args.command in ('encode', 'stream', 'join', 'manage'):
             from src.archive.dashboard import run
             return run(args)
         return args.handler(args)

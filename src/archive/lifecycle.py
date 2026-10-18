@@ -102,6 +102,18 @@ def inventory(roots, sources=None, base_root=None):
     return channels
 
 
+def local_model_options(args, archive):
+    """Use the selected channel's resolved models during final verification."""
+    matches = [(root, paths) for root, paths in getattr(args, '_channel_profiles', {}).items()
+               if Path(archive).resolve().is_relative_to(Path(root))]
+    if matches:
+        _, paths = max(matches, key=lambda item: len(Path(item[0]).parts))
+        return dict(model_path_i=paths[0], model_path_p=paths[1],
+                    prepared_i=paths[2] if len(paths) > 2 else None,
+                    prepared_p=paths[3] if len(paths) > 3 else None)
+    return {name: getattr(args, name, None) for name in ('model_path_i', 'model_path_p', 'prepared_i', 'prepared_p')}
+
+
 def cleanup_channel(row, args):
     from src.archive.workflow import run_cleanup
     failures = 0
@@ -110,8 +122,7 @@ def cleanup_channel(row, args):
         if not item['eligible']:
             continue
         options = SimpleNamespace(input=item['input'], base_root=getattr(args,'base_root',None), yes=not getattr(args, 'cleanup_dry_run', False),
-                    model_path_i=args.model_path_i, model_path_p=args.model_path_p,
-                    prepared_i=args.prepared_i, prepared_p=args.prepared_p, runtime='auto',
+                    **local_model_options(args, item['input']), runtime='auto',
                     device=args.device, cuda_idx=args.cuda_idx[0] if isinstance(args.cuda_idx, list) else args.cuda_idx)
         try:
             event('original_validation_started', channel=row['channel'], source=item['source'])
@@ -204,8 +215,7 @@ def revalidate_channel(channel, args):
             final = Path(job['final'])
             if not final.exists() and job.get('legacy'): final = Path(job['legacy'])
             load_bundle(final)
-            options = SimpleNamespace(input=str(final),runtime='auto',model_path_i=args.model_path_i,
-                       model_path_p=args.model_path_p,prepared_i=args.prepared_i,prepared_p=args.prepared_p,
+            options = SimpleNamespace(input=str(final),runtime='auto',**local_model_options(args, final),
                        device=args.device,cuda_idx=args.cuda_idx[0] if isinstance(args.cuda_idx,list) else args.cuda_idx)
             run_decode(options,verify_only=True)
         return True

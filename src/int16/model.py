@@ -82,6 +82,9 @@ class IntegerModel:
     def _mask_positions(self, shape):
         if self._position_shape != tuple(shape):
             m = self.model
+            # Persistent workers see unrelated video sizes. The upstream mask
+            # dictionary otherwise keeps a GPU allocation for every size seen.
+            m.masks.clear()
             masks = (m.get_mask_2x(*shape, self.device) if self.variant == 'ld'
                      else m.get_mask_4x(*shape, self.device))
             # Boolean indexing resolves nonzero positions and synchronizes on

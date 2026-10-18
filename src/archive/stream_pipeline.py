@@ -228,8 +228,10 @@ def execute_stream_jobs(args, config, paths, binary, counts):
     from src.archive.streaming import stream_jobs
     from src.archive.workflow import _job_entry
     from src.archive.dashboard import event_queue
+    from src.archive.coordinator import existing_archive, peer_active, validate_completed, job_key
+    from src.archive.profiles import canonical
     context = multiprocessing.get_context('spawn')
-    policy = BufferPolicy(context)
+    policies = {}
     stop = threading.Event()
     producer = AheadJobs(stream_jobs(args, binary, counts, cancel_event=stop, config=config), stop)
     devices = ['cpu'] if args.device == 'cpu' else (args.cuda_idx or [0])
@@ -238,9 +240,27 @@ def execute_stream_jobs(args, config, paths, binary, counts):
     gpu_gates = EncodeGates(config, free)
     active, outcomes, failed = [], [], set()
     pending = warm = None
+    waiting = []
+    retry_at = 0
     exhausted = False
     try:
-        while not exhausted or pending is not None or active:
+        while not exhausted or pending is not None or active or waiting:
+            if exhausted and pending is None and waiting and time.monotonic() >= retry_at:
+                retry_at = time.monotonic() + 5
+                for job in list(waiting):
+                    if existing_archive(job):
+                        status = validate_completed(job, job.get('_config', config))
+                        outcomes.append(status)
+                        if status == 'failed':
+                            failed.add(str(Path(job['final']).parent))
+                        waiting.remove(job)
+                    elif not peer_active(job):
+                        pending = job
+                        waiting.remove(job)
+                        break
+                if waiting and pending is None:
+                    event('waiting_for_peers', total=len(waiting),
+                          message=f'Waiting for {len(waiting):,} peer-owned videos; checking every 5 seconds')
             if pending is None and not exhausted:
                 try:
                     kind, payload = producer.queue.get_nowait()
@@ -252,6 +272,19 @@ def execute_stream_jobs(args, config, paths, binary, counts):
                         pending = payload
                 except queue.Empty:
                     pass
+            if pending is not None:
+                if existing_archive(pending):
+                    status = validate_completed(pending, pending.get('_config', config))
+                    outcomes.append(status)
+                    if status == 'failed':
+                        failed.add(str(Path(pending['final']).parent))
+                    pending = None
+                elif peer_active(pending):
+                    waiting.append(pending)
+                    pending = None
+                if pending is None and warm is not None:
+                    warm.close()
+                    warm = None
             # One additional downloader may warm while the GPU slots are full.
             nearing = any(item['near'].is_set() for item in active)
             if pending is not None and warm is None and (free or nearing) and needs_download(pending):
@@ -261,13 +294,19 @@ def execute_stream_jobs(args, config, paths, binary, counts):
                 job, prepared = pending, warm
                 pending = warm = None
                 near = prepared.near_end if prepared else context.Event()
+                job_config, job_paths = job.get('_config', config), job.get('_paths', paths)
+                profile_key = canonical(job_config)
+                if profile_key not in policies:
+                    policies[profile_key] = BufferPolicy(context)
+                policy = policies[profile_key]
                 job.update(buffer_policy=policy, stream_near_end=near)
                 if prepared:
                     job['prepared_download'] = prepared.descriptor()
                 device = free.pop(0)
-                job = gpu_gates.job(job, device)
+                if job_config.get('runtime') == 'int16' and job_config.get('variant') == 'htl':
+                    job = gpu_gates.job(job, device)
                 reader, writer = context.Pipe(duplex=False)
-                process = context.Process(target=_job_entry, args=(writer,job,config,paths,device,args.shared_instance),
+                process = context.Process(target=_job_entry, args=(writer,job,job_config,job_paths,device,args.shared_instance),
                                           kwargs={'event_queue':event_queue()})
                 try:
                     process.start()
@@ -276,7 +315,8 @@ def execute_stream_jobs(args, config, paths, binary, counts):
                     if prepared: prepared.close()
                     raise
                 writer.close()
-                active.append(dict(process=process, reader=reader, job=job, device=device, prepared=prepared, near=near))
+                active.append(dict(process=process, reader=reader, job=job, device=device,
+                                   prepared=prepared, near=near, policy=policy))
             for item in list(active):
                 process = item['process']
                 if process.is_alive():
@@ -289,10 +329,18 @@ def execute_stream_jobs(args, config, paths, binary, counts):
                 if process.exitcode:
                     status = 'failed'
                     event('worker_failed', source=item['job']['source'], exitcode=process.exitcode)
-                outcomes.append(status)
-                if status in ('busy','failed'):
+                if status not in ('encoded', 'resumed', 'busy', 'failed'):
+                    status = 'failed'
+                if status == 'busy':
+                    retry = {key: value for key, value in item['job'].items()
+                             if key not in ('prepared_download', 'buffer_policy', 'stream_near_end', 'gpu_gate')}
+                    waiting.append(retry)
+                else:
+                    outcomes.append(status)
+                    event('job_settled', job_key=job_key(item['job']), source=item['job']['source'], status=status)
+                if status == 'failed':
                     failed.add(str(Path(item['job']['final']).parent))
-                policy.release(process.pid)
+                item['policy'].release(process.pid)
                 item['reader'].close()
                 if item['prepared']: item['prepared'].close()
                 active.remove(item); free.append(item['device'])

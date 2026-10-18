@@ -12,6 +12,10 @@ used without renaming. Choose `--model_structure hts`, `htl`, or `ld` to match t
 video checkpoint. At least the image model and one corresponding video model
 are needed for video compression.
 
-Keep original UF checkpoints here. RT checkpoints and RT `.int16prep.pt` caches
-are incompatible with UF. UF integerization and its prepared-cache format have
-not been implemented yet. Model files in this directory are ignored by Git.
+Keep original UF checkpoints or portable UF prepared `*.int16.pt` files here.
+RT checkpoints and RT `.int16prep.pt` caches are incompatible with UF. Use
+`main.py prepare-int16` to prepare UF checkpoints, or copy the exact prepared
+files used by an existing channel. `join` locates local files by their saved
+content identities; `--prepared_i` and `--prepared_p` can select other paths.
+Prepared UF files include integer weights and entropy tables and can be used
+without the original float checkpoints. Model files are ignored by Git.
