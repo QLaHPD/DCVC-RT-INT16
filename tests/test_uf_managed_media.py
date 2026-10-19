@@ -72,6 +72,25 @@ class ManagedMediaTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 packet_index(io.BufferedReader(io.BytesIO(out.getvalue())),dict(width=2,height=2,frames=frames,packets=packets),8)
 
+    def test_viewer_discovers_audio_in_flat_and_legacy_archives(self):
+        for flat in (False, True):
+            video = self.root / ('movie.bin' if flat else 'video.bin')
+            with video.open('wb') as out:
+                write_sps(out, dict(sps_id=0, width=2, height=2))
+                write_ip(out, True, 0, 10, 0, 0, b'x')
+            data = dict(pipeline=self.config, video=dict(width=2, height=2, frames=1, packets=1),
+                        artifacts={'video.bin': {}, 'audio.opus': {}})
+            if flat:
+                data.update(layout='flat', files={'video.bin': 'movie.bin', 'audio.opus': 'movie.opus'})
+            with patch('src.archive.storage.load_bundle', return_value=(self.root, data)):
+                source = FrameSource(video, self.args)
+                self.assertEqual(source.audio_path, self.root / ('movie.opus' if flat else 'audio.opus'))
+                source.close()
+                del data['artifacts']['audio.opus']
+                source = FrameSource(video, self.args)
+                self.assertIsNone(source.audio_path)
+                source.close()
+
     def test_seek_uses_partial_decode_hook_and_rejects_wrong_counts(self):
         path = self.root/'video.bin'
         with path.open('wb') as out:

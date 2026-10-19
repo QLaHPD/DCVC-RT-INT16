@@ -331,8 +331,19 @@ The shared RT Tk viewer provides Play/Pause, previous/next frame, a seek slider,
 writing reconstructed media. Seeking starts at the nearest preceding I-frame;
 with `--intra_period -1`, a backward jump may require decoding from the start.
 UF's padded final temporal packet is trimmed to the recorded frame count.
-Like RT's viewer, playback is video-only, without synchronized audio. Folder
-image viewing provides a gallery and reuses the intra model between images.
+UF video viewing automatically loads archived Opus audio when available, for
+both flat archives and legacy bundles. Play/Pause controls both streams; seeking
+and frame stepping pause sound and reposition it for the next Play. Playback
+follows the audio device's consumed-sample clock (with a small device-dependent
+buffer delay); late video frames are skipped for display to avoid accumulating
+drift. A shorter audio track lets video finish normally. `--fps` changes both
+video speed and audio tempo while preserving pitch. No reconstructed media is
+written, and the audio queue holds approximately a quarter-second of PCM.
+`--no-audio` disables sound. Without audio, SDL2, FFmpeg or a working output
+device, video remains playable; audio initialization/decoding errors appear in
+the viewer status. Folder image viewing provides a gallery and reuses the intra
+model between images. SDL2 is loaded from the system library; no Python audio
+package is required.
 
 UF `.dcvci` files are self-contained: they embed their pipeline, original image
 size and payload hash. Older images also contain decoded-pixel validation. They use the UF intra network,

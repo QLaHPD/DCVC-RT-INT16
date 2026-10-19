@@ -154,6 +154,7 @@ def build_parser():
             child.add_argument('bin_path', nargs='?')
             child.add_argument('--recursive', action='store_true')
             child.add_argument('--fps', type=positive)
+            child.add_argument('--no-audio', action='store_true', help='Disable archived audio during windowed playback')
             child.add_argument('--start_frame', type=int, default=0)
             child.add_argument('--max_width', type=int, default=1280)
             child.add_argument('--max_height', type=int, default=720)

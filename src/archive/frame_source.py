@@ -60,6 +60,7 @@ class FrameSource:
         from src.archive.storage import load_bundle, artifact_path
         self.path, self.options = Path(path), options
         self.image = self.path.suffix.lower() == '.dcvci'
+        self.audio_path = None
         if self.image:
             from src.archive.thumbnails import read_image
             self.metadata, self.payload_offset = read_image(path)
@@ -67,6 +68,8 @@ class FrameSource:
         else:
             root, self.metadata = load_bundle(path)
             self.bitstream = artifact_path(root, self.metadata, 'video.bin')
+            if 'audio.opus' in self.metadata.get('artifacts', {}):
+                self.audio_path = artifact_path(root, self.metadata, 'audio.opus')
             self.payload_offset = 0
         self.codec = None
         self.stream = open(self.bitstream, 'rb')
@@ -189,15 +192,31 @@ def run_view(args):
         raise ValueError('No .dcvci images found')
     root = tk.Tk()
     root.withdraw()
-    if images:
-        viewer.ImageGalleryApp(root, images, args, args.start_frame, args.max_width,args.max_height,
-                               'UF / recorded runtime', source_factory=FrameSource)
-        root.title('DCVC-UF Intra Image Viewer')
-    else:
-        source = FrameSource(path,args)
-        viewer.ViewerApp(root,source,args.fps or source.metadata['video']['fps'],args.start_frame,
-                         args.max_width,args.max_height,source.metadata['pipeline'].get('runtime','fp16'))
-        root.title(f'DCVC-UF Viewer - {path.name}')
-    root.deiconify()
-    root.mainloop()
+    app = source = None
+    try:
+        if images:
+            app = viewer.ImageGalleryApp(root, images, args, args.start_frame, args.max_width,args.max_height,
+                                        'UF / recorded runtime', source_factory=FrameSource)
+            root.title('DCVC-UF Intra Image Viewer')
+        else:
+            source = FrameSource(path,args)
+            from src.archive.viewer import ViewerApp
+            app = ViewerApp(root,source,args.fps or source.metadata['video']['fps'],args.start_frame,
+                            args.max_width,args.max_height,source.metadata['pipeline'].get('runtime','fp16'),
+                            audio=not getattr(args, 'no_audio', False))
+            root.title(f'DCVC-UF Viewer - {path.name}')
+        root.deiconify()
+        root.mainloop()
+    finally:
+        # Also stop audio on Ctrl-C / root.quit(), not only window-close clicks.
+        try:
+            if root.winfo_exists():
+                if app is not None:
+                    app.close()
+                else:
+                    if source is not None:
+                        source.close()
+                    root.destroy()
+        except tk.TclError:
+            pass  # The close button already destroyed this interpreter.
     return 0
