@@ -1,5 +1,5 @@
 """YouTube inputs streamed through yt-dlp into the normal UF archive encoder."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import multiprocessing
 import os
@@ -112,9 +112,17 @@ def download_pipe(remote, format_id, prepared=None):
         with prepared_pipe(prepared) as stream:
             yield stream
         return
-    with cookie_copy(remote.get('cookies')) as copy, tempfile.TemporaryFile() as errors:
-        cmd = command(remote['binary'], copy) + ['--no-playlist', '-f', str(format_id), '-o', '-', '--', remote['url']]
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors)
+    # The native HLS downloader creates --Frag* files even for stdout output.
+    # Keep SRF fragments in an owned RAM directory, also cleaned on cancellation.
+    from src.archive.storage import memory_stage_root
+    scratch = (tempfile.TemporaryDirectory(prefix='uf-srf-download-', dir=memory_stage_root())
+               if remote.get('provider') == 'srf' else nullcontext(None))
+    with scratch as working_directory, cookie_copy(remote.get('cookies')) as copy, tempfile.TemporaryFile() as errors:
+        cmd = command(remote['binary'], copy) + ['--no-playlist', '-f', str(format_id), '-o', '-']
+        if remote.get('provider') == 'srf':
+            cmd += ['--concurrent-fragments', '4']
+        cmd += ['--', remote['url']]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors, cwd=working_directory)
         normal = False
         try:
             yield process.stdout

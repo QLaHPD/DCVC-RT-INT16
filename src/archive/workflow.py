@@ -242,6 +242,16 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
                     last[0] = now
                     pulse.check()
             from src.archive.streaming import download_pipe
+            single_pass_audio = bool(remote and remote.get('single_pass_audio')
+                                     and original['audio'] and config['audio'] == 'opus')
+            if single_pass_audio and (config['max_frames'] is not None
+                                      or remote['audio_format'] != remote['video_format']):
+                raise ValueError('Single-pass audio requires a full, muxed input')
+            reader_options = {}
+            if single_pass_audio:
+                reader_options.update(audio_output=stage / 'audio.opus', audio_options=config)
+            if job.get('reference_output'):
+                reader_options['reference_output'] = job['reference_output']
             from src.archive.rt_managed import managed_module
             DecodeError = managed_module('jetson_decode').DecodeError
             mode = job.get('hwaccel','none')
@@ -250,7 +260,7 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
                     with (download_pipe(remote, remote['video_format'], prepared=job.get('prepared_download')) if remote else nullcontext(None)) as input_pipe, \
                             FrameReader('pipe:0' if remote else source, width, height, original, fps,
                                      decoder_threads=job.get('input_threads', 1),
-                                     prefetch_frames=policy.capacity() if policy is not None else job.get('prefetch_frames', 0), input_pipe=input_pipe,hwaccel=decode_mode,adaptive_buffer=policy is not None) as reader:
+                                     prefetch_frames=policy.capacity() if policy is not None else job.get('prefetch_frames', 0), input_pipe=input_pipe,hwaccel=decode_mode,adaptive_buffer=policy is not None, **reader_options) as reader:
                         current_reader[0] = reader
                         if policy is not None: reader.prime()
                         result = codec.encode(reader, stage / 'video.bin', config['qp_i'], config['qp_p'],
@@ -265,7 +275,9 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
             result.update(width=width, height=height, fps=fps)
             if config['audio'] == 'opus' and original['audio']:
                 existing_audio = parent / (final.name.removesuffix('.uf.json') + '.opus') if flat else None
-                if existing_audio is not None and existing_audio.is_file() and not existing_audio.is_symlink():
+                if single_pass_audio:
+                    pass  # Both tracks were consumed by the same FFmpeg process.
+                elif existing_audio is not None and existing_audio.is_file() and not existing_audio.is_symlink():
                     verify_audio(existing_audio)
                     shutil.copy2(existing_audio, stage / 'audio.opus')
                     event('audio_reused', source=str(existing_audio))
@@ -292,7 +304,7 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
             import torch
             metadata = {'format': 'dcvc-uf-archive', 'version': 1, 'pipeline': config,
                         'source': {'path': str(source), 'relative_path': job['relative'],
-                                   'sha256': source_sha, **before, 'media': original, **({'url': remote['url'], 'kind': 'youtube'} if remote else {})},
+                                   'sha256': source_sha, **before, 'media': original, **({'url': remote['url'], 'kind': remote.get('provider', 'youtube')} if remote else {})},
                         'video': result, 'validation': validation, 'artifacts': artifacts,
                         'environment': {'torch': torch.__version__, 'cuda': torch.version.cuda,
                                         'gpu': 'CPU reference' if device == 'cpu' else torch.cuda.get_device_name(device)}}
@@ -308,6 +320,10 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
             # overwrite a nonempty peer archive. Partial work is always hidden.
             if final.exists():
                 raise FileExistsError(final)
+            if job.get('min_free_bytes') is not None:
+                required = sum(p.stat().st_size for p in stage.iterdir()) + job['min_free_bytes']
+                if shutil.disk_usage(parent).free < required:
+                    raise OSError('Insufficient destination space; archive not published')
             event('publication_started', source=str(source), message='Encoding complete; copying RAM output for atomic publication')
             memory_stage = stage
             stage = completed_disk_stage(memory_stage, final, pulse)
@@ -546,7 +562,7 @@ def _cleanup_owned(args, root, metadata, heartbeat):
         raise ValueError('Partial archives cannot authorize original deletion')
     if metadata['source']['media']['audio'] and 'audio.opus' not in metadata['artifacts']:
         raise ValueError('Archive omits source audio; refusing original deletion')
-    if metadata['source'].get('kind') == 'youtube':
+    if metadata['source'].get('url'):
         raise ValueError('Streamed archives have no stored original video to delete')
     source = (Path(args.base_root).resolve() / metadata['source']['relative_path']
               if args.base_root else Path(metadata['source']['path']))

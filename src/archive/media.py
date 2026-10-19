@@ -48,7 +48,8 @@ def dimensions(width, height, resolution):
 
 class FrameReader:
     def __init__(self, source, width, height, original, fps=None, decoder_threads=1,
-                 prefetch_frames=0, input_pipe=None, hwaccel="none", adaptive_buffer=False):
+                 prefetch_frames=0, input_pipe=None, hwaccel="none", adaptive_buffer=False,
+                 audio_output=None, audio_options=None, reference_output=None):
         if not isinstance(decoder_threads, int) or decoder_threads < 1:
             raise ValueError('decoder_threads must be a positive integer')
         if not isinstance(prefetch_frames, int) or prefetch_frames < 0:
@@ -68,6 +69,17 @@ class FrameReader:
         if filters:
             command += ['-vf', ','.join(filters)]
         command += ['-pix_fmt', 'yuv420p', '-vsync', '0', '-f', 'rawvideo', 'pipe:1']
+        if audio_output is not None:
+            options = audio_options or {}
+            command += ['-map', '0:a:0', '-vn', '-sn', '-dn', '-c:a', 'libopus',
+                        '-ac', '1' if options.get('opus_channels', 'mono') == 'mono' else '2',
+                        '-b:a', options.get('opus_bitrate', '6k'),
+                        '-frame_duration', str(options.get('opus_frame_ms', 20)),
+                        '-compression_level', str(options.get('opus_complexity', 10)),
+                        '-vbr', options.get('opus_vbr', 'on'), '-f', 'opus', str(audio_output)]
+        # Optional pilot reference is the exact YUV420 input to the neural codec.
+        # It is streamed to RAM, rather than retaining a full broadcast in Python.
+        self.reference = open(reference_output, 'xb') if reference_output is not None else None
         self.errors = tempfile.TemporaryFile()
         try:
             if hwaccel == 'jetson':
@@ -77,6 +89,8 @@ class FrameReader:
                 self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=self.errors, stdin=input_pipe)
         except BaseException:
             self.errors.close()
+            if self.reference is not None:
+                self.reference.close()
             raise
         self.ended = False
         self._closed = self._prefetch_done = False
@@ -157,7 +171,10 @@ class FrameReader:
                 return None
             blocks.append(chunk)
             remaining -= len(chunk)
-        values = np.frombuffer(b''.join(blocks), dtype=np.uint8)
+        raw = b''.join(blocks)
+        if self.reference is not None:
+            self.reference.write(raw)
+        values = np.frombuffer(raw, dtype=np.uint8)
         n = self.width * self.height
         y = values[:n].reshape(self.height, self.width)
         u = values[n:n + n//4].reshape(self.height//2, self.width//2)
@@ -185,6 +202,8 @@ class FrameReader:
         self.process.stdout.close()
         if hasattr(self.process,'close'): self.process.close()
         self.errors.close()
+        if self.reference is not None:
+            self.reference.close()
 
     def __enter__(self):
         return self

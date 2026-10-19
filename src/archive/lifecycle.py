@@ -46,7 +46,7 @@ def inventory(roots, sources=None, base_root=None):
                     source = base / data['source']['relative_path']
                     if not source.resolve().is_relative_to(base):
                         raise ValueError('Original path escapes base_root')
-                remote = data['source'].get('kind') == 'youtube'
+                remote = bool(data['source'].get('url'))
                 in_scope = sources is None or str(source.absolute()) in sources
                 eligible = (in_scope and not remote and data['pipeline'].get('max_frames') is None
                             and (not data['source']['media']['audio'] or 'audio.opus' in data['artifacts'])
