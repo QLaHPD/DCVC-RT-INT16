@@ -92,6 +92,30 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'positive integer'):
             FrameReader(self.source, 48, 32, media, decoder_threads=0)
 
+    def test_truncated_remote_stream_is_not_published(self):
+        media = {**probe(self.source), 'duration': 10, 'audio': False}
+        self.config['audio'] = 'none'
+        self.job['remote'] = dict(url='https://www.youtube.com/watch?v=abcdefghijk',
+                                  video_format='v', media=media,
+                                  public_metadata={'id': 'abcdefghijk'})
+
+        @contextlib.contextmanager
+        def download(*args, **kwargs):
+            with self.source.open('rb') as stream:
+                yield stream
+
+        output = io.StringIO()
+        with patch('src.archive.streaming.download_pipe', download), contextlib.redirect_stdout(output):
+            self.assertEqual(encode_job(self.job, self.config, ('unused-i', 'unused-p'), 0, 'test'), 'failed')
+        self.assertIn('Source stream ended early', output.getvalue())
+        self.assertFalse(self.final.exists())
+        self.assertTrue(self.source.exists())
+        self.config['max_frames'] = 2
+        self.final = self.root / 'partial/source.mkv.uf'
+        self.job['final'] = str(self.final)
+        with patch('src.archive.streaming.download_pipe', download):
+            self.assertEqual(self.encode(), 'encoded')
+
     def test_prefetch_early_stop_and_decoder_failure_release_resources(self):
         media = probe(self.source)
         # Frames larger than the OS pipe ensure an abandoned producer cannot
@@ -124,6 +148,8 @@ class ArchiveTests(unittest.TestCase):
         for runtime, extra, expected in cases:
             captured = []
             def run(args):
+                from src.archive.profiles import validate_options
+                validate_options(args)
                 captured.append((args.input_threads, args.prefetch_frames))
                 return 0
             argv = ['main.py', 'encode', '--input_file', str(self.source),

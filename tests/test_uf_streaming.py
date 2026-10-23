@@ -1,4 +1,5 @@
 import os
+import shlex
 from pathlib import Path
 import tempfile
 import unittest
@@ -46,10 +47,17 @@ class StreamingTests(unittest.TestCase):
 
     def test_failed_downloader_is_not_published_as_success(self):
         with tempfile.TemporaryDirectory() as d:
-            p=Path(d)/'downloader';p.write_text('#!/bin/sh\nprintf partial\nexit 1\n');p.chmod(0o700)
+            marker=Path(d)/'download-directory'
+            p=Path(d)/'downloader'
+            p.write_text('#!/bin/sh\npwd > '+shlex.quote(str(marker))+'\n'
+                         'printf fragment > ./--Frag1.part\nprintf partial\nexit 1\n')
+            p.chmod(0o700)
             with self.assertRaisesRegex(RuntimeError,'stream failed'):
                 with download_pipe(dict(binary=str(p),url='test'), 'v') as source:
                     self.assertEqual(source.read(),b'partial')
+            directory=Path(marker.read_text().strip())
+            self.assertEqual(directory.parent,Path('/dev/shm'))
+            self.assertFalse(directory.exists())
 
     def test_stream_cli_uses_encode_validation(self):
         import main
@@ -57,6 +65,10 @@ class StreamingTests(unittest.TestCase):
             self.assertEqual(main.main(),0)
             args=run.call_args.args[0]
             self.assertEqual(args.cuda_idx,[0])
+            # Buffer defaults are resolved after the saved channel profile.
+            self.assertIsNone(args.prefetch_frames)
+            from src.archive.profiles import validate_options
+            validate_options(args)
             self.assertEqual(args.prefetch_frames,8)
 
     def test_source_height_cap_and_rt_stream_names(self):

@@ -128,6 +128,40 @@ if url=='fail':sys.exit(5)
         self.assertIsNotNone(prepared.process.poll())
         self.assertFalse(Path(name).exists());self.assertEqual(cookies.read_text(),'original')
 
+    def test_parallel_downloaders_isolate_hls_fragment_names_and_cleanup(self):
+        binary = self.root / 'hls-downloader'
+        release = self.root / 'release-downloads'
+        binary.write_text('#!' + sys.executable + '\n' + '''
+import sys,time
+from pathlib import Path
+fragment=Path('--Frag1.part')
+fragment.write_text(sys.argv[-1])
+print(str(Path.cwd()),flush=True)
+while not Path(''' + repr(str(release)) + ''').exists():time.sleep(.01)
+assert fragment.read_text()==sys.argv[-1]
+print(fragment.read_text(),flush=True)
+''')
+        binary.chmod(0o700)
+        downloads = []
+        try:
+            for name in ('one', 'two'):
+                download = PreparedDownload(dict(binary=str(binary), url=name,
+                                                 video_format='v'), self.context)
+                downloads.append(download)
+                directory = Path(download.process.stdout.readline().decode().strip())
+                self.assertEqual(directory.parent, Path('/dev/shm'))
+                self.assertEqual((directory / '--Frag1.part').read_text(), name)
+            self.assertNotEqual(downloads[0].scratch.name, downloads[1].scratch.name)
+            release.touch()
+            for name, download in zip(('one', 'two'), downloads):
+                self.assertEqual(download.process.stdout.read(), (name + '\n').encode())
+                self.assertEqual(download.process.wait(timeout=5), 0)
+        finally:
+            directories = [Path(download.scratch.name) for download in downloads]
+            for download in downloads:
+                download.close()
+            self.assertTrue(all(not directory.exists() for directory in directories))
+
     def test_next_downloader_starts_before_current_worker_finishes(self):
         binary,log=self.downloader()
         jobs=[dict(source=name,final=str(self.root/(name+'.uf.json')),log=str(log),

@@ -88,14 +88,18 @@ class PreparedDownload:
         self.near_end = context.Event()
         self.process = None
         self.thread = None
+        self.scratch = None
         self.closed = False
         try:
+            from src.archive.storage import memory_stage_root
+            self.scratch = tempfile.TemporaryDirectory(
+                prefix='uf-stream-download-', dir=memory_stage_root())
             cmd = command(remote['binary'], self.cookie_path) + [
                 '--progress', '--newline', '--progress-delta', '0.2',
                 '--progress-template', _TEMPLATE, '--no-playlist',
                 '-f', str(remote['video_format']), '-o', '-', '--', remote['url']]
             self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                            start_new_session=True)
+                                            start_new_session=True, cwd=self.scratch.name)
             self.thread = threading.Thread(target=self._monitor, name='uf-download-progress', daemon=True)
             self.thread.start()
         except BaseException:
@@ -146,6 +150,8 @@ class PreparedDownload:
             self.process.stderr.close()
         self.errors.close()
         self.cookies.__exit__(None, None, None)
+        if self.scratch is not None:
+            self.scratch.cleanup()
 
 
 def open_descriptor(descriptor):

@@ -1,5 +1,5 @@
 """YouTube inputs streamed through yt-dlp into the normal UF archive encoder."""
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import json
 import multiprocessing
 import os
@@ -113,10 +113,9 @@ def download_pipe(remote, format_id, prepared=None):
             yield stream
         return
     # The native HLS downloader creates --Frag* files even for stdout output.
-    # Keep SRF fragments in an owned RAM directory, also cleaned on cancellation.
+    # YouTube and SRF both use HLS. Isolate every downloader's fragment names.
     from src.archive.storage import memory_stage_root
-    scratch = (tempfile.TemporaryDirectory(prefix='uf-srf-download-', dir=memory_stage_root())
-               if remote.get('provider') == 'srf' else nullcontext(None))
+    scratch = tempfile.TemporaryDirectory(prefix='uf-stream-download-', dir=memory_stage_root())
     with scratch as working_directory, cookie_copy(remote.get('cookies')) as copy, tempfile.TemporaryFile() as errors:
         cmd = command(remote['binary'], copy) + ['--no-playlist', '-f', str(format_id), '-o', '-']
         if remote.get('provider') == 'srf':

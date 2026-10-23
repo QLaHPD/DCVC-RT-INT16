@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -272,6 +273,13 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
                     event('decoder_fallback',source=str(source),error=str(exc),message='Retrying input with software decoding')
             if policy is not None: policy.release()
             if job.get('stream_near_end') is not None: job['stream_near_end'].set()
+            if remote and config['max_frames'] is None:
+                expected_seconds = float(original.get('duration') or 0)
+                encoded_seconds = result['frames'] / fps
+                if (math.isfinite(expected_seconds) and expected_seconds > 0
+                        and encoded_seconds + max(2.0, 2.0 / fps) < expected_seconds):
+                    raise ValueError(f'Source stream ended early: encoded {encoded_seconds:.2f}s '
+                                     f'of expected {expected_seconds:.2f}s; refusing to publish')
             result.update(width=width, height=height, fps=fps)
             if config['audio'] == 'opus' and original['audio']:
                 existing_audio = parent / (final.name.removesuffix('.uf.json') + '.opus') if flat else None
