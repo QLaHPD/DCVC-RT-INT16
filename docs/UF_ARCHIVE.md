@@ -336,7 +336,18 @@ both flat archives and legacy bundles. Play/Pause controls both streams; seeking
 and frame stepping pause sound and reposition it for the next Play. Playback
 follows the audio device's consumed-sample clock (with a small device-dependent
 buffer delay); late video frames are skipped for display to avoid accumulating
-drift. A shorter audio track lets video finish normally. `--fps` changes both
+drift. The viewer retains **512 previous frames and decodes 512 frames ahead**,
+independent of frame rate (`--decode-history` and `--decode-ahead` override the
+counts). The currently displayed frame is retained as well. Cached frames remain
+in compact YUV420 form, using approximately 338 MiB for a full window at 640×360.
+The UI shows history and future-buffer occupancy. Playback starts after a short packet-sized warm-up while the
+rest of the buffer fills, then presents frames individually at their timestamps.
+Real buffer starvation pauses both clocks until video is ready. Previous/Next
+and seeks within the cached window reuse decoded frames immediately. A seek
+outside it clears the cache and cancels obsolete decode work; frames outside
+the history/future limits are evicted. Closing waits for the decoder
+thread to release its native resources.
+A shorter audio track lets video finish normally. `--fps` changes both
 video speed and audio tempo while preserving pitch. No reconstructed media is
 written, and the audio queue holds approximately a quarter-second of PCM.
 `--no-audio` disables sound. Without audio, SDL2, FFmpeg or a working output

@@ -120,13 +120,13 @@ class ImageGalleryWorker:
 
 class ViewerApp:
     def __init__(self, root, source: BitstreamFrameSource, fps: float, start_frame: int,
-                 max_width: int, max_height: int, runtime_label: str):
+                 max_width: int, max_height: int, runtime_label: str, worker_factory=None):
         import tkinter as tk
 
         self.tk = tk
         self.root = root
         self.source = source
-        self.worker = DecodeWorker(source)
+        self.worker = (worker_factory or DecodeWorker)(source)
         self.fps = max(0.1, fps)
         self.max_width = max_width
         self.max_height = max_height
@@ -172,7 +172,7 @@ class ViewerApp:
 
         self.set_status("Loading frame...")
         self.request_frame(self.current_frame)
-        self.root.after(30, self.poll_results)
+        self.poll_after_id = self.root.after(30, self.poll_results)
 
     def request_frame(self, frame_index: int):
         if self.source.index.frame_count <= 0:
@@ -199,7 +199,7 @@ class ViewerApp:
                 self.set_status(payload)
                 continue
             self.display_frame(payload)
-        self.root.after(30, self.poll_results)
+        self.poll_after_id = self.root.after(30, self.poll_results)
 
     def display_frame(self, frame: DecodedFrame):
         self.photo = _frame_photo(frame, self.max_width, self.max_height)
@@ -263,6 +263,9 @@ class ViewerApp:
         self.status_label.configure(text=text)
 
     def close(self):
+        if self.poll_after_id is not None:
+            self.root.after_cancel(self.poll_after_id)
+            self.poll_after_id = None
         if self.play_after_id is not None:
             self.root.after_cancel(self.play_after_id)
         self.worker.close()

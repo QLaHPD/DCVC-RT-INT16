@@ -155,6 +155,10 @@ def build_parser():
             child.add_argument('--recursive', action='store_true')
             child.add_argument('--fps', type=positive)
             child.add_argument('--no-audio', action='store_true', help='Disable archived audio during windowed playback')
+            child.add_argument('--decode-ahead', type=int, default=512,
+                               help='Maximum decoded frames buffered ahead (default: 512, independent of fps)')
+            child.add_argument('--decode-history', type=int, default=512,
+                               help='Previous decoded frames retained for backward navigation (default: 512)')
             child.add_argument('--start_frame', type=int, default=0)
             child.add_argument('--max_width', type=int, default=1280)
             child.add_argument('--max_height', type=int, default=720)
@@ -188,6 +192,10 @@ def main():
         args.device = 'cpu'
     if args.command == 'view':
         args.input = args.input or args.bin_path
+        if args.decode_ahead < 1:
+            parser.error('--decode-ahead must be positive')
+        if args.decode_history < 0:
+            parser.error('--decode-history must be nonnegative')
     if args.command in ('decode','verify','view','cleanup'):
         if not args.input and not getattr(args,'input_folder',None):
             parser.error('provide --input_file, --input_folder, or a viewer path')

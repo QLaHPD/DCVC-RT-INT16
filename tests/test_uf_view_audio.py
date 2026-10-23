@@ -40,6 +40,9 @@ class TempoTests(unittest.TestCase):
         parser = build_parser()
         self.assertFalse(parser.parse_args(['view', 'clip.bin']).no_audio)
         self.assertTrue(parser.parse_args(['view', 'clip.bin', '--no-audio']).no_audio)
+        for fps in (8, 15, 60):
+            options = parser.parse_args(['view', 'clip.bin', '--fps', str(fps)])
+            self.assertEqual((options.decode_ahead, options.decode_history), (512, 512))
 
 
 @unittest.skipUnless(shutil.which('ffmpeg') and ctypes.util.find_library('SDL2-2.0'), 'Needs FFmpeg and SDL2')
@@ -114,17 +117,40 @@ class FakeSource:
         self.metadata = dict(video=dict(fps=8), pipeline=dict(runtime='int16'))
         self.closed = False
         self.delay = 0
+        self.calls = []
 
     def seek(self, index, **_kwargs):
+        self.calls.append(index)
         time.sleep(self.delay)
         return SimpleNamespace(index=index, width=8, height=8, frame_type='P', qp=39,
-                               rgb=np.zeros((8, 8, 3), dtype=np.uint8))
+                               rgb=np.zeros((8, 8, 3), dtype=np.uint8), raw=bytes(64) + bytes([128])*32)
 
     def close(self):
         self.closed = True
 
 
 class ViewerLifecycleTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('DISPLAY'), 'Needs a Tk display')
+    def test_shared_viewer_default_worker_remains_compatible(self):
+        import tkinter as tk
+        from src.archive.rt_managed import managed_module
+        viewer = managed_module('viewer')
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(str(exc))
+        root.withdraw()
+        app = viewer.ViewerApp(root, FakeSource(), 8, 0, 100, 100, 'test')
+        try:
+            self.assertIsInstance(app.worker, viewer.DecodeWorker)
+            until(lambda: app.photo is not None, pump=root.update)
+            app.toggle_play()
+            until(lambda: app.current_frame > 0, pump=root.update)
+        finally:
+            app.close()
+            app.worker.thread.join(timeout=2)
+        self.assertFalse(app.worker.thread.is_alive())
+
     def test_keyboard_interrupt_closes_window_and_audio_owner(self):
         from src.archive.frame_source import run_view
         root = Mock()
@@ -231,17 +257,50 @@ class ViewerTests(unittest.TestCase):
         app.toggle_play()
         until(lambda: app.displayed_frame == 0, pump=self.root.update)
         self.assertTrue(app.playing)
+        until(lambda: app.audio.calls[-1] == ('play', 0., 1.), pump=self.root.update)
         self.assertEqual(app.audio.calls[-1], ('play', 0., 1.))
 
     def test_play_waits_for_seek_before_starting_sound(self):
         app = self.app
-        self.source.delay = .1
-        app.seek(8)
+        self.source.index.frame_count = 1200
+        self.source.delay = .02
+        app.seek(800)  # A cache miss: audio waits for the seek and warm-up.
         count = len([c for c in app.audio.calls if c[0] == 'play'])
         app.toggle_play()
         self.assertEqual(len([c for c in app.audio.calls if c[0] == 'play']), count)
-        until(lambda: app.displayed_frame == 8, pump=self.root.update)
-        self.assertEqual(app.audio.calls[-1], ('play', 1., 1.))
+        until(lambda: app.displayed_frame == 800, pump=self.root.update)
+        until(lambda: app.audio.calls[-1] == ('play', 100., 1.), pump=self.root.update)
+        self.assertEqual(app.audio.calls[-1], ('play', 100., 1.))
+
+    def test_previous_and_next_reuse_decoded_frames(self):
+        app = self.app
+        until(lambda: app.worker.status(app.request_id)['eof'], pump=self.root.update)
+        app.toggle_play()
+        app.audio.time = 1.25
+        until(lambda: app.displayed_frame == 10, pump=self.root.update)
+        calls = list(self.source.calls)
+        app.previous_frame()
+        until(lambda: app.displayed_frame == 9, pump=self.root.update)
+        self.assertFalse(app.playing)
+        self.assertEqual(self.source.calls, calls)
+        app.next_frame()
+        until(lambda: app.displayed_frame == 10, pump=self.root.update)
+        self.assertEqual(self.source.calls, calls)
+
+    def test_prefetched_frames_wait_for_their_presentation_time(self):
+        app = self.app
+        until(lambda: app.worker.status(app.request_id)['eof'], pump=self.root.update)
+        self.assertEqual(app.worker.status(app.request_id)['size'], 15)
+        app.toggle_play()
+        # A full buffer must not dump its frames onto the screen at decode speed.
+        end = time.monotonic() + .08
+        while time.monotonic() < end:
+            self.root.update()
+            time.sleep(.005)
+        self.assertEqual(app.displayed_frame, 0)
+        for index in (1, 2, 3):
+            app.audio.time = index / app.native_fps
+            until(lambda: app.displayed_frame == index, pump=self.root.update)
 
     def test_audio_failure_keeps_video_running(self):
         app = self.app

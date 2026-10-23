@@ -94,11 +94,13 @@ class FrameSource:
             self.stream.close()
             raise
 
-    def seek(self, frame_index, output_format='rgb'):
+    def seek(self, frame_index, output_format='rgb', cancel=None):
         import torch
         from src.archive.workflow import checked_codec
         if not 0 <= frame_index < self.index.frame_count:
             raise IndexError(frame_index)
+        if output_format not in ('rgb', 'yuv420p'):
+            raise ValueError(f'Unsupported viewer output format: {output_format}')
         if self.codec is None:
             if self.image:
                 key = repr(self.metadata['pipeline'])
@@ -121,6 +123,8 @@ class FrameSource:
                 self.next_packet = anchor
             with torch.no_grad():
                 while self.next_packet <= target:
+                    if cancel is not None and cancel():
+                        raise InterruptedError('Viewer seek cancelled')
                     packet = self.packets[self.next_packet]
                     self.stream.seek(packet.offset)
                     read_header(self.stream)
@@ -168,10 +172,11 @@ class FrameSource:
         packet = self.packets[target]
         width, height = packet.sps['width'], packet.sps['height']
         raw = self.cached[frame_index-packet.first]
-        rgb = raw_rgb(raw,width,height)
+        rgb = raw_rgb(raw,width,height) if output_format == 'rgb' else None
         if self.image:
             width,height = self.metadata['image_width'],self.metadata['image_height']
-            rgb = rgb[:height,:width]
+            if rgb is not None:
+                rgb = rgb[:height,:width]
         return SimpleNamespace(index=frame_index, width=width, height=height,
                                frame_type='I' if packet.nal_type == NalType.NAL_I else 'P', qp=packet.qp,
                                rgb=rgb, raw=raw)
@@ -203,7 +208,9 @@ def run_view(args):
             from src.archive.viewer import ViewerApp
             app = ViewerApp(root,source,args.fps or source.metadata['video']['fps'],args.start_frame,
                             args.max_width,args.max_height,source.metadata['pipeline'].get('runtime','fp16'),
-                            audio=not getattr(args, 'no_audio', False))
+                            audio=not getattr(args, 'no_audio', False),
+                            decode_ahead=getattr(args, 'decode_ahead', 512),
+                            decode_history=getattr(args, 'decode_history', 512))
             root.title(f'DCVC-UF Viewer - {path.name}')
         root.deiconify()
         root.mainloop()

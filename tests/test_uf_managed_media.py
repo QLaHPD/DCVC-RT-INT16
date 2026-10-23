@@ -65,6 +65,11 @@ class ManagedMediaTests(unittest.TestCase):
                 self.assertEqual(source.seek(index).raw,bytes([10+index])*6)
             self.assertEqual(fake.image.calls[0],(19,)) # Jump starts at nearest I, skips first GOP.
             with self.assertRaises(IndexError):source.seek(13)
+            raw = source.seek(12, output_format='yuv420p')
+            self.assertIsNone(raw.rgb)
+            self.assertEqual(raw.raw, bytes([22])*6)
+            with self.assertRaises(InterruptedError):
+                source.seek(0, cancel=lambda: True)
 
     def test_incomplete_index_and_extra_packet_rejected(self):
         for frames,packets in [(2,1),(1,2)]:
