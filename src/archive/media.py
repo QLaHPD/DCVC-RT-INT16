@@ -219,5 +219,7 @@ def encode_audio(source, target, channels, bitrate, duration, input_pipe=None, f
 
 
 def verify_audio(path):
-    subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-i', str(path), '-map', '0:a:0',
-                    '-f', 'null', '-'], check=True)
+    # FFmpeg 6.1 can repeat a decoded timestamp while trimming the last Opus
+    # packet. Check continuous decoded samples using throwaway timestamps.
+    subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-xerror', '-i', str(path), '-map', '0:a:0',
+                    '-af', 'asetpts=N/SR/TB', '-f', 'null', '-'], check=True)
