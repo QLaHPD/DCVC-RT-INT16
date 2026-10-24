@@ -21,10 +21,10 @@ torch::Tensor uf_depth_block(const torch::Tensor&,const std::vector<torch::Tenso
 std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_depth_block_packed(
     const torch::Tensor&,const std::vector<torch::Tensor>&,
     const std::vector<c10::optional<torch::Tensor>>&,const torch::Tensor&,bool,
-    const c10::optional<torch::Tensor>&,bool);
+    const c10::optional<torch::Tensor>&,bool,bool);
 std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_conv_packed(
     const torch::Tensor&,const torch::Tensor&,const c10::optional<torch::Tensor>&,
-    const c10::optional<torch::Tensor>&,bool);
+    const c10::optional<torch::Tensor>&,bool,bool);
 torch::Tensor uf_conv_tiled(const torch::Tensor&, const torch::Tensor&, const c10::optional<torch::Tensor>&, int);
 torch::Tensor uf_conv_wsilu4(const torch::Tensor&, const torch::Tensor&, const c10::optional<torch::Tensor>&,
     const torch::Tensor&,int);
@@ -58,8 +58,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("from_symbols", &uf_from_symbols);
     m.def("reciprocal", &uf_reciprocal);
     m.def("depth_conv_block", &uf_depth_block,pybind11::call_guard<pybind11::gil_scoped_release>());
-    m.def("depth_conv_block_packed", &uf_depth_block_packed,pybind11::call_guard<pybind11::gil_scoped_release>());
-    m.def("conv2d_packed", &uf_conv_packed,pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("depth_conv_block_packed", &uf_depth_block_packed,
+          pybind11::arg("x"),pybind11::arg("weights"),pybind11::arg("biases"),
+          pybind11::arg("lut"),pybind11::arg("shortcut"),pybind11::arg("packed_input"),
+          pybind11::arg("emit_packed"),pybind11::arg("packed_only")=false,
+          pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("conv2d_packed", &uf_conv_packed,
+          pybind11::arg("x"),pybind11::arg("weight"),pybind11::arg("bias"),
+          pybind11::arg("packed_input"),pybind11::arg("emit_packed"),
+          pybind11::arg("packed_only")=false,
+          pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("conv2d_tiled", &uf_conv_tiled);
     m.def("conv2d_wsilu4", &uf_conv_wsilu4,pybind11::arg("x"),pybind11::arg("weight"),
           pybind11::arg("bias"),pybind11::arg("lut"),pybind11::arg("tile")=0);

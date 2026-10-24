@@ -76,6 +76,8 @@ class Layers:
                 entries = []
                 for index, child in enumerate(children):
                     current = self._native_blocks.get(id(child))
+                    if current is None and type(child).__name__ == 'ResidualBlockUpsample':
+                        current = self._native_blocks.get(id(child.conv))
                     eligible, channels = False, 0
                     if current is not None and index + 1 < len(children):
                         weights = current[0]
@@ -150,7 +152,7 @@ class Layers:
             if (self._native_conv_packed is not None and (_pack_output or _packed_input is not None)
                     and module.kernel_size == (1, 1) and module.stride == (1, 1)
                     and module.padding == (0, 0) and module.groups == 1):
-                out, packed = self._native_conv_packed(x, w, b, _packed_input, _pack_output)
+                out, packed = self._native_conv_packed(x, w, b, _packed_input, _pack_output, _pack_output)
                 return (out, packed) if _pack_output else out
             out = ops.conv2d(x, w, b, module.stride, module.padding, module.groups)
             return (out, None) if _pack_output else out
@@ -175,7 +177,7 @@ class Layers:
                 weights, biases, shortcut = native
                 if self._native_packed_block is not None and (_pack_output or _packed_input is not None):
                     out, packed = self._native_packed_block(x, weights, biases,
-                        self.values['tables.wsilu'], shortcut, _packed_input, _pack_output)
+                        self.values['tables.wsilu'], shortcut, _packed_input, _pack_output, _pack_output)
                     return (out, packed) if _pack_output else out
                 return self._native_block(x, weights, biases, self.values['tables.wsilu'], shortcut)
             fused = self._fused_blocks.get(id(module))
@@ -193,7 +195,7 @@ class Layers:
         if name == 'SubpelConv2x':
             return self(module.conv, x)
         if name == 'ResidualBlockUpsample':
-            return self(module.conv, self(module.up, x))
+            return self(module.conv, self(module.up, x), _pack_output=_pack_output)
         if name == 'ResidualBlockWithStride2':
             unshuffled = F.pixel_unshuffle(x, 2)
             if self._native_packed_block is not None and self._native_conv_packed is not None:

@@ -22,7 +22,7 @@ __device__ int16_t postprocess(int16_t value,const int16_t* lut,
         value=sum<-32768?-32768:(sum>32767?32767:sum);
     }
     if(shortcut) {
-        int sum=static_cast<int>(value)+shortcut[index];
+        int sum=static_cast<int>(value)+shortcut[residual_index];
         value=sum<-32768?-32768:(sum>32767?32767:sum);
     }
     return value;
@@ -86,6 +86,17 @@ __global__ void unfold_int16(int16_t* out,const int16_t* x,int count,int ci,int 
     int n=i%(oh*ow),k=(i/(oh*ow))%(ci*kh*kw),batch=i/(ci*kh*kw*oh*ow);
     int iy=(n/ow)*sh+(k%(kh*kw))/kw-ph,ix=(n%ow)*sw+k%kw-pw;
     out[i]=(iy>=0 && iy<h && ix>=0 && ix<w)?x[((batch*ci+k/(kh*kw))*h+iy)*w+ix]:0;
+}
+
+__global__ void unfold_int16_nhwc(int16_t* __restrict__ out,const int16_t* __restrict__ x,
+    int reduction,int ci,int h,int w,int oh,int ow,int kh,int kw,int sh,int sw,int ph,int pw) {
+    int k=blockIdx.x*256+threadIdx.x;
+    if(k>=reduction) return;
+    int ox=blockIdx.y,batch_oy=blockIdx.z,oy=batch_oy%oh,batch=batch_oy/oh;
+    int area=kh*kw,c=k/area,rem=k%area,ky=rem/kw,kx=rem%kw;
+    int iy=oy*sh+ky-ph,ix=ox*sw+kx-pw;
+    int64_t out_idx=(static_cast<int64_t>(batch_oy)*ow+ox)*reduction+k;
+    out[out_idx]=(iy>=0 && iy<h && ix>=0 && ix<w)?x[((static_cast<int64_t>(batch)*ci+c)*h+iy)*w+ix]:0;
 }
 
 __global__ void depthwise3x3(int16_t* out,const int16_t* x,const int16_t* weight,
@@ -158,6 +169,32 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
         int64_t elements=x.size(0)*reduction*oh*ow;
         if(use_mma && !point && groups==1 && co>=128 && reduction>=256 &&
            reduction<=32768 && elements<=4*1024*1024) {
+            int n=oh*ow;
+            if(reduction%32==0 && n>=128 && !(reinterpret_cast<uintptr_t>(weight.data_ptr<int16_t>())&7)) {
+                auto packed=torch::empty({x.size(0),n,reduction},x.options());
+                unfold_int16_nhwc<<<dim3((reduction+255)/256,ow,x.size(0)*oh),256,0,stream>>>(
+                    packed.data_ptr<int16_t>(),x.data_ptr<int16_t>(),reduction,ci,h,w,oh,ow,kh,kw,sh,sw,ph,pw);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                auto out=torch::empty({x.size(0),co,oh,ow},x.options());
+                if(n>=256 && reduction%64==0) {
+                    dim3 grid((n+63)/64,(co+63)/64,x.size(0));
+                    uf_mma_direct<64,false,2,4><<<grid,128,0,stream>>>(
+                        out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),weight.data_ptr<int16_t>(),
+                        ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                } else if(reduction%64==0) {
+                    dim3 grid((n+31)/32,(co+63)/64,x.size(0));
+                    uf_mma_direct<32,false,2,4><<<grid,128,0,stream>>>(
+                        out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),weight.data_ptr<int16_t>(),
+                        ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                } else {
+                    dim3 grid((n+31)/32,(co+63)/64,x.size(0));
+                    uf_mma_direct<32,false,1,4><<<grid,128,0,stream>>>(
+                        out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),weight.data_ptr<int16_t>(),
+                        ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                }
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                return out;
+            }
             auto packed=torch::empty({x.size(0),reduction,oh,ow},x.options());
             unfold_int16<<<(elements+255)/256,256,0,stream>>>(packed.data_ptr<int16_t>(),
                 x.data_ptr<int16_t>(),elements,ci,h,w,oh,ow,kh,kw,sh,sw,ph,pw);
@@ -349,7 +386,8 @@ static torch::Tensor block_pointwise(const torch::Tensor& x,const torch::Tensor&
     torch::Tensor res,skip;
     if(residual.has_value())
         res=RES_LAST?residual->permute({0,2,3,1}).contiguous():residual->contiguous();
-    if(shortcut.has_value()) skip=shortcut->contiguous();
+    if(shortcut.has_value())
+        skip=RES_LAST?shortcut->permute({0,2,3,1}).contiguous():shortcut->contiguous();
     const int16_t* r=residual.has_value()?res.data_ptr<int16_t>():nullptr;
     const int16_t* s=shortcut.has_value()?skip.data_ptr<int16_t>():nullptr;
     int16_t* dual=packed_output.has_value()?packed_output->data_ptr<int16_t>():nullptr;
@@ -389,40 +427,65 @@ static torch::Tensor block_pointwise(const torch::Tensor& x,const torch::Tensor&
     C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
 }
 
+__device__ __forceinline__ int64_t dw_row(
+    int16_t r0,int16_t r1,int16_t r2,int16_t w0,int16_t w1,int16_t w2) {
+    return static_cast<int64_t>(static_cast<int>(r0)*w0)+
+           static_cast<int>(r1)*w1+static_cast<int>(r2)*w2;
+}
+
 __global__ void block_depthwise(int16_t* __restrict__ out,const int16_t* __restrict__ x,
     const int16_t* __restrict__ weight,const int16_t* __restrict__ bias,int channels,int h,int w) {
     int channel=blockIdx.x*128+threadIdx.x;
     if(channel>=channels) return;
-    int col=blockIdx.y,batch_row=blockIdx.z,row=batch_row%h;
-    int64_t index=(static_cast<int64_t>(batch_row)*w+col)*channels+channel;
+    int col=blockIdx.y,h_tiles=(h+3)/4,batch=blockIdx.z/h_tiles,row0=(blockIdx.z%h_tiles)*4;
     const int16_t* wk=weight+channel*9;
-    int64_t sum=0;
-    if(row>0 && row+1<h && col>0 && col+1<w) {
-        const int16_t* xp=x+index;
-        #pragma unroll
-        for(int ky=0;ky<3;++ky) {
-            #pragma unroll
-            for(int kx=0;kx<3;++kx)
-                sum+=static_cast<int>(xp[((ky-1)*w+kx-1)*channels])*wk[ky*3+kx];
-        }
+    int16_t w00=wk[0],w01=wk[1],w02=wk[2],w10=wk[3],w11=wk[4],w12=wk[5],w20=wk[6],w21=wk[7],w22=wk[8];
+    int16_t b=bias?bias[channel]:0;
+    int64_t row_stride=static_cast<int64_t>(w)*channels;
+    if(row0>0 && row0+4<h && col>0 && col+1<w) {
+        int64_t base=((static_cast<int64_t>(batch)*h+row0-1)*w+col)*channels+channel;
+        const int16_t* xp=x+base;
+        int16_t r0_0=xp[-channels],r0_1=xp[0],r0_2=xp[channels]; xp+=row_stride;
+        int16_t r1_0=xp[-channels],r1_1=xp[0],r1_2=xp[channels]; xp+=row_stride;
+        int16_t r2_0=xp[-channels],r2_1=xp[0],r2_2=xp[channels]; xp+=row_stride;
+        int16_t r3_0=xp[-channels],r3_1=xp[0],r3_2=xp[channels]; xp+=row_stride;
+        int16_t r4_0=xp[-channels],r4_1=xp[0],r4_2=xp[channels]; xp+=row_stride;
+        int16_t r5_0=xp[-channels],r5_1=xp[0],r5_2=xp[channels];
+        int16_t* op=out+base+row_stride;
+        op[0]=finish(dw_row(r0_0,r0_1,r0_2,w00,w01,w02)+dw_row(r1_0,r1_1,r1_2,w10,w11,w12)+dw_row(r2_0,r2_1,r2_2,w20,w21,w22),b);
+        op+=row_stride;
+        op[0]=finish(dw_row(r1_0,r1_1,r1_2,w00,w01,w02)+dw_row(r2_0,r2_1,r2_2,w10,w11,w12)+dw_row(r3_0,r3_1,r3_2,w20,w21,w22),b);
+        op+=row_stride;
+        op[0]=finish(dw_row(r2_0,r2_1,r2_2,w00,w01,w02)+dw_row(r3_0,r3_1,r3_2,w10,w11,w12)+dw_row(r4_0,r4_1,r4_2,w20,w21,w22),b);
+        op+=row_stride;
+        op[0]=finish(dw_row(r3_0,r3_1,r3_2,w00,w01,w02)+dw_row(r4_0,r4_1,r4_2,w10,w11,w12)+dw_row(r5_0,r5_1,r5_2,w20,w21,w22),b);
     } else {
+        const int16_t w_arr[3][3]={{w00,w01,w02},{w10,w11,w12},{w20,w21,w22}};
         #pragma unroll
-        for(int ky=0;ky<3;++ky) {
-            int iy=row+ky-1;
+        for(int dr=0;dr<4;++dr) {
+            int row=row0+dr;
+            if(row>=h) break;
+            int64_t index=((static_cast<int64_t>(batch)*h+row)*w+col)*channels+channel;
+            int64_t sum=0;
             #pragma unroll
-            for(int kx=0;kx<3;++kx) {
-                int ix=col+kx-1;
-                if(iy>=0 && iy<h && ix>=0 && ix<w)
-                    sum+=static_cast<int>(x[index+((ky-1)*w+kx-1)*channels])*wk[ky*3+kx];
+            for(int ky=0;ky<3;++ky) {
+                int iy=row+ky-1;
+                #pragma unroll
+                for(int kx=0;kx<3;++kx) {
+                    int ix=col+kx-1;
+                    if(iy>=0 && iy<h && ix>=0 && ix<w)
+                        sum+=static_cast<int>(x[index+((ky-1)*w+kx-1)*channels])*w_arr[ky][kx];
+                }
             }
+            out[index]=finish(sum,b);
         }
     }
-    out[index]=finish(sum,bias?bias[channel]:0);
 }
 
 static bool packed_block(const torch::Tensor& x,const std::vector<torch::Tensor>& weights,
-    const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut) {
-    if(!x.is_cuda() || x.scalar_type()!=at::kShort || x.dim()!=4 || !x.is_contiguous() ||
+    const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut,bool has_packed=false) {
+    if(!x.is_cuda() || x.scalar_type()!=at::kShort || x.dim()!=4 ||
+       (!x.is_contiguous() && !(has_packed && x.is_contiguous(at::MemoryFormat::ChannelsLast))) ||
        x.size(0)<1 || x.size(1)<256 || x.size(1)>32768 || x.size(1)%32 ||
        x.size(2)*x.size(3)<128 || x.numel()>8*1024*1024 ||
        (reinterpret_cast<uintptr_t>(x.data_ptr())&7)) return false;
@@ -452,12 +515,12 @@ static bool packed_block(const torch::Tensor& x,const std::vector<torch::Tensor>
 static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
     const torch::Tensor& x,const std::vector<torch::Tensor>& weights,
     const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut,bool shortcut,
-    const c10::optional<torch::Tensor>& packed_input,bool emit_packed) {
+    const c10::optional<torch::Tensor>& packed_input,bool emit_packed,bool packed_only=false) {
     TORCH_CHECK(weights.size()==5 && biases.size()==5,"five block convolutions required");
     const auto& depth=weights[1];
     TORCH_CHECK(depth.dim()==4 && depth.size(1)==1 && depth.size(2)==3 && depth.size(3)==3,
                 "3x3 depthwise block required");
-    if(packed_block(x,weights,biases,lut)) {
+    if(packed_block(x,weights,biases,lut,packed_input.has_value())) {
         c10::cuda::CUDAGuard guard(x.device());
         int tile=pointwise_tile(x,weights[0]),ffn_tile=pointwise_tile(x,weights[3],true),dc=depth.size(0);
         const int16_t* table=lut.data_ptr<int16_t>();
@@ -468,17 +531,25 @@ static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
                 p.size(3)==x.size(1) && p.is_contiguous() &&
                 !(reinterpret_cast<uintptr_t>(p.data_ptr())&7),"invalid packed block input");
         }
+        auto x_packed=packed_input.has_value()?*packed_input:x.permute({0,2,3,1}).contiguous();
+        auto x_nhwc=x_packed.permute({0,3,1,2});
         auto first=block_pointwise<false,true>(x,weights[0],biases[0],table,tile,
-                                              c10::nullopt,c10::nullopt,packed_input);
+                                              c10::nullopt,c10::nullopt,x_packed);
         auto spatial=torch::empty({x.size(0),x.size(2),x.size(3),dc},x.options()).permute({0,3,1,2});
-        block_depthwise<<<dim3((dc+127)/128,x.size(3),x.size(0)*x.size(2)),128,0,c10::cuda::getCurrentCUDAStream()>>>(
+        int h_tiles=(x.size(2)+3)/4;
+        block_depthwise<<<dim3((dc+127)/128,x.size(3),x.size(0)*h_tiles),128,0,c10::cuda::getCurrentCUDAStream()>>>(
             spatial.data_ptr<int16_t>(),first.data_ptr<int16_t>(),depth.data_ptr<int16_t>(),
             biases[1].has_value()?biases[1]->data_ptr<int16_t>():nullptr,dc,x.size(2),x.size(3));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         int projection_tile=pointwise_tile(spatial,weights[2]);
-        auto residual=block_pointwise<false,true>(spatial,weights[2],biases[2],nullptr,projection_tile,x);
+        auto residual=block_pointwise<false,true,true>(spatial,weights[2],biases[2],nullptr,projection_tile,x_nhwc);
         auto expanded=block_pointwise<true,true>(residual,weights[3],biases[3],table,ffn_tile);
-        auto skip=shortcut?c10::optional<torch::Tensor>(x):c10::nullopt;
+        auto skip=shortcut?c10::optional<torch::Tensor>(x_nhwc):c10::nullopt;
+        if(emit_packed && packed_only) {
+            auto result=block_pointwise<false,true,true>(expanded,weights[4],biases[4],nullptr,
+                projection_tile,residual,skip);
+            return {result,result.permute({0,2,3,1})};
+        }
         if(emit_packed) {
             auto p=torch::empty({x.size(0),x.size(2),x.size(3),x.size(1)},x.options());
             auto result=block_pointwise<false,false,true,true>(expanded,weights[4],biases[4],nullptr,
@@ -488,29 +559,31 @@ static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
         return {block_pointwise<false,false,true>(expanded,weights[4],biases[4],nullptr,
                                                   projection_tile,residual,skip),c10::nullopt};
     }
-    auto first=uf_conv_post(x,weights[0],biases[0],lut,c10::nullopt,c10::nullopt,0);
+    auto xc=x.contiguous();
+    auto first=uf_conv_post(xc,weights[0],biases[0],lut,c10::nullopt,c10::nullopt,0);
     auto spatial=uf_conv(first,depth,biases[1],1,1,1,1,depth.size(0));
-    auto residual=uf_conv_post(spatial,weights[2],biases[2],c10::nullopt,x,c10::nullopt,0);
+    auto residual=uf_conv_post(spatial,weights[2],biases[2],c10::nullopt,xc,c10::nullopt,0);
     auto expanded=uf_conv_wsilu4(residual,weights[3],biases[3],lut,0);
     return {uf_conv_post(expanded,weights[4],biases[4],c10::nullopt,residual,
-                         shortcut?c10::optional<torch::Tensor>(x):c10::nullopt,0),c10::nullopt};
+                         shortcut?c10::optional<torch::Tensor>(xc):c10::nullopt,0),c10::nullopt};
 }
 
 torch::Tensor uf_depth_block(const torch::Tensor& x,const std::vector<torch::Tensor>& weights,
     const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut,bool shortcut) {
-    return depth_block_impl(x,weights,biases,lut,shortcut,c10::nullopt,false).first;
+    return depth_block_impl(x,weights,biases,lut,shortcut,c10::nullopt,false,false).first;
 }
 
 std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_depth_block_packed(
     const torch::Tensor& x,const std::vector<torch::Tensor>& weights,
     const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut,bool shortcut,
-    const c10::optional<torch::Tensor>& packed_input,bool emit_packed) {
-    return depth_block_impl(x,weights,biases,lut,shortcut,packed_input,emit_packed);
+    const c10::optional<torch::Tensor>& packed_input,bool emit_packed,bool packed_only) {
+    return depth_block_impl(x,weights,biases,lut,shortcut,packed_input,emit_packed,packed_only);
 }
 
 static bool packed_pointwise(const torch::Tensor& x,const torch::Tensor& w,
-    const c10::optional<torch::Tensor>& b) {
-    if(!x.is_cuda() || x.scalar_type()!=at::kShort || x.dim()!=4 || !x.is_contiguous() ||
+    const c10::optional<torch::Tensor>& b,bool has_packed=false) {
+    if(!x.is_cuda() || x.scalar_type()!=at::kShort || x.dim()!=4 ||
+       (!x.is_contiguous() && !(has_packed && x.is_contiguous(at::MemoryFormat::ChannelsLast))) ||
        x.size(0)<1 || x.size(1)<256 || x.size(1)>32768 || x.size(1)%32 ||
        x.size(2)*x.size(3)<128 || x.numel()>8*1024*1024 ||
        (reinterpret_cast<uintptr_t>(x.data_ptr())&7)) return false;
@@ -527,8 +600,8 @@ static bool packed_pointwise(const torch::Tensor& x,const torch::Tensor& w,
 
 std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_conv_packed(
     const torch::Tensor& x,const torch::Tensor& w,const c10::optional<torch::Tensor>& b,
-    const c10::optional<torch::Tensor>& packed_input,bool emit_packed) {
-    if(packed_pointwise(x,w,b)) {
+    const c10::optional<torch::Tensor>& packed_input,bool emit_packed,bool packed_only) {
+    if(packed_pointwise(x,w,b,packed_input.has_value())) {
         c10::cuda::CUDAGuard guard(x.device());
         if(packed_input.has_value()) {
             const auto& p=*packed_input;
@@ -540,6 +613,11 @@ std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_conv_packed(
         int tile=pointwise_tile(x,w),co=w.size(0);
         int64_t out_elements=x.numel()/x.size(1)*co;
         if(emit_packed && co>=256 && co<=32768 && co%32==0 && out_elements<=8*1024*1024) {
+            if(packed_only) {
+                auto result=block_pointwise<false,true>(x,w,b,nullptr,tile,
+                    c10::nullopt,c10::nullopt,packed_input);
+                return {result,result.permute({0,2,3,1})};
+            }
             auto p=torch::empty({x.size(0),x.size(2),x.size(3),co},x.options());
             auto result=block_pointwise<false,false,false,true>(x,w,b,nullptr,tile,
                 c10::nullopt,c10::nullopt,packed_input,p);
@@ -548,5 +626,5 @@ std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_conv_packed(
         return {block_pointwise<false,false>(x,w,b,nullptr,tile,
             c10::nullopt,c10::nullopt,packed_input),c10::nullopt};
     }
-    return {uf_conv(x,w,b,1,1,0,0,1),c10::nullopt};
+    return {uf_conv(x.contiguous(),w,b,1,1,0,0,1),c10::nullopt};
 }
