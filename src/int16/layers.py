@@ -22,6 +22,8 @@ class Layers:
         self._native_block = None
         self._native_packed_block = None
         self._native_conv_packed = None
+        self._native_cat_nhwc = None
+        self._native_unshuffle_cat_nhwc = None
         self._packed_chains = {}
         post_native = False
         if torch.device(device).type == 'cuda':
@@ -30,6 +32,8 @@ class Layers:
             self._native_block = getattr(uf_int16_cuda, 'depth_conv_block', None)
             self._native_packed_block = getattr(uf_int16_cuda, 'depth_conv_block_packed', None)
             self._native_conv_packed = getattr(uf_int16_cuda, 'conv2d_packed', None)
+            self._native_cat_nhwc = getattr(uf_int16_cuda, 'cat_pack_nhwc', None)
+            self._native_unshuffle_cat_nhwc = getattr(uf_int16_cuda, 'from_bytes_unshuffle_cat_nhwc', None)
         for module in model.modules():
             if (post_native and type(module).__name__ in ('DepthConvBlock', 'SpatialPriorAdaptor')
                     and len(module.dc) == 4 and len(module.ffn) == 3
@@ -117,6 +121,15 @@ class Layers:
             self._parameters[key] = self.values[name][qp:qp+1, :, None, None]
         return self._parameters[key]
 
+    def _cat_for_chain(self, seq_module, a, b):
+        if (self._native_cat_nhwc is not None and id(seq_module) in self._packed_chains
+                and a.is_cuda and b.is_cuda and a.dtype == torch.int16 and b.dtype == torch.int16
+                and a.shape[2] * a.shape[3] >= 128
+                and (a.numel() + b.numel()) <= 8 * 1024 * 1024
+                and (a.shape[1] + b.shape[1]) >= 256 and (a.shape[1] + b.shape[1]) % 32 == 0):
+            return self._native_cat_nhwc(a, b)
+        return torch.cat((a, b), dim=1), None
+
     def __call__(self, module, *args, for_reset=False, output_frames=None,
                  _packed_input=None, _pack_output=False):
         x = args[0]
@@ -164,8 +177,15 @@ class Layers:
             return ops.wsilu4(x, self.values['tables.wsilu'])
         if name in ('DepthConvBlock', 'SpatialPriorAdaptor'):
             if len(args) == 2:
-                x = torch.cat(args, dim=1)
-                _packed_input = None
+                if (self._native_cat_nhwc is not None and self._native_packed_block is not None
+                        and args[0].is_cuda and args[0].shape[2] * args[0].shape[3] >= 128
+                        and (args[0].numel() + args[1].numel()) <= 8 * 1024 * 1024
+                        and (args[0].shape[1] + args[1].shape[1]) >= 256
+                        and (args[0].shape[1] + args[1].shape[1]) % 32 == 0):
+                    x, _packed_input = self._native_cat_nhwc(args[0], args[1])
+                else:
+                    x = torch.cat(args, dim=1)
+                    _packed_input = None
             native = self._native_blocks.get(id(module))
             if module.adaptor is not None:
                 if native is not None and self._native_packed_block is not None and self._native_conv_packed is not None:
@@ -208,23 +228,35 @@ class Layers:
         if name == 'IntraDecoder':
             return F.pixel_shuffle(self(module.dec_2, ops.multiply(self(module.dec_1, x), args[1])), 8)
         if name == 'Encoder':
-            source = ops.from_bytes_unshuffle(x) if source_bytes else F.pixel_unshuffle(x, 8)
-            out = self(module.conv1, torch.cat((source, args[1]), dim=1))
+            if (source_bytes and x.dim() == 5 and self._native_unshuffle_cat_nhwc is not None
+                    and id(module.conv1) in self._packed_chains
+                    and args[1].shape[2] * args[1].shape[3] >= 128
+                    and (x.shape[1] * 3 * 64 + args[1].shape[1]) * args[1].shape[2] * args[1].shape[3] <= 8 * 1024 * 1024):
+                cat_x, packed = self._native_unshuffle_cat_nhwc(x, args[1])
+                out = self(module.conv1, cat_x, _packed_input=packed)
+            else:
+                source = ops.from_bytes_unshuffle(x) if source_bytes else F.pixel_unshuffle(x, 8)
+                cat_x, packed = self._cat_for_chain(module.conv1, source, args[1])
+                out = self(module.conv1, cat_x, _packed_input=packed)
             if hasattr(module, 'conv2'):
                 out = self(module.conv2, out)
             return self(module.down, ops.multiply(out, args[2]))
         if name == 'Decoder':
-            out = self(module.conv1, torch.cat((self(module.up, x), args[1]), dim=1))
+            up = self(module.up, x)
+            cat_x, packed = self._cat_for_chain(module.conv1, up, args[1])
+            out = self(module.conv1, cat_x, _packed_input=packed)
             if hasattr(module, 'conv2'):
                 out = self(module.conv2, out)
             return ops.multiply(out, args[2])
         if name == 'FeatureAdaptorM':
-            return self(module.conv, torch.cat(args, dim=1))
+            cat_x, packed = self._cat_for_chain(module.conv, args[0], args[1])
+            return self(module.conv, cat_x, _packed_input=packed)
         if name == 'TemporalPriorEncoder':
             return self(module.conv, ops.multiply(x, args[1]) if len(args)==2 else x)
         if name == 'PriorFusion':
             other = ops.multiply(args[1], args[2]) if len(args)==3 else args[1]
-            return self(module.conv, torch.cat((x, other), dim=1))
+            cat_x, packed = self._cat_for_chain(module.conv, x, other)
+            return self(module.conv, cat_x, _packed_input=packed)
         if name == 'ReconHead':
             maximum = 1 if hasattr(module, 'head') else 8
             count = maximum if output_frames is None else output_frames
@@ -259,5 +291,8 @@ class Layers:
                     'SpatialPrior'):
             if len(args) == 1 and _packed_input is not None:
                 return self(module.conv, x, _packed_input=_packed_input)
+            if len(args) == 2:
+                cat_x, packed = self._cat_for_chain(module.conv, args[0], args[1])
+                return self(module.conv, cat_x, _packed_input=packed)
             return self(module.conv, torch.cat(args, dim=1) if len(args)>1 else x)
         raise NotImplementedError(f'UF integer layer not implemented: {name}')

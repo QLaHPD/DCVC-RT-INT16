@@ -25,8 +25,10 @@ def filesize(filepath: str) -> int:
 
 
 def read_bytes(fd, n, fmt='>{:d}s'):
-    sz = struct.calcsize('s')
-    return struct.unpack(fmt.format(n), fd.read(n * sz))[0]
+    data = fd.read(n)
+    if len(data) != n:
+        raise struct.error(f'unpack requires a buffer of {n} bytes')
+    return data
 
 
 def read_uchars(fd, n, fmt='>{:d}B'):
@@ -94,51 +96,46 @@ def read_sps_remaining(f, sps_id):
 def write_bytes(fd, values, fmt='>{:d}s'):
     if len(values) == 0:
         return 0
-    fd.write(struct.pack(fmt.format(len(values)), values))
+    fd.write(values)
     return len(values)
 
 
 def write_uchars(fd, values, fmt='>{:d}B'):
-    fd.write(struct.pack(fmt.format(len(values)), *values))
+    fd.write(bytes(values))
     return len(values)
 
 
 def write_uint_adaptive(f, a):
     if a < (1 << 7):
-        a0 = (a >> 0) & 0xff
-        a0 = a0 | (0x00 << 7)
-        write_uchars(f, (a0,))
+        f.write(bytes((a & 0xff,)))
         return 1
 
     if a < (1 << 14):
-        a0 = (a >> 0) & 0xff
-        a1 = (a >> 8) & 0xff
-        a1 = a1 | (0x02 << 6)
-        write_uchars(f, (a1, a0))
+        f.write(bytes((((a >> 8) & 0xff) | 0x80, a & 0xff)))
         return 2
 
     assert a < (1 << 30)
-    a0 = (a >> 0) & 0xff
-    a1 = (a >> 8) & 0xff
-    a2 = (a >> 16) & 0xff
-    a3 = (a >> 24) & 0xff
-    a3 = a3 | (0x03 << 6)
-    write_uchars(f, (a3, a2, a1, a0))
+    f.write(bytes((((a >> 24) & 0xff) | 0xc0, (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff)))
     return 4
 
 
 def write_ip(f, is_i_frame, sps_id, qp, ec_part, reset_feature_memory, bit_stream):
-    written = 0
-    flag = (int(NalType.NAL_I if is_i_frame else NalType.NAL_P) << 4) + sps_id
-    written += write_uchars(f, (flag,))
     assert 0 <= qp < 256
-    written += write_uchars(f, (qp,))
-    # ec_part(7), reset_feature_memory(1)
-    flag = (ec_part << 1) + reset_feature_memory
-    written += write_uchars(f, (flag,))
-    written += write_uint_adaptive(f, len(bit_stream))
-    written += write_bytes(f, bit_stream)
-    return written
+    flag0 = (int(NalType.NAL_I if is_i_frame else NalType.NAL_P) << 4) + sps_id
+    flag2 = (ec_part << 1) + reset_feature_memory
+    a = len(bit_stream)
+    if a < (1 << 7):
+        header = bytes((flag0, qp, flag2, a & 0xff))
+    elif a < (1 << 14):
+        header = bytes((flag0, qp, flag2, ((a >> 8) & 0xff) | 0x80, a & 0xff))
+    else:
+        assert a < (1 << 30)
+        header = bytes((flag0, qp, flag2, ((a >> 24) & 0xff) | 0xc0,
+                        (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff))
+    f.write(header)
+    if a:
+        f.write(bit_stream)
+    return len(header) + a
 
 
 def write_sps(f, sps):

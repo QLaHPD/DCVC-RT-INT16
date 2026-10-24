@@ -171,19 +171,33 @@ class FrameReader:
         buf = np.empty((self.height * 3 // 2, self.width), dtype=np.uint8)
         view = memoryview(buf).cast('B')
         offset = 0
+        readinto = getattr(self.process.stdout, 'readinto', None)
         while offset < size:
-            chunk = self.process.stdout.read(size - offset)
-            if not chunk:
-                if offset != 0:
-                    raise ValueError('FFmpeg produced a truncated frame')
-                code = self.process.wait()
-                self.ended = True
-                if code:
-                    self.errors.seek(0)
-                    raise RuntimeError(self.errors.read(8192).decode(errors='replace'))
-                return None
-            view[offset:offset + len(chunk)] = chunk
-            offset += len(chunk)
+            if readinto is not None:
+                n = readinto(view[offset:])
+                if not n:
+                    if offset != 0:
+                        raise ValueError('FFmpeg produced a truncated frame')
+                    code = self.process.wait()
+                    self.ended = True
+                    if code:
+                        self.errors.seek(0)
+                        raise RuntimeError(self.errors.read(8192).decode(errors='replace'))
+                    return None
+                offset += n
+            else:
+                chunk = self.process.stdout.read(size - offset)
+                if not chunk:
+                    if offset != 0:
+                        raise ValueError('FFmpeg produced a truncated frame')
+                    code = self.process.wait()
+                    self.ended = True
+                    if code:
+                        self.errors.seek(0)
+                        raise RuntimeError(self.errors.read(8192).decode(errors='replace'))
+                    return None
+                view[offset:offset + len(chunk)] = chunk
+                offset += len(chunk)
         if self.reference is not None:
             self.reference.write(view)
         return buf

@@ -99,6 +99,16 @@ class IntegerModel:
             self._position_shape = tuple(shape)
         return self._positions
 
+    def _pinned_host_buffer(self, attr, shape, dtype):
+        buf = getattr(self, attr, None)
+        if buf is None or buf.shape != tuple(shape) or buf.dtype != dtype:
+            try:
+                buf = torch.empty(shape, dtype=dtype, pin_memory=(self.device.type == 'cuda'))
+            except RuntimeError:
+                buf = torch.empty(shape, dtype=dtype)
+            setattr(self, attr, buf)
+        return buf
+
     def _prior(self, y, params, qp, image, encode):
         m, run = self.model, self.layers
         native = self._prior_native
@@ -123,8 +133,11 @@ class IntegerModel:
         reduced = run(m.y_spatial_prior_reduction, params) if self.variant != 'ld' else None
         if (native is not None and self.variant != 'ld' and shape[0] == 1
                 and reduced.shape == shape):
-            adaptor_buf = torch.empty((1, shape[1] * 2, shape[2], shape[3]),
-                                      dtype=torch.int16, device=self.device)
+            adaptor_shape = (1, shape[1] * 2, shape[2], shape[3])
+            adaptor_buf = getattr(self, '_adaptor_buf', None)
+            if adaptor_buf is None or adaptor_buf.shape != adaptor_shape:
+                adaptor_buf = torch.empty(adaptor_shape, dtype=torch.int16, device=self.device)
+                self._adaptor_buf = adaptor_buf
             restored = adaptor_buf[:, :shape[1]]
             restored.zero_()
             adaptor_buf[:, shape[1]:].copy_(reduced)
@@ -132,8 +145,11 @@ class IntegerModel:
             adaptor_buf = None
             restored = torch.zeros(shape, dtype=torch.int16, device=self.device)
         if native is not None and encode:
-            packed_all = torch.empty(sum(p.numel() for p in positions),
-                                     dtype=torch.int32, device=self.device)
+            total_positions = sum(p.numel() for p in positions)
+            packed_all = getattr(self, '_packed_all', None)
+            if packed_all is None or packed_all.numel() != total_positions:
+                packed_all = torch.empty(total_positions, dtype=torch.int32, device=self.device)
+                self._packed_all = packed_all
             offset = 0
         else:
             packed_all = None
@@ -301,12 +317,18 @@ class IntegerModel:
             if self._d2h_stream is not None:
                 self._prior_done.record()
                 frames = self._reconstruct(y_hat, qp, reset, self.reconstruct_on_encode)
+                packed_cpu = self._pinned_host_buffer('_packed_cpu', packed_gpu.shape, packed_gpu.dtype)
+                z_cpu_t = self._pinned_host_buffer('_z_cpu', z.shape, z.dtype)
                 with torch.cuda.stream(self._d2h_stream):
                     self._d2h_stream.wait_event(self._prior_done)
                     packed_gpu.record_stream(self._d2h_stream)
                     z.record_stream(self._d2h_stream)
-                    packed = packed_gpu.cpu().numpy()
-                    z_cpu = z.cpu().numpy()
+                    packed_cpu.copy_(packed_gpu, non_blocking=True)
+                    z_cpu_t.copy_(z, non_blocking=True)
+                if not _defer_entropy:
+                    self._d2h_stream.synchronize()
+                packed = packed_cpu.numpy()
+                z_cpu = z_cpu_t.numpy()
             else:
                 packed = packed_gpu.cpu().numpy()
                 z_cpu = z.cpu().numpy()

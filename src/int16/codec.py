@@ -66,7 +66,18 @@ class IntegerCodec(Codec):
 
     def set_gpu_gate(self, path):
         from .scheduling import GpuGate
-        gate = GpuGate(path) if path and self.device.type == 'cuda' and self.variant == 'htl' else None
+        current = getattr(self.image, 'gpu_gate', None)
+        if path and self.device.type == 'cuda' and self.variant == 'htl':
+            if isinstance(current, GpuGate) and current.path == str(path):
+                gate = current
+            else:
+                if hasattr(current, 'close'):
+                    current.close()
+                gate = GpuGate(path)
+        else:
+            if hasattr(current, 'close'):
+                current.close()
+            gate = None
         self.image.gpu_gate = gate
         if self.video is not None:
             self.video.gpu_gate = gate
@@ -118,14 +129,22 @@ class IntegerCodec(Codec):
                 rows, w = frames[0].shape
                 h_half = rows // 3
                 t = len(frames)
+                staging_t = getattr(self, '_staging_yuv420_tensor', None)
+                cap = max(t, getattr(self, 'chunk_size', 8))
+                if staging_t is None or staging_t.shape != (cap, rows, w):
+                    try:
+                        staging_t = torch.empty((cap, rows, w), dtype=torch.uint8,
+                                                pin_memory=(self.device.type == 'cuda'))
+                    except RuntimeError:
+                        staging_t = torch.empty((cap, rows, w), dtype=torch.uint8)
+                    self._staging_yuv420_tensor = staging_t
+                    self._staging_yuv420 = staging_t.numpy()
                 if t == 1:
-                    return torch.from_numpy(frames[0]).view(1, 1, 3, h_half, w).to(self.device)
-                staging = getattr(self, '_staging_yuv420', None)
-                if staging is None or staging.shape != (t, rows, w):
-                    staging = np.empty((t, rows, w), dtype=np.uint8)
-                    self._staging_yuv420 = staging
+                    self._staging_yuv420[0] = frames[0]
+                    return staging_t[:1].view(1, 1, 3, h_half, w).to(self.device, non_blocking=True)
+                staging = self._staging_yuv420[:t]
                 np.stack(frames, axis=0, out=staging)
-                return torch.from_numpy(staging).view(1, t, 3, h_half, w).to(self.device)
+                return staging_t[:t].view(1, t, 3, h_half, w).to(self.device, non_blocking=True)
             frames = [self._expand_yuv420_frame(f) for f in frames]
         if self.device.type == 'cuda' and all(getattr(type(model), 'supports_byte_input', False) and
                 getattr(type(model.layers), 'supports_byte_input', False)

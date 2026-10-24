@@ -11,23 +11,37 @@ class GpuGate:
     def __init__(self, path):
         self.path = str(path)
         self.stream = None
+        self._fd = None
+
+    def _ensure_open(self):
+        if self.stream is None or self.stream.closed:
+            self.stream = open(self.path, 'ab')
+            self._fd = self.stream.fileno()
+
+    def close(self):
+        if self.stream is not None:
+            try:
+                if not self.stream.closed:
+                    self.stream.close()
+            finally:
+                self.stream = None
+                self._fd = None
+
+    def __del__(self):
+        self.close()
 
     def __enter__(self):
-        stream = open(self.path, 'ab')
+        self._ensure_open()
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
         except BaseException:
-            stream.close()
+            self.close()
             raise
-        self.stream = stream
         return self
 
     def __exit__(self, *exc):
-        try:
-            fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
-        finally:
-            self.stream.close()
-            self.stream = None
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
 
 
 class EncodeGates:

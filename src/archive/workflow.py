@@ -319,10 +319,6 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
             if flat and job.get('filename_style'):
                 metadata['filename_style'] = job['filename_style']
             atomic_json(stage / 'manifest.json', metadata)
-            for path in stage.iterdir():
-                with path.open('rb') as stream:
-                    os.fsync(stream.fileno())
-            sync_directory(stage)
             pulse.check()
             # A completed directory is the atomic commit record. os.rename cannot
             # overwrite a nonempty peer archive. Partial work is always hidden.
