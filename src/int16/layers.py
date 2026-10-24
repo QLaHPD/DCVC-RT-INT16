@@ -80,7 +80,7 @@ class Layers:
                     if current is not None and following is not None and children[index+1].adaptor is None:
                         weights = current[0]
                         channels, depth = weights[2].shape[0], weights[1].shape[0]
-                        eligible = (channels >= 384 and channels <= 32768 and channels % 32 == 0
+                        eligible = (channels >= 256 and channels <= 32768 and channels % 32 == 0
                                     and depth >= 256 and depth % 32 == 0
                                     and following[0][0].shape[1] == channels)
                     entries.append((eligible, channels))

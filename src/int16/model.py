@@ -235,11 +235,12 @@ class IntegerModel:
             return self._compress(x, qp, *args)
         with self.gpu_gate:
             try:
-                result = self._compress(x, qp, *args, _defer_entropy=True)
+                defer = getattr(self, '_encode_chunk_to_bytes', None) is not None
+                result = self._compress(x, qp, *args, _defer_entropy=defer) if defer else self._compress(x, qp, *args)
             finally:
                 # Release the run's GPU slot only after queued reconstruction.
                 torch.cuda.synchronize(self.device)
-        entropy_args = result.pop('_entropy_args', None)
+        entropy_args = result.pop('_entropy_args', None) if isinstance(result, dict) else None
         if entropy_args is not None:
             result['bit_stream'] = self._encode_chunk_to_bytes(*entropy_args)
         return result

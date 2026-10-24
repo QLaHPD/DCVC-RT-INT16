@@ -6,8 +6,10 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-__device__ int16_t finish(int64_t sum, int16_t bias) {
-    int64_t rounded = sum < 0 ? -((-sum + 4096) / 8192) : (sum + 4096) / 8192;
+__device__ __forceinline__ int16_t finish(int64_t sum, int16_t bias) {
+    uint64_t mag = sum < 0 ? static_cast<uint64_t>(-sum) : static_cast<uint64_t>(sum);
+    int64_t rounded = static_cast<int64_t>((mag + 4096u) >> 13);
+    if (sum < 0) rounded = -rounded;
     rounded += bias;
     return static_cast<int16_t>(rounded < -32768 ? -32768 : (rounded > 32767 ? 32767 : rounded));
 }
@@ -170,7 +172,7 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
         // Direct fragment loads read uint32 pairs; shared staging handles such
         // views without imposing a stronger alignment contract on the caller.
         if((reinterpret_cast<uintptr_t>(x.data_ptr<int16_t>()) |
-            reinterpret_cast<uintptr_t>(weight.data_ptr<int16_t>())) & 3)
+            reinterpret_cast<uintptr_t>(weight.data_ptr<int16_t>())) & 7)
             return uf_conv_impl<16,32,64,REDUCE4,false,8>(x,weight,bias,sh,sw,ph,pw,groups,
                                                          use_mma,table,residual,shortcut);
     }
@@ -239,21 +241,22 @@ static int pointwise_tile_shape(int64_t ci,int64_t co,int64_t spatial,int64_t el
     // 144p expansion and wider 768-channel priors retain their existing path.
     if(reduce4 && co>=ci*4 && elements<=8*1024*1024 && spatial>=128) {
         if(ci==128 && spatial>=256) return 19;
-        if(ci==256) return spatial<256?16:12;
-        if(ci==512 && spatial<256) return 16;
-        if(ci==512 && spatial>1024) return 12;
+        if(ci==256) return spatial<=1024?16:9;
+        if(ci==384) return spatial<=1024?9:16;
+        if(ci==512) return spatial<256?9:(spatial>1024?12:8);
+        if(ci==768) return 9;
     }
     // Packing is amortized by larger matrix products. Keep scratch <= 16 MiB.
     if(ci>=256 && ci%32==0 && ci<=32768 && elements<=8*1024*1024 && spatial>=128) {
         // Two reduction fragments are prefetched together. Keep the smaller
         // live register set for the four-channel activation reduction.
         if(!reduce4) {
-            if(spatial>=256 && spatial<=8192 && (ci>=384 || co>=ci*2)) return 10;
+            if(spatial>=256 && spatial<=8192 && (ci>=256 || co>=ci*2)) return (ci==256 && spatial>1024)?11:10;
             if(spatial<256 && ci>=640) return 9;
-            if(spatial<256 && ci>=384 && co<=ci) return 11;
-        } else if(ci==768 && spatial<256 && co>=ci*2) return 8;
-        if(co>=ci*2) return spatial>=256 && spatial<=1024?8:7;
-        if(ci>=384 && spatial>1024 && spatial<=8192) return 7;
+            if(spatial<256 && ci>=256 && co<=ci) return 11;
+        }
+        if(co>=ci*2) return spatial>=256 && spatial<=1024?9:7;
+        if(ci>=256 && spatial>1024 && spatial<=8192) return 7;
     }
     if(spatial>=256 && spatial<=1024 && spatial%64==0 && ci>=384 && ci<=1024 && co<=ci)
         return 4;
@@ -386,20 +389,32 @@ static torch::Tensor block_pointwise(const torch::Tensor& x,const torch::Tensor&
     C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
 }
 
-__global__ void block_depthwise(int16_t* out,const int16_t* x,const int16_t* weight,
-    const int16_t* bias,int count,int channels,int h,int w) {
-    int64_t index=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
-    if(index>=count) return;
-    int channel=index%channels,spatial=index/channels,col=spatial%w,row=(spatial/w)%h;
+__global__ void block_depthwise(int16_t* __restrict__ out,const int16_t* __restrict__ x,
+    const int16_t* __restrict__ weight,const int16_t* __restrict__ bias,int channels,int h,int w) {
+    int channel=blockIdx.x*128+threadIdx.x;
+    if(channel>=channels) return;
+    int col=blockIdx.y,batch_row=blockIdx.z,row=batch_row%h;
+    int64_t index=(static_cast<int64_t>(batch_row)*w+col)*channels+channel;
+    const int16_t* wk=weight+channel*9;
     int64_t sum=0;
-    #pragma unroll
-    for(int ky=0;ky<3;++ky) {
-        int iy=row+ky-1;
+    if(row>0 && row+1<h && col>0 && col+1<w) {
+        const int16_t* xp=x+index;
         #pragma unroll
-        for(int kx=0;kx<3;++kx) {
-            int ix=col+kx-1;
-            if(iy>=0 && iy<h && ix>=0 && ix<w)
-                sum+=static_cast<int>(x[index+((ky-1)*w+kx-1)*channels])*weight[channel*9+ky*3+kx];
+        for(int ky=0;ky<3;++ky) {
+            #pragma unroll
+            for(int kx=0;kx<3;++kx)
+                sum+=static_cast<int>(xp[((ky-1)*w+kx-1)*channels])*wk[ky*3+kx];
+        }
+    } else {
+        #pragma unroll
+        for(int ky=0;ky<3;++ky) {
+            int iy=row+ky-1;
+            #pragma unroll
+            for(int kx=0;kx<3;++kx) {
+                int ix=col+kx-1;
+                if(iy>=0 && iy<h && ix>=0 && ix<w)
+                    sum+=static_cast<int>(x[index+((ky-1)*w+kx-1)*channels])*wk[ky*3+kx];
+            }
         }
     }
     out[index]=finish(sum,bias?bias[channel]:0);
@@ -408,9 +423,9 @@ __global__ void block_depthwise(int16_t* out,const int16_t* x,const int16_t* wei
 static bool packed_block(const torch::Tensor& x,const std::vector<torch::Tensor>& weights,
     const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut) {
     if(!x.is_cuda() || x.scalar_type()!=at::kShort || x.dim()!=4 || !x.is_contiguous() ||
-       x.size(0)<1 || x.size(1)<384 || x.size(1)>32768 || x.size(1)%32 ||
+       x.size(0)<1 || x.size(1)<256 || x.size(1)>32768 || x.size(1)%32 ||
        x.size(2)*x.size(3)<128 || x.numel()>8*1024*1024 ||
-       (reinterpret_cast<uintptr_t>(x.data_ptr())&3)) return false;
+       (reinterpret_cast<uintptr_t>(x.data_ptr())&7)) return false;
     int c=x.size(1),dc=weights[1].size(0);
     if((dc!=c && dc*2!=c) || dc<256 || dc%32) return false;
     for(int index=0;index<5;++index) {
@@ -419,7 +434,7 @@ static bool packed_block(const torch::Tensor& x,const std::vector<torch::Tensor>
            w.numel()>INT32_MAX || w.size(0)!=(index<2?dc:(index==3?dc*4:c)) ||
            w.size(1)!=(index==1?1:((index==2 || index==4)?dc:c)) ||
            w.size(2)!=(index==1?3:1) || w.size(3)!=(index==1?3:1) ||
-           (reinterpret_cast<uintptr_t>(w.data_ptr())&3)) return false;
+           (reinterpret_cast<uintptr_t>(w.data_ptr())&7)) return false;
         if(biases[index].has_value()) {
             const auto& b=*biases[index];
             if(b.device()!=x.device() || b.scalar_type()!=at::kShort || b.dim()!=1 ||
@@ -451,14 +466,14 @@ static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
             TORCH_CHECK(p.device()==x.device() && p.scalar_type()==at::kShort && p.dim()==4 &&
                 p.size(0)==x.size(0) && p.size(1)==x.size(2) && p.size(2)==x.size(3) &&
                 p.size(3)==x.size(1) && p.is_contiguous() &&
-                !(reinterpret_cast<uintptr_t>(p.data_ptr())&3),"invalid packed block input");
+                !(reinterpret_cast<uintptr_t>(p.data_ptr())&7),"invalid packed block input");
         }
         auto first=block_pointwise<false,true>(x,weights[0],biases[0],table,tile,
                                               c10::nullopt,c10::nullopt,packed_input);
         auto spatial=torch::empty({x.size(0),x.size(2),x.size(3),dc},x.options()).permute({0,3,1,2});
-        block_depthwise<<<(spatial.numel()+255)/256,256,0,c10::cuda::getCurrentCUDAStream()>>>(
+        block_depthwise<<<dim3((dc+127)/128,x.size(3),x.size(0)*x.size(2)),128,0,c10::cuda::getCurrentCUDAStream()>>>(
             spatial.data_ptr<int16_t>(),first.data_ptr<int16_t>(),depth.data_ptr<int16_t>(),
-            biases[1].has_value()?biases[1]->data_ptr<int16_t>():nullptr,spatial.numel(),dc,x.size(2),x.size(3));
+            biases[1].has_value()?biases[1]->data_ptr<int16_t>():nullptr,dc,x.size(2),x.size(3));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         int projection_tile=pointwise_tile(spatial,weights[2]);
         auto residual=block_pointwise<false,true>(spatial,weights[2],biases[2],nullptr,projection_tile,x);
