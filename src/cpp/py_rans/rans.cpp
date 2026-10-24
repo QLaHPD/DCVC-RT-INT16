@@ -90,6 +90,24 @@ FORCE_INLINE void RansEncPut(RansState& r, uint8_t*& ptr, uint32_t start, uint32
     r = ((r / freq) << SCALE_BITS) + (r % freq) + start;
 }
 
+FORCE_INLINE void RansEncPutReciprocal(RansState& r, uint8_t*& ptr, uint32_t start, uint32_t freq,
+                                       uint32_t reciprocal)
+{
+    const uint32_t r_max = freq << ENC_RENORM_SHIFT_BITS;
+    while (r >= r_max) {
+        *(--ptr) = static_cast<uint8_t>(r);
+        r >>= 8;
+    }
+
+    uint32_t quotient = freq == 1 ? r : static_cast<uint32_t>((uint64_t(r) * reciprocal) >> 32);
+    uint32_t remainder = r - quotient * freq;
+    if (remainder >= freq) {
+        ++quotient;
+        remainder -= freq;
+    }
+    r = (quotient << SCALE_BITS) + remainder + start;
+}
+
 FORCE_INLINE void RansEncPutBits(RansState& r, uint8_t*& ptr, uint32_t val)
 {
     static_assert(BYPASS_PRECISION <= 8);
@@ -150,34 +168,22 @@ FORCE_INLINE void encode_one_symbol(uint8_t*& ptr, RansState& rans, const int32_
         const uint32_t raw_val = value - max_value;
         value = max_value;
 
-        std::vector<uint16_t> bypassBins;
-        bypassBins.reserve(20);
-        // Determine the number of bypasses (in BYPASS_PRECISION size)
-        // needed to encode the raw value.
         int32_t n_bypass = 0;
         while ((raw_val >> (n_bypass * BYPASS_PRECISION)) != 0) {
             ++n_bypass;
         }
 
-        // Encode number of bypasses
-        int32_t val = n_bypass;
-        while (val >= MAX_BYPASS_VAL) {
-            bypassBins.push_back(MAX_BYPASS_VAL);
-            val -= MAX_BYPASS_VAL;
+        // Emit the original bypass sequence in reverse order directly without heap allocation.
+        for (int32_t j = n_bypass - 1; j >= 0; --j) {
+            RansEncPutBits(rans, ptr, (raw_val >> (j * BYPASS_PRECISION)) & MAX_BYPASS_VAL);
         }
-        bypassBins.push_back(static_cast<uint16_t>(val));
-
-        // Encode raw value
-        for (int32_t j = 0; j < n_bypass; ++j) {
-            const int32_t val1 = (raw_val >> (j * BYPASS_PRECISION)) & MAX_BYPASS_VAL;
-            bypassBins.push_back(static_cast<uint16_t>(val1));
-        }
-
-        for (auto it = bypassBins.rbegin(); it < bypassBins.rend(); it++) {
-            RansEncPutBits(rans, ptr, *it);
+        RansEncPutBits(rans, ptr, n_bypass % MAX_BYPASS_VAL);
+        for (int32_t j = 0; j < n_bypass / MAX_BYPASS_VAL; ++j) {
+            RansEncPutBits(rans, ptr, MAX_BYPASS_VAL);
         }
     }
-    RansEncPut(rans, ptr, ransSymbols[value].start, ransSymbols[value].range);
+    const auto& entry = ransSymbols[value];
+    RansEncPutReciprocal(rans, ptr, entry.start, entry.range, entry.reciprocal);
 }
 
 RansEncoderLib::RansEncoderLib()
@@ -293,6 +299,135 @@ void RansEncoderLib::encode_z_internal(const std::shared_ptr<std::vector<int8_t>
     }
 }
 
+void RansEncoderLib::encode_chunk_flush(const int32_t* y_ptr, int y_size, const int8_t* z_ptr,
+                                        int z_size, int cdf_offset, int ch)
+{
+    std::unique_lock<std::mutex> lk(m_mutex_pending);
+    m_chunk_y.resize(y_size);
+    if (y_size > 0) {
+        std::memcpy(m_chunk_y.data(), y_ptr, static_cast<size_t>(y_size) * sizeof(int32_t));
+    }
+    m_chunk_z.resize(z_size);
+    if (z_size > 0) {
+        std::memcpy(m_chunk_z.data(), z_ptr, static_cast<size_t>(z_size) * sizeof(int8_t));
+    }
+    {
+        std::lock_guard<std::mutex> lk_result(m_mutex_result);
+        m_result_ready = false;
+    }
+    PendingTask p;
+    p.workType = WorkType::EncodeChunkFlush;
+    p.cdf_offset = cdf_offset;
+    p.ch = ch;
+    m_pending.push(std::move(p));
+    lk.unlock();
+    m_cv_pending.notify_one();
+}
+
+void RansEncoderLib::encode_chunk_flush_internal(int cdf_offset, int ch)
+{
+    m_stream->clear();
+    RansEncInit(m_rans);
+    uint8_t* ptrEnd = m_stream_buffer + max_stream_buffer_size;
+    m_ptr = ptrEnd;
+
+    const int y_size = static_cast<int>(m_chunk_y.size());
+    const int z_size = static_cast<int>(m_chunk_z.size());
+    check_buffer_capacity(y_size + z_size);
+
+    const int32_t* y_ptr = m_chunk_y.data();
+    const int8_t* max_value_y = m_max_value[1]->data();
+    const std::vector<RansSymbol>* rans_symbols_y = m_ransSymbols[1]->data();
+    for (int i = y_size - 1; i >= 0; --i) {
+        const int32_t combined = y_ptr[i];
+        if (combined == 65536) {
+            continue;
+        }
+        const int32_t cdf_idx = combined & 0xff;
+        const int32_t s = static_cast<int8_t>(combined >> 8);
+        encode_one_symbol(m_ptr, m_rans, s, max_value_y[cdf_idx], rans_symbols_y[cdf_idx]);
+    }
+
+    if (z_size > 0 && ch > 0) {
+        const int8_t* z_ptr = m_chunk_z.data();
+        const int8_t* max_value_z = m_max_value[0]->data();
+        const std::vector<RansSymbol>* rans_symbols_z = m_ransSymbols[0]->data();
+        const int spatial_size = z_size / ch;
+        for (int sp = spatial_size - 1; sp >= 0; --sp) {
+            for (int c = ch - 1; c >= 0; --c) {
+                const int32_t cdf_idx = c + cdf_offset;
+                encode_one_symbol(m_ptr, m_rans, z_ptr[c * spatial_size + sp],
+                                  max_value_z[cdf_idx], rans_symbols_z[cdf_idx]);
+            }
+        }
+    }
+
+    RansEncFlush(m_rans, m_ptr);
+    const int nbytes = static_cast<int>(std::distance(m_ptr, ptrEnd));
+    if (m_ptr < m_stream_buffer || nbytes > max_stream_buffer_size) {
+        throw std::runtime_error("rANS stream buffer overflow: encoded size ("
+                                 + std::to_string(nbytes) + ") exceeds buffer capacity ("
+                                 + std::to_string(max_stream_buffer_size) + ")");
+    }
+    m_stream->resize(nbytes);
+    std::memcpy(m_stream->data(), m_ptr, nbytes);
+    {
+        std::lock_guard<std::mutex> lk_result(m_mutex_result);
+        m_result_ready = true;
+    }
+    m_cv_result.notify_one();
+}
+
+const uint8_t* RansEncoderLib::encode_chunk_direct(const int32_t* y_ptr, int y_size,
+                                                   const int8_t* z_ptr, int z_size,
+                                                   int cdf_offset, int ch, int& out_nbytes)
+{
+    RansEncInit(m_rans);
+    uint8_t* ptrEnd = m_stream_buffer + max_stream_buffer_size;
+    m_ptr = ptrEnd;
+    check_buffer_capacity(y_size + z_size);
+
+    const int8_t* __restrict max_value_y = m_max_value[1]->data();
+    const std::vector<RansSymbol>* __restrict rans_symbols_y = m_ransSymbols[1]->data();
+    uint8_t* ptr = m_ptr;
+    RansState rans = m_rans;
+
+    for (int i = y_size - 1; i >= 0; --i) {
+        const int32_t combined = y_ptr[i];
+        if (combined == 65536) {
+            continue;
+        }
+        const int32_t cdf_idx = combined & 0xff;
+        const int32_t s = static_cast<int8_t>(combined >> 8);
+        encode_one_symbol(ptr, rans, s, max_value_y[cdf_idx], rans_symbols_y[cdf_idx]);
+    }
+
+    if (z_size > 0 && ch > 0) {
+        const int8_t* __restrict max_value_z = m_max_value[0]->data();
+        const std::vector<RansSymbol>* __restrict rans_symbols_z = m_ransSymbols[0]->data();
+        const int spatial_size = z_size / ch;
+        for (int sp = spatial_size - 1; sp >= 0; --sp) {
+            for (int c = ch - 1; c >= 0; --c) {
+                const int32_t cdf_idx = c + cdf_offset;
+                encode_one_symbol(ptr, rans, z_ptr[c * spatial_size + sp],
+                                  max_value_z[cdf_idx], rans_symbols_z[cdf_idx]);
+            }
+        }
+    }
+
+    RansEncFlush(rans, ptr);
+    m_ptr = ptr;
+    m_rans = rans;
+    const int nbytes = static_cast<int>(std::distance(ptr, ptrEnd));
+    if (ptr < m_stream_buffer || nbytes > max_stream_buffer_size) {
+        throw std::runtime_error("rANS stream buffer overflow: encoded size ("
+                                 + std::to_string(nbytes) + ") exceeds buffer capacity ("
+                                 + std::to_string(max_stream_buffer_size) + ")");
+    }
+    out_nbytes = nbytes;
+    return ptr;
+}
+
 void RansEncoderLib::flush()
 {
     PendingTask p;
@@ -368,6 +503,8 @@ void RansEncoderLib::worker()
                     m_result_ready = true;
                 }
                 m_cv_result.notify_one();
+            } else if (p.workType == WorkType::EncodeChunkFlush) {
+                RansEncoderLib::encode_chunk_flush_internal(p.cdf_offset, p.ch);
             }
             lk.lock();
         }

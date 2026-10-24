@@ -146,6 +146,52 @@ void RansEncoder::encode_z(const py::array_t<int8_t>& symbols, const int cdf_off
     encode_z(vec_symbols, cdf_offset, ch);
 }
 
+void RansEncoder::encode_chunk_flush(
+    const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& packed_y,
+    const py::array_t<int8_t, py::array::c_style | py::array::forcecast>& z_nchw,
+    const int cdf_offset, const int ch)
+{
+    if (m_entropy_coder_parallel != 1) {
+        throw std::runtime_error("encode_chunk_flush requires entropy_coder_parallel == 1");
+    }
+    const int32_t* y_ptr = packed_y.data();
+    const int y_size = static_cast<int>(packed_y.size());
+    const int8_t* z_ptr = z_nchw.data();
+    const int z_size = static_cast<int>(z_nchw.size());
+    m_encoders[0]->encode_chunk_flush(y_ptr, y_size, z_ptr, z_size, cdf_offset, ch);
+}
+
+py::bytes RansEncoder::encode_chunk_to_bytes(
+    const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& packed_y,
+    const py::array_t<int8_t, py::array::c_style | py::array::forcecast>& z_nchw,
+    const int cdf_offset, const int ch)
+{
+    if (m_entropy_coder_parallel != 1) {
+        throw std::runtime_error("encode_chunk_to_bytes requires entropy_coder_parallel == 1");
+    }
+    const int32_t* y_ptr = packed_y.data();
+    const int y_size = static_cast<int>(packed_y.size());
+    const int8_t* z_ptr = z_nchw.data();
+    const int z_size = static_cast<int>(z_nchw.size());
+    int nbytes = 0;
+    const uint8_t* ptr = nullptr;
+    {
+        py::gil_scoped_release release;
+        ptr = m_encoders[0]->encode_chunk_direct(y_ptr, y_size, z_ptr, z_size, cdf_offset, ch, nbytes);
+    }
+    return py::bytes(reinterpret_cast<const char*>(ptr), nbytes);
+}
+
+py::bytes RansEncoder::get_encoded_bytes()
+{
+    if (m_entropy_coder_parallel == 1) {
+        auto res = m_encoders[0]->get_encoded_stream();
+        return py::bytes(reinterpret_cast<const char*>(res->data()), res->size());
+    }
+    py::array_t<uint8_t> stream = get_encoded_stream();
+    return py::bytes(reinterpret_cast<const char*>(stream.data()), stream.size());
+}
+
 void RansEncoder::flush()
 {
     int n = m_entropy_coder_parallel;
@@ -270,8 +316,10 @@ void RansEncoder::set_cdf(const std::shared_ptr<std::vector<int32_t>>& cdfs,
         std::vector<RansSymbol> ransSym(per_vector_size);
         const int ransSize = per_vector_size - 1;
         for (int j = 0; j < ransSize; j++) {
+            const auto range = static_cast<uint16_t>(cdf[j + 1] - cdf[j]);
             ransSym[j] = RansSymbol(
-                { static_cast<uint16_t>(cdf[j]), static_cast<uint16_t>(cdf[j + 1] - cdf[j]) });
+                { static_cast<uint16_t>(cdf[j]), range,
+                  range > 1 ? static_cast<uint32_t>((uint64_t(1) << 32) / range) : 0 });
         }
         ransSymbols->at(i) = std::move(ransSym);
     }

@@ -11,12 +11,14 @@
 struct RansSymbol {
     uint16_t start;
     uint16_t range;
+    uint32_t reciprocal;
 };
 
 enum class WorkType {
     EncodeDecodeY,
     EncodeDecodeZ,
     Flush,
+    EncodeChunkFlush,
 };
 
 struct PendingTask {
@@ -63,6 +65,11 @@ public:
                   const int symbol_offset, const int cdf_offset, const int ch);
     void encode_z_internal(const std::shared_ptr<std::vector<int8_t>>& symbols, const int symbol_size,
                            const int symbol_offset, const int cdf_offset, const int ch);
+    void encode_chunk_flush(const int32_t* y_ptr, int y_size, const int8_t* z_ptr, int z_size,
+                            int cdf_offset, int ch);
+    void encode_chunk_flush_internal(int cdf_offset, int ch);
+    const uint8_t* encode_chunk_direct(const int32_t* y_ptr, int y_size, const int8_t* z_ptr,
+                                       int z_size, int cdf_offset, int ch, int& out_nbytes);
     void flush();
     std::shared_ptr<std::vector<uint8_t>> get_encoded_stream();
     void reset();
@@ -79,6 +86,8 @@ private:
 
     std::vector<std::shared_ptr<std::vector<std::vector<RansSymbol>>>> m_ransSymbols;
     std::vector<std::shared_ptr<std::vector<int8_t>>> m_max_value;
+    std::vector<int32_t> m_chunk_y;
+    std::vector<int8_t> m_chunk_z;
 
     bool m_finish{ false };
     bool m_result_ready{ false };

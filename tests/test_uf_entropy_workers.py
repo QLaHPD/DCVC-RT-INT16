@@ -109,6 +109,31 @@ class EntropyWorkerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             decoder.decode_y_with_skip(np.array([-1], dtype=np.int16))
 
+    def test_encode_chunk_to_bytes_matches_partitioned_reference(self):
+        cdf = np.tile(np.linspace(0, 65536, 18, dtype=np.int32), (6, 1))
+        lengths = np.full(6, 18, dtype=np.int32)
+        encoder = RansEncoder()
+        for kind in (0, 1):
+            encoder.set_cdf(cdf, lengths, kind)
+        rng = np.random.default_rng(1337)
+        y_vals = rng.integers(-128, 128, size=512, dtype=np.int32)
+        y_idx = rng.integers(0, 6, size=512, dtype=np.int32)
+        packed = ((y_vals & 0xff) << 8) | y_idx
+        packed[rng.random(512) < 0.4] = 65536
+        z_nchw = rng.integers(-128, 128, size=(1, 2, 4, 5), dtype=np.int8)
+        z_nhwc = np.ascontiguousarray(z_nchw.transpose(0, 2, 3, 1))
+        encoder.reset()
+        for p in reversed(range(4)):
+            part = packed[p * 128:(p + 1) * 128]
+            part = part[part != 65536].astype(np.int16)
+            if part.size:
+                encoder.encode_y(part)
+        encoder.encode_z(z_nhwc.reshape(-1), 2, 2)
+        encoder.flush()
+        expected = encoder.get_encoded_stream().tobytes()
+        actual = encoder.encode_chunk_to_bytes(packed, z_nchw, 2, 2)
+        self.assertEqual(actual, expected)
+
     @unittest.skipUnless(Path('/proc/self/task').is_dir(), 'Linux thread accounting required')
     def test_default_coder_starts_only_two_workers(self):
         gc.collect()

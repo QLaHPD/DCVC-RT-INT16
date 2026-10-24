@@ -33,8 +33,17 @@ public:
     void encode_z(const std::shared_ptr<std::vector<int8_t>>& symbols, const int cdf_offset,
                   const int ch);
     void encode_z(const py::array_t<int8_t>& symbols, const int cdf_offset, const int ch);
+    void encode_chunk_flush(
+        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& packed_y,
+        const py::array_t<int8_t, py::array::c_style | py::array::forcecast>& z_nchw,
+        const int cdf_offset, const int ch);
+    py::bytes encode_chunk_to_bytes(
+        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& packed_y,
+        const py::array_t<int8_t, py::array::c_style | py::array::forcecast>& z_nchw,
+        const int cdf_offset, const int ch);
     void flush();
     py::array_t<uint8_t> get_encoded_stream();
+    py::bytes get_encoded_bytes();
     void reset();
     void set_cdf(const std::shared_ptr<std::vector<int32_t>>& cdfs,
                  const std::shared_ptr<std::vector<int32_t>>& cdfs_sizes, const int index);

@@ -37,6 +37,7 @@ class IntegerModel:
         self.coder = EntropyCoder()
         self.coder.set_entropy_coder_parallel(1)
         self._masked_decode = getattr(self.coder.decoder, 'decode_y_with_skip', None)
+        self._encode_chunk_to_bytes = getattr(self.coder.encoder, 'encode_chunk_to_bytes', None)
         values = prepared['tensors']
         for index, kind in enumerate(('z', 'y')):
             self.coder.set_cdf(values[f'tables.{kind}_cdf'].numpy(),
@@ -234,12 +235,16 @@ class IntegerModel:
             return self._compress(x, qp, *args)
         with self.gpu_gate:
             try:
-                return self._compress(x, qp, *args)
+                result = self._compress(x, qp, *args, _defer_entropy=True)
             finally:
                 # Release the run's GPU slot only after queued reconstruction.
                 torch.cuda.synchronize(self.device)
+        entropy_args = result.pop('_entropy_args', None)
+        if entropy_args is not None:
+            result['bit_stream'] = self._encode_chunk_to_bytes(*entropy_args)
+        return result
 
-    def _compress(self, x, qp, *args):
+    def _compress(self, x, qp, *args, _defer_entropy=False):
         image = self.variant == 'image'
         reset = False if image else args[0]
         if x.dtype != torch.uint8:
@@ -254,6 +259,27 @@ class IntegerModel:
             z = ops.symbols(run(m.hyper_encoder, pad_right_bottom(y, 4)))
         params = self._params(z, qp, *y.shape[-2:])
         y_hat, parts = self._prior(y, params, qp, image, encode=True)
+        encode_chunk_to_bytes = getattr(self, '_encode_chunk_to_bytes', None)
+        if isinstance(parts, tuple) and encode_chunk_to_bytes is not None:
+            packed_gpu, _ = parts
+            if self._d2h_stream is not None:
+                self._prior_done.record()
+                frames = self._reconstruct(y_hat, qp, reset, self.reconstruct_on_encode)
+                with torch.cuda.stream(self._d2h_stream):
+                    self._d2h_stream.wait_event(self._prior_done)
+                    packed_gpu.record_stream(self._d2h_stream)
+                    z.record_stream(self._d2h_stream)
+                    packed = packed_gpu.cpu().numpy()
+                    z_cpu = z.cpu().numpy()
+            else:
+                packed = packed_gpu.cpu().numpy()
+                z_cpu = z.cpu().numpy()
+                frames = self._reconstruct(y_hat, qp, reset, self.reconstruct_on_encode)
+            if _defer_entropy:
+                return {'bit_stream': None, 'x_hat': frames, 'ec_parallel': 1,
+                        '_entropy_args': (packed, z_cpu, qp * m.z_channel, m.z_channel)}
+            bits = encode_chunk_to_bytes(packed, z_cpu, qp * m.z_channel, m.z_channel)
+            return {'bit_stream': bits, 'x_hat': frames, 'ec_parallel': 1}
         z_nhwc = z.permute(0, 2, 3, 1).contiguous()
         if isinstance(parts, tuple):
             packed_gpu, positions = parts

@@ -19,8 +19,11 @@ PYBIND11_MODULE(MLCodec_extensions_cpp, m)
         .def("encode_y", py::overload_cast<const py::array_t<int16_t>&>(&RansEncoder::encode_y))
         .def("encode_z", py::overload_cast<const py::array_t<int8_t>&, const int, const int>(
                              &RansEncoder::encode_z))
+        .def("encode_chunk_flush", &RansEncoder::encode_chunk_flush)
+        .def("encode_chunk_to_bytes", &RansEncoder::encode_chunk_to_bytes)
         .def("flush", &RansEncoder::flush)
         .def("get_encoded_stream", &RansEncoder::get_encoded_stream)
+        .def("get_encoded_bytes", &RansEncoder::get_encoded_bytes)
         .def("reset", &RansEncoder::reset)
         .def("set_cdf",
              py::overload_cast<const py::array_t<int32_t>&, const py::array_t<int32_t>&, const int>(
