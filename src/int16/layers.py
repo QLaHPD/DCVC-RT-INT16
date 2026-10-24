@@ -21,6 +21,7 @@ class Layers:
         self._native_blocks = {}
         self._native_block = None
         self._native_packed_block = None
+        self._native_conv_packed = None
         self._packed_chains = {}
         post_native = False
         if torch.device(device).type == 'cuda':
@@ -28,6 +29,7 @@ class Layers:
             post_native = callable(getattr(uf_int16_cuda, 'conv2d_post', None))
             self._native_block = getattr(uf_int16_cuda, 'depth_conv_block', None)
             self._native_packed_block = getattr(uf_int16_cuda, 'depth_conv_block_packed', None)
+            self._native_conv_packed = getattr(uf_int16_cuda, 'conv2d_packed', None)
         for module in model.modules():
             if (post_native and type(module).__name__ in ('DepthConvBlock', 'SpatialPriorAdaptor')
                     and len(module.dc) == 4 and len(module.ffn) == 3
@@ -74,15 +76,35 @@ class Layers:
                 entries = []
                 for index, child in enumerate(children):
                     current = self._native_blocks.get(id(child))
-                    following = (self._native_blocks.get(id(children[index+1]))
-                                 if index+1 < len(children) else None)
                     eligible, channels = False, 0
-                    if current is not None and following is not None and children[index+1].adaptor is None:
+                    if current is not None and index + 1 < len(children):
                         weights = current[0]
                         channels, depth = weights[2].shape[0], weights[1].shape[0]
-                        eligible = (channels >= 256 and channels <= 32768 and channels % 32 == 0
-                                    and depth >= 256 and depth % 32 == 0
-                                    and following[0][0].shape[1] == channels)
+                        if (channels >= 256 and channels <= 32768 and channels % 32 == 0
+                                and depth >= 256 and depth % 32 == 0):
+                            nxt = children[index + 1]
+                            following = self._native_blocks.get(id(nxt))
+                            if following is not None:
+                                if nxt.adaptor is None:
+                                    eligible = following[0][0].shape[1] == channels
+                                elif (callable(self._native_conv_packed)
+                                      and isinstance(nxt.adaptor, nn.Conv2d)
+                                      and nxt.adaptor.kernel_size == (1, 1)
+                                      and nxt.adaptor.stride == (1, 1)
+                                      and nxt.adaptor.padding == (0, 0)
+                                      and nxt.adaptor.dilation == (1, 1)
+                                      and nxt.adaptor.groups == 1
+                                      and nxt.adaptor.padding_mode == 'zeros'):
+                                    eligible = nxt.adaptor.in_channels == channels
+                            elif (callable(self._native_conv_packed)
+                                  and isinstance(nxt, nn.Conv2d)
+                                  and nxt.kernel_size == (1, 1)
+                                  and nxt.stride == (1, 1)
+                                  and nxt.padding == (0, 0)
+                                  and nxt.dilation == (1, 1)
+                                  and nxt.groups == 1
+                                  and nxt.padding_mode == 'zeros'):
+                                eligible = nxt.in_channels == channels
                     entries.append((eligible, channels))
                 if any(eligible for eligible, _ in entries):
                     self._packed_chains[id(module)] = entries
@@ -108,7 +130,7 @@ class Layers:
                 return self(projection, ops.conv2d_wsilu4(x, weight, bias, self.values['tables.wsilu']))
             chain = self._packed_chains.get(id(module))
             if chain is not None and self._native_packed_block is not None and x.shape[2]*x.shape[3] >= 128:
-                packed = None
+                packed = _packed_input
                 for child, (eligible, channels) in zip(module, chain):
                     emit = eligible and x.shape[0]*channels*x.shape[2]*x.shape[3] <= 8*1024*1024
                     result = self(child, x, _packed_input=packed, _pack_output=emit)
@@ -124,8 +146,14 @@ class Layers:
             if module.dilation != (1, 1) or module.padding_mode != 'zeros':
                 raise ValueError('Unsupported integer convolution configuration')
             prefix = self.names[id(module)]
-            return ops.conv2d(x, self.values[prefix+'.weight'], self.values.get(prefix+'.bias'),
-                              module.stride, module.padding, module.groups)
+            w, b = self.values[prefix+'.weight'], self.values.get(prefix+'.bias')
+            if (self._native_conv_packed is not None and (_pack_output or _packed_input is not None)
+                    and module.kernel_size == (1, 1) and module.stride == (1, 1)
+                    and module.padding == (0, 0) and module.groups == 1):
+                out, packed = self._native_conv_packed(x, w, b, _packed_input, _pack_output)
+                return (out, packed) if _pack_output else out
+            out = ops.conv2d(x, w, b, module.stride, module.padding, module.groups)
+            return (out, None) if _pack_output else out
         if isinstance(module, nn.PixelShuffle):
             return F.pixel_shuffle(x, module.upscale_factor)
         if name == 'WSiLU':
@@ -136,10 +164,13 @@ class Layers:
             if len(args) == 2:
                 x = torch.cat(args, dim=1)
                 _packed_input = None
-            if module.adaptor is not None:
-                x = self(module.adaptor, x)
-                _packed_input = None
             native = self._native_blocks.get(id(module))
+            if module.adaptor is not None:
+                if native is not None and self._native_packed_block is not None and self._native_conv_packed is not None:
+                    x, _packed_input = self(module.adaptor, x, _packed_input=_packed_input, _pack_output=True)
+                else:
+                    x = self(module.adaptor, x)
+                    _packed_input = None
             if native is not None:
                 weights, biases, shortcut = native
                 if self._native_packed_block is not None and (_pack_output or _packed_input is not None):
@@ -164,7 +195,11 @@ class Layers:
         if name == 'ResidualBlockUpsample':
             return self(module.conv, self(module.up, x))
         if name == 'ResidualBlockWithStride2':
-            return self(module.conv, self(module.down, F.pixel_unshuffle(x, 2)))
+            unshuffled = F.pixel_unshuffle(x, 2)
+            if self._native_packed_block is not None and self._native_conv_packed is not None:
+                down, packed = self(module.down, unshuffled, _pack_output=True)
+                return self(module.conv, down, _packed_input=packed)
+            return self(module.conv, self(module.down, unshuffled))
         if name == 'IntraEncoder':
             source = ops.from_bytes_unshuffle(x) if source_bytes else F.pixel_unshuffle(x, 8)
             return self(module.enc_2, ops.multiply(self(module.enc_1, source), args[1]))
@@ -207,9 +242,20 @@ class Layers:
                 return frames
             if for_reset:
                 return self(module.conv[-1], x)
-            return [F.pixel_shuffle(self(child, x), 8) for child in module.conv[:count]]
+            packed_x = (x.permute(0, 2, 3, 1).contiguous()
+                        if (count > 1 and self._native_packed_block is not None
+                            and self._native_conv_packed is not None and x.is_cuda
+                            and x.is_contiguous() and x.shape[2]*x.shape[3] >= 128
+                            and x.numel() <= 8*1024*1024 and not (x.data_ptr() & 7))
+                        else None)
+            return ([F.pixel_shuffle(self(child, x, _packed_input=packed_x), 8)
+                     for child in module.conv[:count]]
+                    if packed_x is not None
+                    else [F.pixel_shuffle(self(child, x), 8) for child in module.conv[:count]])
         if name in ('FeatureAdaptorI', 'FeatureExtractor', 'HyperEncoder', 'HyperDecoder',
                     'IntraHyperEncoder', 'IntraHyperDecoder', 'IntraSpatialPrior', 'IntraYPriorFusion',
                     'SpatialPrior'):
+            if len(args) == 1 and _packed_input is not None:
+                return self(module.conv, x, _packed_input=_packed_input)
             return self(module.conv, torch.cat(args, dim=1) if len(args)>1 else x)
         raise NotImplementedError(f'UF integer layer not implemented: {name}')

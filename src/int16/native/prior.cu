@@ -46,6 +46,27 @@ __global__ void restore_partition(int16_t* restored, const int8_t* symbols,
     restored[p] = saturate(static_cast<int>(symbols[i]) * 512 + means[p]);
 }
 
+__global__ void prior_scale_kernel(int16_t* __restrict__ out, const int16_t* __restrict__ y,
+    const int16_t* __restrict__ q_dec, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int denominator = q_dec[i] < 256 ? 256 : q_dec[i];
+    int q_enc = (262144 + denominator / 2) / denominator;
+    int product = static_cast<int>(y[i]) * q_enc;
+    int rounded = product < 0 ? -((-product + 256) / 512) : (product + 256) / 512;
+    out[i] = saturate(rounded);
+}
+
+__global__ void prior_unscale_kernel(int16_t* __restrict__ out, const int16_t* __restrict__ restored,
+    const int16_t* __restrict__ q_dec, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int scale = q_dec[i] < 256 ? 256 : q_dec[i];
+    int product = static_cast<int>(restored[i]) * scale;
+    int rounded = product < 0 ? -((-product + 256) / 512) : (product + 256) / 512;
+    out[i] = saturate(rounded);
+}
+
 void check_values(const torch::Tensor& values, const torch::Tensor& positions) {
     TORCH_CHECK(values.is_cuda() && values.scalar_type() == at::kShort,
                 "prior values must be CUDA int16");
@@ -69,9 +90,37 @@ void check_restored(const torch::Tensor& restored, const torch::Tensor& values) 
 }
 }
 
+torch::Tensor uf_prior_scale(const torch::Tensor& y, const torch::Tensor& q_dec) {
+    TORCH_CHECK(y.is_cuda() && q_dec.device() == y.device() &&
+                y.scalar_type() == at::kShort && q_dec.scalar_type() == at::kShort &&
+                y.sizes() == q_dec.sizes() && y.numel() > 0 && y.numel() <= INT32_MAX,
+                "invalid prior scale tensors");
+    c10::cuda::CUDAGuard guard(y.device());
+    auto input = y.contiguous(), qd = q_dec.contiguous();
+    auto out = torch::empty_like(input);
+    prior_scale_kernel<<<(input.numel()+255)/256, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        out.data_ptr<int16_t>(), input.data_ptr<int16_t>(), qd.data_ptr<int16_t>(), input.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor uf_prior_unscale(const torch::Tensor& restored, const torch::Tensor& q_dec) {
+    TORCH_CHECK(restored.is_cuda() && q_dec.device() == restored.device() &&
+                restored.scalar_type() == at::kShort && q_dec.scalar_type() == at::kShort &&
+                restored.sizes() == q_dec.sizes() && restored.numel() > 0 && restored.numel() <= INT32_MAX,
+                "invalid prior unscale tensors");
+    c10::cuda::CUDAGuard guard(restored.device());
+    auto input = restored.contiguous(), qd = q_dec.contiguous();
+    auto out = torch::empty_like(input);
+    prior_unscale_kernel<<<(input.numel()+255)/256, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        out.data_ptr<int16_t>(), input.data_ptr<int16_t>(), qd.data_ptr<int16_t>(), input.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 torch::Tensor uf_prior_encode(const torch::Tensor& y, const torch::Tensor& scales,
     const torch::Tensor& means, torch::Tensor restored, const torch::Tensor& positions,
-    const torch::Tensor& table, int threshold) {
+    const torch::Tensor& table, int threshold, const c10::optional<torch::Tensor>& out) {
     check_values(scales, positions);
     check_table(table, scales, threshold);
     check_restored(restored, scales);
@@ -81,7 +130,15 @@ torch::Tensor uf_prior_encode(const torch::Tensor& y, const torch::Tensor& scale
                 "invalid prior feature/mean tensors");
     c10::cuda::CUDAGuard guard(scales.device());
     auto input = y.contiguous(), s = scales.contiguous(), m = means.contiguous();
-    auto packed = torch::empty(positions.sizes(), scales.options().dtype(at::kInt));
+    torch::Tensor packed;
+    if (out.has_value()) {
+        TORCH_CHECK(out->device() == scales.device() && out->scalar_type() == at::kInt &&
+                    out->sizes() == positions.sizes() && out->is_contiguous(),
+                    "invalid prior output buffer");
+        packed = *out;
+    } else {
+        packed = torch::empty(positions.sizes(), scales.options().dtype(at::kInt));
+    }
     encode_partition<<<(positions.numel()+255)/256, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
         packed.data_ptr<int32_t>(), restored.data_ptr<int16_t>(), input.data_ptr<int16_t>(),
         s.data_ptr<int16_t>(), m.data_ptr<int16_t>(), positions.data_ptr<int64_t>(),

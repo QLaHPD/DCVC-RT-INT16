@@ -22,13 +22,19 @@ std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_depth_block_packed(
     const torch::Tensor&,const std::vector<torch::Tensor>&,
     const std::vector<c10::optional<torch::Tensor>>&,const torch::Tensor&,bool,
     const c10::optional<torch::Tensor>&,bool);
+std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_conv_packed(
+    const torch::Tensor&,const torch::Tensor&,const c10::optional<torch::Tensor>&,
+    const c10::optional<torch::Tensor>&,bool);
 torch::Tensor uf_conv_tiled(const torch::Tensor&, const torch::Tensor&, const c10::optional<torch::Tensor>&, int);
 torch::Tensor uf_conv_wsilu4(const torch::Tensor&, const torch::Tensor&, const c10::optional<torch::Tensor>&,
     const torch::Tensor&,int);
 torch::Tensor uf_conv_post(const torch::Tensor&,const torch::Tensor&,const c10::optional<torch::Tensor>&,
     const c10::optional<torch::Tensor>&,const c10::optional<torch::Tensor>&,const c10::optional<torch::Tensor>&,int);
+torch::Tensor uf_prior_scale(const torch::Tensor&, const torch::Tensor&);
+torch::Tensor uf_prior_unscale(const torch::Tensor&, const torch::Tensor&);
 torch::Tensor uf_prior_encode(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
-    torch::Tensor, const torch::Tensor&, const torch::Tensor&, int);
+    torch::Tensor, const torch::Tensor&, const torch::Tensor&, int,
+    const c10::optional<torch::Tensor>&);
 torch::Tensor uf_prior_indexes(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, int);
 void uf_prior_restore(const torch::Tensor&, const torch::Tensor&, torch::Tensor, const torch::Tensor&);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -53,13 +59,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("reciprocal", &uf_reciprocal);
     m.def("depth_conv_block", &uf_depth_block,pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("depth_conv_block_packed", &uf_depth_block_packed,pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("conv2d_packed", &uf_conv_packed,pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("conv2d_tiled", &uf_conv_tiled);
     m.def("conv2d_wsilu4", &uf_conv_wsilu4,pybind11::arg("x"),pybind11::arg("weight"),
           pybind11::arg("bias"),pybind11::arg("lut"),pybind11::arg("tile")=0);
     m.def("conv2d_post", &uf_conv_post,pybind11::arg("x"),pybind11::arg("weight"),
           pybind11::arg("bias"),pybind11::arg("lut"),pybind11::arg("residual"),
           pybind11::arg("shortcut"),pybind11::arg("tile")=0);
-    m.def("prior_encode", &uf_prior_encode);
+    m.def("prior_scale", &uf_prior_scale);
+    m.def("prior_unscale", &uf_prior_unscale);
+    m.def("prior_encode", &uf_prior_encode,pybind11::arg("y"),pybind11::arg("scales"),
+          pybind11::arg("means"),pybind11::arg("restored"),pybind11::arg("positions"),
+          pybind11::arg("table"),pybind11::arg("threshold"),pybind11::arg("out")=pybind11::none());
     m.def("prior_indexes", &uf_prior_indexes);
     m.def("prior_restore", &uf_prior_restore);
 }

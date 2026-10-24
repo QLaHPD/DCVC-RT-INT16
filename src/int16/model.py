@@ -101,38 +101,70 @@ class IntegerModel:
 
     def _prior(self, y, params, qp, image, encode):
         m, run = self.model, self.layers
+        native = self._prior_native
+        has_scale_ops = native is not None and hasattr(native, 'prior_scale')
         if image:
             scales, means = params.chunk(2, dim=1)
             q_enc, q_dec = run.parameter('q_scale_y_enc', qp), run.parameter('q_scale_y_dec', qp)
+            if encode:
+                y = ops.multiply(y, q_enc)
         else:
             q_dec, scales, means = params.chunk(3, dim=1)
-            q_dec = q_dec.clamp_min(ops.FEATURE_SCALE//2)
-            if encode:
-                q_enc = ops.reciprocal(q_dec)
-        if encode:
-            y = ops.multiply(y, q_enc)
+            if has_scale_ops:
+                if encode:
+                    y = native.prior_scale(y, q_dec)
+            else:
+                q_dec = q_dec.clamp_min(ops.FEATURE_SCALE//2)
+                if encode:
+                    q_enc = ops.reciprocal(q_dec)
+                    y = ops.multiply(y, q_enc)
         shape = scales.shape
         positions = self._mask_positions(shape)
         reduced = run(m.y_spatial_prior_reduction, params) if self.variant != 'ld' else None
-        restored = torch.zeros(shape, dtype=torch.int16, device=self.device)
-        pending = []
-        native = self._prior_native
+        if (native is not None and self.variant != 'ld' and shape[0] == 1
+                and reduced.shape == shape):
+            adaptor_buf = torch.empty((1, shape[1] * 2, shape[2], shape[3]),
+                                      dtype=torch.int16, device=self.device)
+            restored = adaptor_buf[:, :shape[1]]
+            restored.zero_()
+            adaptor_buf[:, shape[1]:].copy_(reduced)
+        else:
+            adaptor_buf = None
+            restored = torch.zeros(shape, dtype=torch.int16, device=self.device)
+        if native is not None and encode:
+            packed_all = torch.empty(sum(p.numel() for p in positions),
+                                     dtype=torch.int32, device=self.device)
+            offset = 0
+        else:
+            packed_all = None
+            pending = []
+        pack_adaptor = getattr(run, '_native_packed_block', None) is not None
         for part, position in enumerate(positions):
             if part:
                 if self.variant == 'ld':
                     means = run(m.y_spatial_prior, restored, params)
                 else:
                     adaptor = getattr(m, f'y_spatial_prior_adaptor_{part}')
-                    if image or self.variant == 'htl':
-                        next_params = run(m.y_spatial_prior, run(adaptor, torch.cat((restored, reduced), dim=1)))
-                        scales, means = next_params.chunk(2, dim=1)
+                    if adaptor_buf is not None and pack_adaptor:
+                        adapted, packed_a = run(adaptor, adaptor_buf, _pack_output=True)
+                        prior_out = run(m.y_spatial_prior, adapted, _packed_input=packed_a)
+                    elif adaptor_buf is not None:
+                        prior_out = run(m.y_spatial_prior, run(adaptor, adaptor_buf))
+                    elif image or self.variant == 'htl':
+                        prior_out = run(m.y_spatial_prior, run(adaptor, torch.cat((restored, reduced), dim=1)))
                     else:
-                        means = run(m.y_spatial_prior, run(adaptor, restored, reduced))
+                        prior_out = run(m.y_spatial_prior, run(adaptor, restored, reduced))
+                    if image or self.variant == 'htl':
+                        scales, means = prior_out.chunk(2, dim=1)
+                    else:
+                        means = prior_out
             if native is not None:
                 table = run.values['tables.scale_index']
                 if encode:
-                    pending.append(native.prior_encode(y, scales, means, restored,
-                                                       position, table, self.skip_threshold))
+                    count = position.numel()
+                    native.prior_encode(y, scales, means, restored, position, table,
+                                        self.skip_threshold, packed_all[offset:offset + count])
+                    offset += count
                 else:
                     # One fixed-size transfer contains both indexes and skip flags.
                     indexes = native.prior_indexes(scales, position, table,
@@ -184,11 +216,14 @@ class IntegerModel:
                 pending.append(packed.cpu().numpy().copy())
             restored.view(-1).index_copy_(0, position,
                 ops.saturate(symbols.long()*ops.FEATURE_SCALE + selected_means))
+        y_hat = (native.prior_unscale(restored, q_dec)
+                 if (not image and has_scale_ops)
+                 else ops.multiply(restored, q_dec))
         if native is not None and encode:
             # Defer CPU transfer/filtering so _reconstruct can be launched on the GPU
             # before CPU partition filtering and rANS task submission.
-            return ops.multiply(restored, q_dec), (torch.cat(pending), positions)
-        return ops.multiply(restored, q_dec), pending
+            return y_hat, (packed_all, positions)
+        return y_hat, pending
 
     def _params(self, z, qp, height, width):
         m, run = self.model, self.layers

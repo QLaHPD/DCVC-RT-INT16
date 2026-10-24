@@ -507,3 +507,46 @@ std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_depth_block_packed(
     const c10::optional<torch::Tensor>& packed_input,bool emit_packed) {
     return depth_block_impl(x,weights,biases,lut,shortcut,packed_input,emit_packed);
 }
+
+static bool packed_pointwise(const torch::Tensor& x,const torch::Tensor& w,
+    const c10::optional<torch::Tensor>& b) {
+    if(!x.is_cuda() || x.scalar_type()!=at::kShort || x.dim()!=4 || !x.is_contiguous() ||
+       x.size(0)<1 || x.size(1)<256 || x.size(1)>32768 || x.size(1)%32 ||
+       x.size(2)*x.size(3)<128 || x.numel()>8*1024*1024 ||
+       (reinterpret_cast<uintptr_t>(x.data_ptr())&7)) return false;
+    if(w.device()!=x.device() || w.scalar_type()!=at::kShort || w.dim()!=4 || !w.is_contiguous() ||
+       w.numel()>INT32_MAX || w.size(1)!=x.size(1) || w.size(2)!=1 || w.size(3)!=1 ||
+       (reinterpret_cast<uintptr_t>(w.data_ptr())&7)) return false;
+    if(b.has_value()) {
+        const auto& bias=*b;
+        if(bias.device()!=x.device() || bias.scalar_type()!=at::kShort || bias.dim()!=1 ||
+           bias.numel()!=w.size(0) || !bias.is_contiguous()) return false;
+    }
+    return pointwise_tile_shape(x.size(1),w.size(0),x.size(2)*x.size(3),x.numel())>=7;
+}
+
+std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_conv_packed(
+    const torch::Tensor& x,const torch::Tensor& w,const c10::optional<torch::Tensor>& b,
+    const c10::optional<torch::Tensor>& packed_input,bool emit_packed) {
+    if(packed_pointwise(x,w,b)) {
+        c10::cuda::CUDAGuard guard(x.device());
+        if(packed_input.has_value()) {
+            const auto& p=*packed_input;
+            TORCH_CHECK(p.device()==x.device() && p.scalar_type()==at::kShort && p.dim()==4 &&
+                p.size(0)==x.size(0) && p.size(1)==x.size(2) && p.size(2)==x.size(3) &&
+                p.size(3)==x.size(1) && p.is_contiguous() &&
+                !(reinterpret_cast<uintptr_t>(p.data_ptr())&7),"invalid packed conv input");
+        }
+        int tile=pointwise_tile(x,w),co=w.size(0);
+        int64_t out_elements=x.numel()/x.size(1)*co;
+        if(emit_packed && co>=256 && co<=32768 && co%32==0 && out_elements<=8*1024*1024) {
+            auto p=torch::empty({x.size(0),x.size(2),x.size(3),co},x.options());
+            auto result=block_pointwise<false,false,false,true>(x,w,b,nullptr,tile,
+                c10::nullopt,c10::nullopt,packed_input,p);
+            return {result,p};
+        }
+        return {block_pointwise<false,false>(x,w,b,nullptr,tile,
+            c10::nullopt,c10::nullopt,packed_input),c10::nullopt};
+    }
+    return {uf_conv(x,w,b,1,1,0,0,1),c10::nullopt};
+}
