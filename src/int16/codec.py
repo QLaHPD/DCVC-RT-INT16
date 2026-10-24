@@ -71,11 +71,62 @@ class IntegerCodec(Codec):
         if self.video is not None:
             self.video.gpu_gate = gate
 
+    @staticmethod
+    def _expand_yuv420_frame(frame):
+        if frame.ndim != 2:
+            return frame
+        h = frame.shape[0] * 2 // 3
+        w = frame.shape[1]
+        flat = frame.reshape(-1)
+        n = h * w
+        y = flat[:n].reshape(h, w)
+        u = flat[n:n + n // 4].reshape(h // 2, w // 2)
+        v = flat[n + n // 4:].reshape(h // 2, w // 2)
+        return np.stack((y, u.repeat(2, 0).repeat(2, 1), v.repeat(2, 0).repeat(2, 1)))
+
+    def _supports_yuv420_encode(self):
+        if self.device.type != 'cuda':
+            return False
+        if not all(getattr(type(model), 'supports_byte_input', False) and
+                   getattr(type(model), 'supports_yuv420_input', False) and
+                   getattr(type(model.layers), 'supports_byte_input', False)
+                   for model in (self.image, self.video) if model is not None):
+            return False
+        import uf_int16_cuda
+        return (callable(getattr(uf_int16_cuda, 'from_bytes_unshuffle', None)) and
+                bool(getattr(uf_int16_cuda, 'supports_yuv420_unshuffle', False)))
+
+    def encode(self, reader, *args, **kwargs):
+        if hasattr(reader, 'raw_yuv420') and self._supports_yuv420_encode():
+            previous = reader.raw_yuv420
+            reader.raw_yuv420 = True
+            try:
+                return super().encode(reader, *args, **kwargs)
+            finally:
+                reader.raw_yuv420 = previous
+        return super().encode(reader, *args, **kwargs)
+
     def tensor(self, frames):
+        if frames and frames[0].ndim == 2:
+            frames = [self._expand_yuv420_frame(f) for f in frames]
         values = torch.from_numpy(np.concatenate(frames, axis=0)).unsqueeze(0).to(self.device)
         return ops.from_bytes(values)
 
     def tensor_for_encode(self, frames):
+        if frames and frames[0].ndim == 2:
+            if self._supports_yuv420_encode():
+                rows, w = frames[0].shape
+                h_half = rows // 3
+                t = len(frames)
+                if t == 1:
+                    return torch.from_numpy(frames[0]).view(1, 1, 3, h_half, w).to(self.device)
+                staging = getattr(self, '_staging_yuv420', None)
+                if staging is None or staging.shape != (t, rows, w):
+                    staging = np.empty((t, rows, w), dtype=np.uint8)
+                    self._staging_yuv420 = staging
+                np.stack(frames, axis=0, out=staging)
+                return torch.from_numpy(staging).view(1, t, 3, h_half, w).to(self.device)
+            frames = [self._expand_yuv420_frame(f) for f in frames]
         if self.device.type == 'cuda' and all(getattr(type(model), 'supports_byte_input', False) and
                 getattr(type(model.layers), 'supports_byte_input', False)
                 for model in (self.image, self.video) if model is not None):

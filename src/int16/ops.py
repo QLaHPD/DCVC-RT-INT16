@@ -85,8 +85,17 @@ def from_bytes_unshuffle(x):
     if x.is_cuda:
         import uf_int16_cuda
         fused = getattr(uf_int16_cuda, 'from_bytes_unshuffle', None)
-        if fused is not None:
+        if fused is not None and (x.dim() == 4 or getattr(uf_int16_cuda, 'supports_yuv420_unshuffle', False)):
             return fused(x)
+    if x.dim() == 5:
+        b, t, _, h_half, w = x.shape
+        h = h_half * 2
+        raw = x.reshape(b * t, h * w * 3 // 2)
+        n = h * w
+        y = raw[:, :n].reshape(b, t, 1, h, w)
+        u = raw[:, n:n + n // 4].reshape(b, t, 1, h_half, w // 2).repeat_interleave(2, dim=3).repeat_interleave(2, dim=4)
+        v = raw[:, n + n // 4:].reshape(b, t, 1, h_half, w // 2).repeat_interleave(2, dim=3).repeat_interleave(2, dim=4)
+        x = torch.cat((y, u, v), dim=2).reshape(b, t * 3, h, w)
     values = from_bytes(x)
     bottom, right = (-values.shape[2]) % 16, (-values.shape[3]) % 16
     if bottom:

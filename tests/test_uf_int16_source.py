@@ -157,6 +157,26 @@ class CudaSourceBytesTests(SourceBytesTests):
         codec.device = torch.device('cpu')
         self.assertTrue(torch.equal(codec.tensor_for_encode(frames), original.cpu()))
 
+    def test_fused_yuv420_unshuffle_matches_expanded_yuv444(self):
+        from src.int16.codec import IntegerCodec
+        from src.int16.layers import Layers
+        from src.int16.model import IntegerModel
+        gen = np.random.default_rng(2227)
+        codec = IntegerCodec.__new__(IntegerCodec)
+        codec.device = torch.device('cuda:0')
+        codec.image = IntegerModel.__new__(IntegerModel)
+        codec.image.layers = Layers.__new__(Layers)
+        codec.video = None
+        for t, h, w in ((1, 16, 16), (1, 18, 22), (8, 144, 256), (8, 30, 34)):
+            raw_frames = [gen.integers(0, 256, size=(h * 3 // 2, w), dtype=np.uint8) for _ in range(t)]
+            expanded_frames = [codec._expand_yuv420_frame(f) for f in raw_frames]
+            packed = codec.tensor_for_encode(raw_frames)
+            expanded = codec.tensor_for_encode(expanded_frames)
+            self.assertEqual(packed.dim(), 5)
+            self.assertEqual(expanded.dim(), 4)
+            self.assertTrue(torch.equal(ops.from_bytes_unshuffle(packed), ops.from_bytes_unshuffle(expanded)))
+            self.assertTrue(torch.equal(ops.from_bytes_unshuffle(packed.cpu()), ops.from_bytes_unshuffle(expanded.cpu())))
+
 
 if __name__ == '__main__':
     unittest.main()

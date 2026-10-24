@@ -22,6 +22,7 @@ def pad_right_bottom(x, multiple):
 
 class IntegerModel:
     supports_byte_input = True
+    supports_yuv420_input = True
     supports_partial_output = True
     supports_skipped_output = True
 
@@ -46,7 +47,11 @@ class IntegerModel:
         self._positions = None
         self.skip_threshold = 0
         self._prior_native = None
+        self._d2h_stream = None
+        self._prior_done = None
         if self.device.type == 'cuda':
+            self._d2h_stream = torch.cuda.Stream(device=self.device)
+            self._prior_done = torch.cuda.Event()
             import uf_int16_cuda
             if all(hasattr(uf_int16_cuda, name) for name in
                    ('prior_encode', 'prior_indexes', 'prior_restore')):
@@ -179,15 +184,9 @@ class IntegerModel:
             restored.view(-1).index_copy_(0, position,
                 ops.saturate(symbols.long()*ops.FEATURE_SCALE + selected_means))
         if native is not None and encode:
-            # All partitions can finish on the GPU before entropy input is read.
-            # Removing skipped entries on the CPU avoids GPU nonzero/any syncs.
-            packed = torch.cat(pending).cpu().numpy()
-            pending = []
-            offset = 0
-            for position in positions:
-                part = packed[offset:offset + position.numel()]
-                pending.append((part[part != 65536] if self.skip_threshold else part).astype(np.int16))
-                offset += position.numel()
+            # Defer CPU transfer/filtering so _reconstruct can be launched on the GPU
+            # before CPU partition filtering and rANS task submission.
+            return ops.multiply(restored, q_dec), (torch.cat(pending), positions)
         return ops.multiply(restored, q_dec), pending
 
     def _params(self, z, qp, height, width):
@@ -230,7 +229,8 @@ class IntegerModel:
 
     @torch.no_grad()
     def compress(self, x, qp, *args):
-        if self.gpu_gate is None or self.device.type != 'cuda' or min(x.shape[-2:]) < 144:
+        height = x.shape[3] * 2 if x.dim() == 5 else x.shape[-2]
+        if self.gpu_gate is None or self.device.type != 'cuda' or min(height, x.shape[-1]) < 144:
             return self._compress(x, qp, *args)
         with self.gpu_gate:
             try:
@@ -254,16 +254,39 @@ class IntegerModel:
             z = ops.symbols(run(m.hyper_encoder, pad_right_bottom(y, 4)))
         params = self._params(z, qp, *y.shape[-2:])
         y_hat, parts = self._prior(y, params, qp, image, encode=True)
+        z_nhwc = z.permute(0, 2, 3, 1).contiguous()
+        if isinstance(parts, tuple):
+            packed_gpu, positions = parts
+            if self._d2h_stream is not None:
+                self._prior_done.record()
+                # Queue GPU reconstruction on the compute stream before D2H wait.
+                frames = self._reconstruct(y_hat, qp, reset, self.reconstruct_on_encode)
+                with torch.cuda.stream(self._d2h_stream):
+                    self._d2h_stream.wait_event(self._prior_done)
+                    packed_gpu.record_stream(self._d2h_stream)
+                    z_nhwc.record_stream(self._d2h_stream)
+                    packed = packed_gpu.cpu().numpy()
+                    z_cpu = z_nhwc.cpu().numpy()
+            else:
+                packed = packed_gpu.cpu().numpy()
+                z_cpu = z_nhwc.cpu().numpy()
+                frames = self._reconstruct(y_hat, qp, reset, self.reconstruct_on_encode)
+            parts = []
+            offset = 0
+            for position in positions:
+                part = packed[offset:offset + position.numel()]
+                parts.append((part[part != 65536] if self.skip_threshold else part).astype(np.int16))
+                offset += position.numel()
+        else:
+            z_cpu = z_nhwc.cpu().numpy()
+            frames = self._reconstruct(y_hat, qp, reset, self.reconstruct_on_encode)
         self.coder.encoder.reset()
         # rANS is a stack: decode z first, then spatial partitions in ascending order.
         for part in reversed(parts):
             if part.size:
                 self.coder.encoder.encode_y(part)
-        self.coder.encoder.encode_z(z.permute(0,2,3,1).contiguous().cpu().numpy(),
-                                    qp*m.z_channel, m.z_channel)
+        self.coder.encoder.encode_z(z_cpu, qp*m.z_channel, m.z_channel)
         self.coder.encoder.flush()
-        # The rANS worker can finish while reconstruction is queued on the GPU.
-        frames = self._reconstruct(y_hat, qp, reset, self.reconstruct_on_encode)
         bits = self.coder.encoder.get_encoded_stream().tobytes()
         return {'bit_stream': bits, 'x_hat': frames, 'ec_parallel': 1}
 

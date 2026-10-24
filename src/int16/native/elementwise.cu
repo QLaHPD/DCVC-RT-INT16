@@ -73,6 +73,45 @@ __global__ void bytes_unshuffle_kernel(int16_t* out,const uint8_t* x,
             out[((static_cast<int64_t>(plane)*64+channel)*oh+oy)*ow+ox+pos]=tile[channel][pos];
     }
 }
+__global__ void bytes_unshuffle_yuv420_kernel(int16_t* out,const uint8_t* x,
+    int h,int w,int oh,int ow,int tiles_w) {
+    __shared__ int32_t tile[64][36];
+    int ox=(blockIdx.x%tiles_w)*32,group=blockIdx.x/tiles_w;
+    int oy=group%oh,plane=group/oh;
+    int frame=plane/3,comp=plane%3;
+    int position=threadIdx.x/8,sub_x=threadIdx.x%8;
+    if(ox+position<ow) {
+        int ix=ox*8+threadIdx.x;
+        ix=ix<w?ix:w-1;
+        const uint8_t* frame_ptr=x+static_cast<int64_t>(frame)*(h/2)*w*3;
+        if(comp==0) {
+            #pragma unroll
+            for(int dy=0;dy<8;++dy) {
+                int iy=oy*8+dy;
+                iy=iy<h?iy:h-1;
+                tile[dy*8+sub_x][position]=rna((2*static_cast<int>(frame_ptr[iy*w+ix])-255)*512,510);
+            }
+        } else {
+            int uv_h=h>>1,uv_w=w>>1;
+            const uint8_t* uv_ptr=frame_ptr+static_cast<int64_t>(h)*w+(comp==2?static_cast<int64_t>(uv_h)*uv_w:0);
+            int uv_x=ix>>1;
+            #pragma unroll
+            for(int dy=0;dy<8;++dy) {
+                int iy=oy*8+dy;
+                iy=iy<h?iy:h-1;
+                int uv_y=iy>>1;
+                tile[dy*8+sub_x][position]=rna((2*static_cast<int>(uv_ptr[uv_y*uv_w+uv_x])-255)*512,510);
+            }
+        }
+    }
+    __syncthreads();
+    #pragma unroll
+    for(int i=threadIdx.x;i<64*32;i+=256) {
+        int channel=i/32,pos=i%32;
+        if(ox+pos<ow)
+            out[((static_cast<int64_t>(plane)*64+channel)*oh+oy)*ow+ox+pos]=tile[channel][pos];
+    }
+}
 __global__ void symbols_kernel(int8_t* out,const int16_t* x,int64_t n) {
     int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(i<n) out[i]=rna(x[i],512);
@@ -183,9 +222,23 @@ torch::Tensor uf_bytes(const torch::Tensor& input) {
 }
 
 torch::Tensor uf_bytes_unshuffle(const torch::Tensor& input) {
-    TORCH_CHECK(input.is_cuda() && input.scalar_type()==at::kByte && input.dim()==4 &&
-                input.numel()>0 && input.numel()<=INT32_MAX,"nonempty CUDA NCHW bytes required");
+    TORCH_CHECK(input.is_cuda() && input.scalar_type()==at::kByte &&
+                (input.dim()==4 || input.dim()==5) &&
+                input.numel()>0 && input.numel()<=INT32_MAX,"nonempty CUDA NCHW or YUV420 bytes required");
     c10::cuda::CUDAGuard guard(input.device()); auto x=input.contiguous();
+    if(x.dim()==5) {
+        TORCH_CHECK(x.size(2)==3 && x.size(4)%2==0,"invalid packed YUV420 dimensions");
+        int64_t h=x.size(3)*2,w=x.size(4);
+        int64_t planes=x.size(0)*x.size(1)*3;
+        int64_t oh=(h+15)/16*2,ow=(w+15)/16*2;
+        int64_t count=planes*64*oh*ow;
+        TORCH_CHECK(count<=INT32_MAX,"unshuffled source exceeds indexing bounds");
+        auto out=torch::empty({x.size(0),x.size(1)*3*64,oh,ow},x.options().dtype(at::kShort));
+        int64_t tiles_w=(ow+31)/32,blocks=planes*oh*tiles_w;
+        bytes_unshuffle_yuv420_kernel<<<blocks,256,0,c10::cuda::getCurrentCUDAStream()>>>(
+            out.data_ptr<int16_t>(),x.data_ptr<uint8_t>(),h,w,oh,ow,tiles_w);
+        C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
+    }
     int64_t oh=(x.size(2)+15)/16*2,ow=(x.size(3)+15)/16*2;
     int64_t count=x.size(0)*x.size(1)*64*oh*ow;
     TORCH_CHECK(count<=INT32_MAX,"unshuffled source exceeds indexing bounds");

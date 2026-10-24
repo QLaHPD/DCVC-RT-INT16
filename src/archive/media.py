@@ -93,6 +93,7 @@ class FrameReader:
                 self.reference.close()
             raise
         self.ended = False
+        self.raw_yuv420 = False
         self._closed = self._prefetch_done = False
         self._stop = threading.Event()
         self._thread = self._queue = None
@@ -129,7 +130,8 @@ class FrameReader:
         if self._closed:
             raise ValueError('Frame reader is closed')
         if self._queue is None:
-            return self._read_frame()
+            frame = self._read_frame()
+            return frame if frame is None or self.raw_yuv420 else self._expand_yuv420(frame)
         if self._prefetch_done:
             return None
         frame, error = self._queue.get()
@@ -138,7 +140,16 @@ class FrameReader:
             raise error
         if frame is None:
             self._prefetch_done = True
-        return frame
+            return None
+        return frame if self.raw_yuv420 else self._expand_yuv420(frame)
+
+    def _expand_yuv420(self, values):
+        flat = values.reshape(-1)
+        n = self.width * self.height
+        y = flat[:n].reshape(self.height, self.width)
+        u = flat[n:n + n//4].reshape(self.height//2, self.width//2)
+        v = flat[n + n//4:].reshape(self.height//2, self.width//2)
+        return np.stack((y, u.repeat(2, 0).repeat(2, 1), v.repeat(2, 0).repeat(2, 1)))
 
     def _prefetch(self):
         while not self._stop.is_set():
@@ -157,11 +168,13 @@ class FrameReader:
 
     def _read_frame(self):
         size = self.width * self.height * 3 // 2
-        blocks, remaining = [], size
-        while remaining:
-            chunk = self.process.stdout.read(remaining)
+        buf = np.empty((self.height * 3 // 2, self.width), dtype=np.uint8)
+        view = memoryview(buf).cast('B')
+        offset = 0
+        while offset < size:
+            chunk = self.process.stdout.read(size - offset)
             if not chunk:
-                if remaining != size:
+                if offset != 0:
                     raise ValueError('FFmpeg produced a truncated frame')
                 code = self.process.wait()
                 self.ended = True
@@ -169,17 +182,11 @@ class FrameReader:
                     self.errors.seek(0)
                     raise RuntimeError(self.errors.read(8192).decode(errors='replace'))
                 return None
-            blocks.append(chunk)
-            remaining -= len(chunk)
-        raw = b''.join(blocks)
+            view[offset:offset + len(chunk)] = chunk
+            offset += len(chunk)
         if self.reference is not None:
-            self.reference.write(raw)
-        values = np.frombuffer(raw, dtype=np.uint8)
-        n = self.width * self.height
-        y = values[:n].reshape(self.height, self.width)
-        u = values[n:n + n//4].reshape(self.height//2, self.width//2)
-        v = values[n + n//4:].reshape(self.height//2, self.width//2)
-        return np.stack((y, u.repeat(2, 0).repeat(2, 1), v.repeat(2, 0).repeat(2, 1)))
+            self.reference.write(view)
+        return buf
 
     def close(self):
         if self._closed:

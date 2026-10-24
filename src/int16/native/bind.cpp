@@ -36,6 +36,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("kernel_revision")="packed-v9";
     m.attr("ffn_transposed")=true;
     m.attr("block_channels_last")=true;
+    m.attr("supports_yuv420_unshuffle")=true;
     m.def("conv2d", &uf_conv);
     m.def("conv2d_generic", &uf_conv_generic);
     m.def("conv2d_baseline", &uf_conv_baseline);
