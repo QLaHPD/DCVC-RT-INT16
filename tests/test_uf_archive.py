@@ -93,7 +93,7 @@ class ArchiveTests(unittest.TestCase):
             FrameReader(self.source, 48, 32, media, decoder_threads=0)
 
     def test_truncated_remote_stream_is_not_published(self):
-        media = {**probe(self.source), 'duration': 10, 'audio': False}
+        media = {**probe(self.source), 'duration': 10, 'video_duration': 10, 'audio': False}
         self.config['audio'] = 'none'
         self.job['remote'] = dict(url='https://www.youtube.com/watch?v=abcdefghijk',
                                   video_format='v', media=media,
@@ -246,7 +246,7 @@ class ArchiveTests(unittest.TestCase):
         moved.parent.mkdir()
         self.final.rename(moved)
         args.input = str(moved)
-        with self.assertRaisesRegex(ValueError, 'omits source audio'):
+        with self.assertRaisesRegex(ValueError, 'source audio'):
             run_cleanup(args)
         self.assertTrue(self.source.exists())
 

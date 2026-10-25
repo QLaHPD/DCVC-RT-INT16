@@ -57,15 +57,17 @@ class PresetTests(unittest.TestCase):
         apply_target_psnr(args)
         self.assertEqual((args.procs, args.fps, args.opus_bitrate), (3, 24, '6k'))
 
-    def test_cli_applies_selection_before_runtime_defaults_and_dispatch(self):
+    def test_cli_defers_selection_until_the_saved_channel_profile_is_loaded(self):
         argv = ['main.py', 'stream', '--source_urls', 'https://example.com/video',
                 '--output_root', 'out', '--target-psnr', '30']
         with patch('sys.argv', argv), patch('src.archive.dashboard.run', return_value=0) as run:
             self.assertEqual(main(), 0)
         args = run.call_args.args[0]
-        self.assertEqual(args.target_psnr_selection['trial'], 783)
-        self.assertEqual(args.prefetch_frames, 8)
-        self.assertEqual(args.runtime, 'int16')
+        self.assertEqual(args.target_psnr, 30)
+        self.assertFalse(hasattr(args, 'target_psnr_selection'))
+        self.assertIsNone(args.prefetch_frames)
+        # Defaults are resolved by Profiles.load after inspecting each channel.
+        self.assertEqual(args.runtime, 'fp16')
 
 
 if __name__ == '__main__':

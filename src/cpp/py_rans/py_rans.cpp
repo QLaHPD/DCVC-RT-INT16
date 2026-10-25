@@ -476,9 +476,17 @@ void RansDecoder::decode_z(const int total_size, const int cdf_offset, const int
 std::shared_ptr<std::vector<int8_t>> RansDecoder::get_decoded_tensor_cpp()
 {
     int n = m_entropy_coder_parallel;
+    std::exception_ptr error;
     for (int i = 0; i < n; i++) {
-        m_decoders[i]->wait_for_decoding_finish();
+        try {
+            m_decoders[i]->wait_for_decoding_finish();
+        } catch (...) {
+            if (!error) error = std::current_exception();
+        }
     }
+    // Drain every writer before propagating an error: Python may now release
+    // or reuse the output buffer while another entropy worker is still active.
+    if (error) std::rethrow_exception(error);
     return m_decoded_tensor;
 }
 
@@ -496,11 +504,23 @@ void RansDecoder::set_cdf(const std::shared_ptr<std::vector<int32_t>>& cdfs,
                           const std::shared_ptr<std::vector<int32_t>>& cdfs_sizes, const int index)
 {
     int cdf_num = static_cast<int>(cdfs_sizes->size());
+    if (index < 0 || index > 1 || cdf_num < 1 || cdfs->size() % cdf_num != 0) {
+        throw std::invalid_argument("Invalid rANS CDF shape");
+    }
 
     int per_vector_size = static_cast<int>(cdfs->size() / cdf_num);
     auto vec_cdfs = std::make_shared<std::vector<std::vector<int32_t>>>(cdf_num);
     auto max_value = std::make_shared<std::vector<int8_t>>(cdf_num);
     for (int i = 0; i < cdf_num; i++) {
+        const int length = cdfs_sizes->at(i);
+        const int32_t* row = cdfs->data() + i * per_vector_size;
+        if (length < 3 || length > per_vector_size || length - 2 > 127 ||
+            row[0] != 0 || row[length - 1] != (1 << 16)) {
+            throw std::invalid_argument("Invalid rANS CDF bounds");
+        }
+        for (int j = 1; j < length; ++j) {
+            if (row[j] <= row[j - 1]) throw std::invalid_argument("Invalid rANS CDF frequencies");
+        }
         max_value->at(i) = static_cast<int8_t>(cdfs_sizes->at(i) - 2);
 
         std::vector<int32_t> t(per_vector_size);
@@ -552,6 +572,7 @@ void RansDecoder::set_entropy_coder_parallel(int n)
 void RansDecoder::set_stream(const uint8_t* ptr, const int size)
 {
     int n = m_entropy_coder_parallel;
+    if (size < 4) throw std::runtime_error("Truncated rANS header");
 
     if (n == 1) {
         auto stream0 = std::make_shared<std::vector<uint8_t>>(size);
@@ -577,11 +598,18 @@ void RansDecoder::set_stream(const uint8_t* ptr, const int size)
     bool has_tail = (n % 2 != 0);
     int num_offsets = num_pairs - 1 + (has_tail ? 1 : 0);
     int header_size = num_offsets * 4;
+    if (size < header_size + 4) throw std::runtime_error("Truncated rANS parallel header");
 
     // Read cumulative offsets
     std::vector<int> offsets(num_offsets);
     for (int k = 0; k < num_offsets; k++) {
-        offsets[k] = *reinterpret_cast<const int32_t*>(ptr + k * 4);
+        uint32_t offset = 0;
+        for (int byte = 0; byte < 4; ++byte) offset |= uint32_t(ptr[k * 4 + byte]) << (byte * 8);
+        const uint32_t previous = k == 0 ? 0 : static_cast<uint32_t>(offsets[k - 1]);
+        if (offset < previous + 4 || offset > static_cast<uint32_t>(size - header_size)) {
+            throw std::runtime_error("Invalid rANS parallel offset");
+        }
+        offsets[k] = static_cast<int>(offset);
     }
 
     // Compute group start/end positions (relative to after header)
@@ -609,6 +637,7 @@ void RansDecoder::set_stream(const uint8_t* ptr, const int size)
         int i1 = p * 2 + 1;
         const uint8_t* group_ptr = payload + group_start[p];
         int gs = group_size[p];
+        if (gs < 4) throw std::runtime_error("Truncated rANS parallel group");
 
         auto s0 = std::make_shared<std::vector<uint8_t>>(gs);
         std::copy(group_ptr, group_ptr + gs, s0->data());
@@ -623,6 +652,7 @@ void RansDecoder::set_stream(const uint8_t* ptr, const int size)
     if (has_tail) {
         int tail_start = offsets[num_offsets - 1];
         int tail_size = payload_size - tail_start;
+        if (tail_size < 4) throw std::runtime_error("Truncated rANS parallel tail");
         const uint8_t* tail_ptr = payload + tail_start;
 
         auto s = std::make_shared<std::vector<uint8_t>>(tail_size);

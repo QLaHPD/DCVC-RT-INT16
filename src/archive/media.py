@@ -1,6 +1,7 @@
 """Bounded FFmpeg pipes and metadata helpers for UF archive inputs."""
 
 import json
+import math
 import os
 from fractions import Fraction
 from pathlib import Path
@@ -34,9 +35,31 @@ def probe(path):
     rate = video.get('avg_frame_rate') or video.get('r_frame_rate')
     if not rate or rate == '0/0':
         rate = video.get('r_frame_rate', '30/1')
-    return {'width': int(video['width']), 'height': int(video['height']),
-            'fps': float(Fraction(rate)), 'duration': float(data.get('format', {}).get('duration', 0)),
-            'audio': any(s['codec_type'] == 'audio' for s in data['streams'])}
+    def stream_duration(stream):
+        try:
+            value = float(stream.get('duration'))
+            if math.isfinite(value) and value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+        # Matroska commonly exposes stream timing through a DURATION tag.
+        try:
+            hours, minutes, seconds = stream.get('tags', {}).get('DURATION', '').split(':')
+            value = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+            return value if math.isfinite(value) and value > 0 else None
+        except (TypeError, ValueError):
+            return None
+    video_duration = stream_duration(video)
+    audio = next((s for s in data['streams'] if s['codec_type'] == 'audio'), None)
+    result = {'width': int(video['width']), 'height': int(video['height']),
+              'fps': float(Fraction(rate)),
+              'duration': video_duration or float(data.get('format', {}).get('duration', 0)),
+              'audio': audio is not None}
+    if video_duration is not None:
+        result['video_duration'] = video_duration
+    if audio is not None and (duration := stream_duration(audio)) is not None:
+        result['audio_duration'] = duration
+    return result
 
 
 def dimensions(width, height, resolution):
@@ -64,7 +87,7 @@ class FrameReader:
             filters.append(f'fps={fps}')
         if hwaccel not in ('none','auto','jetson'): raise ValueError('Unsupported decoder')
         filters += ['format=yuv420p','setsar=1/1']
-        command = ['ffmpeg', '-v', 'error', '-nostdin', '-threads', str(decoder_threads), '-noautorotate', '-hwaccel', 'none' if hwaccel=='jetson' else hwaccel,
+        command = ['ffmpeg', '-v', 'error', '-nostdin', '-xerror', '-threads', str(decoder_threads), '-noautorotate', '-hwaccel', 'none' if hwaccel=='jetson' else hwaccel,
                    '-i', str(source), '-map', '0:v:0', '-an', '-sn', '-dn']
         if filters:
             command += ['-vf', ','.join(filters)]
@@ -234,7 +257,7 @@ class FrameReader:
 
 
 def encode_audio(source, target, channels, bitrate, duration, input_pipe=None, frame_ms=20, complexity=10, vbr="on"):
-    subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-i', str(source), '-map', '0:a:0',
+    subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-xerror', '-i', str(source), '-map', '0:a:0',
                     '-vn', '-c:a', 'libopus', '-ac', '1' if channels == 'mono' else '2',
                     '-b:a', bitrate, '-frame_duration', str(frame_ms), '-compression_level', str(complexity), '-vbr', vbr, '-t', str(duration), '-f', 'opus', str(target)], check=True, stdin=input_pipe)
 
@@ -244,3 +267,12 @@ def verify_audio(path):
     # packet. Check continuous decoded samples using throwaway timestamps.
     subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-xerror', '-i', str(path), '-map', '0:a:0',
                     '-af', 'asetpts=N/SR/TB', '-f', 'null', '-'], check=True)
+
+
+def audio_duration(path):
+    result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                             '-of', 'json', str(path)], capture_output=True, text=True, check=True)
+    duration = float(json.loads(result.stdout)['format']['duration'])
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError('Audio has no positive finite duration')
+    return duration

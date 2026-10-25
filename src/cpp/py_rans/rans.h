@@ -4,6 +4,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <exception>
 #include <queue>
 #include <thread>
 #include <vector>
@@ -126,6 +127,8 @@ public:
 private:
     RansState m_rans;
     const uint8_t* m_ptr8{ nullptr };
+    const uint8_t* m_end8{ nullptr };
+    std::exception_ptr m_error;
     std::shared_ptr<std::vector<uint8_t>> m_stream;
 
     std::vector<std::shared_ptr<std::vector<std::vector<int32_t>>>> m_cdfs;

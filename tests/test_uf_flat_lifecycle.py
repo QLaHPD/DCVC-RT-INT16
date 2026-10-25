@@ -42,16 +42,18 @@ class FlatLifecycleTests(unittest.TestCase):
         with patch('src.archive.workflow.checked_codec',return_value=FakeCodec()):
             self.assertEqual(run_decode(self.options(input=str(root/'source.bin')),verify_only=True),0)
 
-    def test_existing_opus_is_reused_without_reencoding(self):
+    def test_uncommitted_opus_requires_reencoding_and_is_preserved_on_failure(self):
         from src.archive.media import encode_audio
         from src.archive.storage import sha256
         self.flat(); self.final.parent.mkdir()
         opus=self.final.with_name('source.opus')
         encode_audio(self.source,opus,'mono','6k',1)
         before=sha256(opus)
-        with patch('src.archive.workflow.encode_audio',side_effect=AssertionError('must reuse audio')):
-            self.assertEqual(self.encode(),'encoded')
+        with patch('src.archive.workflow.encode_audio',side_effect=RuntimeError('fresh audio encode failed')) as fresh:
+            self.assertEqual(self.encode(),'failed')
+        fresh.assert_called_once()
         self.assertEqual(sha256(opus),before)
+        self.assertFalse(self.final.exists())
 
     def test_inventory_remaps_another_machines_source(self):
         import shutil

@@ -21,7 +21,7 @@ class StreamSkipTests(unittest.TestCase):
         self.url = 'https://www.youtube.com/watch?v='+self.video_id
         self.bin = self.folder/(self.video_id+'_123_256x144_qI10_qP14.bin')
         self.bin.write_bytes(b'complete')
-        self.record = dict(format='dcvc-uf-archive', pipeline=self.config,
+        self.record = dict(format='dcvc-uf-archive', pipeline=self.config, video={'frames': 4, 'fps': 4},
                            source={'url':self.url}, validation={'mode':'artifact-hashes','decode_performed':False},
                            artifacts={'video.bin':{'size':8,'sha256':'unused-for-fast-stat-check'}},
                            files={'video.bin':self.bin.name})

@@ -28,6 +28,15 @@ SHOW = 'ff969c14-c5a7-44ab-ab72-14d4c9e427a9'
 GIB = 1024 ** 3
 
 
+def classify_error(error):
+    """An unavailable item must not consume the controller's failure budget."""
+    message = str(error).lower()
+    return 'unavailable' if any(word in message for word in (
+        'geoblock', 'geo restriction', 'not available in your',
+        'only available in switzerland', 'no video formats found',
+        'no downloadable video format')) else 'failed'
+
+
 def read_inventory(path):
     rows, seen = [], set()
     with Path(path).open() as stream:
@@ -269,9 +278,8 @@ def run_locked(args, output):
                         save('pilot_failed')
                         return 1
             except Exception as exc:
-                unavailable = any(word in str(exc).lower() for word in
-                                  ('geoblock', 'geo restriction', 'not available in your', 'only available in switzerland'))
-                record(row, 'unavailable' if unavailable else 'failed', error=f'{type(exc).__name__}: {exc}')
+                unavailable = classify_error(exc) == 'unavailable'
+                record(row, classify_error(exc), error=f'{type(exc).__name__}: {exc}')
                 consecutive_failures = 0 if unavailable else consecutive_failures + 1
                 if args.validate_pilot:
                     save('pilot_failed', error=str(exc))

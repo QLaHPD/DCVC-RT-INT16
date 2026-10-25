@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -175,6 +176,42 @@ def has_completion_record(metadata):
     return bool(validation.get('decoded_yuv_sha256')) or (
         validation.get('mode') == 'artifact-hashes' and validation.get('decode_performed') is False)
 
+
+def validate_video_coverage(video, media, config):
+    """Check source coverage without trusting successful decoding or byte hashes."""
+    frames, fps = video.get('frames'), video.get('fps') or config.get('fps')
+    if type(frames) is not int or frames < 1:
+        raise ValueError('Archive has no completed video')
+    expected = media.get('video_duration', media.get('duration'))
+    if expected is None or expected == 0:
+        return  # Legacy metadata and still-image inputs may not carry timing.
+    expected = float(expected)
+    if not math.isfinite(expected) or expected < 0 or not fps or not math.isfinite(float(fps)) or fps <= 0:
+        raise ValueError('Invalid source/video timing in archive')
+    if config.get('max_frames') is not None:
+        expected = min(expected, config['max_frames'] / fps)
+    actual = frames / fps
+    if actual + max(2.0, 2.0 / fps) < expected:
+        raise ValueError(f'Source stream ended early: encoded {actual:.2f}s '
+                         f'of expected {expected:.2f}s; refusing incomplete archive')
+
+
+def validate_completion(metadata):
+    """Common semantic gate for publication, recovery, resume and cleanup."""
+    if metadata['pipeline'].get('image_only'):
+        return
+    validate_video_coverage(metadata['video'], metadata['source'].get('media', {}), metadata['pipeline'])
+    media, config = metadata['source'].get('media', {}), metadata['pipeline']
+    if config.get('audio') == 'opus' and media.get('audio') and 'audio.opus' not in metadata['artifacts']:
+        raise ValueError('Completed archive is missing source audio')
+    audio = metadata.get('audio')
+    if audio is not None:
+        actual, expected = float(audio['duration']), float(audio['expected_duration'])
+        if not math.isfinite(actual) or not math.isfinite(expected) or actual <= 0 or expected <= 0:
+            raise ValueError('Invalid audio timing in archive')
+        if actual + 1.0 < expected:
+            raise ValueError(f'Audio ended early: encoded {actual:.2f}s of expected {expected:.2f}s')
+
 def load_bundle(path, expected=None, *, verify_hashes=True):
     """Validate a committed archive; only resume may opt out of payload hashing."""
     manifest = manifest_path(path)
@@ -201,6 +238,7 @@ def load_bundle(path, expected=None, *, verify_hashes=True):
         raise ValueError(f'Existing archive uses different encoding settings/models: {root}')
     if not has_completion_record(data):
         raise ValueError(f'Archive has no recognized completion record: {root}')
+    validate_completion(data)
     for name, info in data['artifacts'].items():
         if Path(name).name != name:
             raise ValueError(f'Unsafe artifact name: {name}')
@@ -246,6 +284,7 @@ def publish_flat(stage, manifest, metadata, heartbeat, lease_key):
     accepts only byte-identical payloads, never replaces a final file, and commits
     only after the current owner has completed encoding and recorded artifact hashes.
     """
+    validate_completion(metadata)
     manifest, stage = Path(manifest), Path(stage)
     stem = manifest.name.removesuffix('.uf.json')
     metadata.update(layout='flat', archive_stem=stem, lease_key=lease_key)
@@ -297,6 +336,7 @@ def recover_flat(manifest, expected, heartbeat, lease_key, source, source_sha, u
         raise ValueError('Unsafe publication journal')
     transaction = json.loads(pending.read_text())
     metadata = transaction['metadata']
+    validate_completion(metadata)
     if metadata['pipeline'] != expected:
         raise ValueError('Pending publication has different encoding settings')
     previous = metadata['source']

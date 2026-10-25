@@ -34,10 +34,22 @@ available for full artifact hashing and decoding.
 
 `batch-state.json` records the current status and counts; `batch-ledger.jsonl`
 records outcomes. Provider metadata and the original inventory row are saved
-in each `.info.json`. Geographic restrictions are logged without bypassing
-them. Other failures are logged and processing continues; 20 consecutive errors
+in each `.info.json`. Geographic restrictions and entries with no downloadable
+video formats are logged as unavailable without consuming the global failure
+budget. Other failures are logged and processing continues; 20 consecutive errors
 pause the run to avoid exhausting the inventory during an outage. Rerunning
 retries unavailable/failed entries and skips completed ones.
+
+For the exported Tagesschau five-GPU handoff layout, the versioned controller is
+`scripts/run_srf_parallel.py`. With the existing environment and prepared models:
+
+```bash
+./scripts/uf-python scripts/run_srf_parallel.py --repo "$PWD" \
+  --root /path/to/Tegesschau --gpus 0,1,2,3,4
+```
+
+It inherits `uf-int16-288p8fps-psnr35/batch-settings.json`, validates the approved
+profile/model identities, and retains the existing batch lock and resume state.
 
 The default free-space reserve is 1 GiB. A conservative output budget is checked
 before each download, and actual staged bytes plus the reserve are checked

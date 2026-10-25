@@ -32,7 +32,8 @@ def command(binary, cookies):
     deno = shutil.which('deno') or str(Path.home() / '.deno/bin/deno')
     runtime = ['--js-runtimes', 'deno:' + deno] if Path(deno).is_file() else []
     return [binary, *runtime, '--ignore-config', '--remote-components', 'ejs:github', '--no-progress', '--retries', '5',
-            '--fragment-retries', '5', *(['--cookies', cookies] if cookies else [])]
+            '--fragment-retries', '5', '--abort-on-unavailable-fragment',
+            *(['--cookies', cookies] if cookies else [])]
 
 
 def metadata(url, binary, cookies, flat=False, cancel_event=None):
@@ -172,13 +173,14 @@ def existing_stream_archives(channel_out, completed=None, config=None, resume_ch
             raise ValueError(f'Multiple archives for {url}: {archives[url]} and {path}')
         archives[url] = path
         if completed is not None and config is not None and not path.is_symlink():
-            from src.archive.storage import has_completion_record, artifact_path, sha256
+            from src.archive.storage import has_completion_record, artifact_path, sha256, validate_completion
             artifacts = data.get('artifacts', {})
             if data.get('pipeline') != config or not has_completion_record(data) or 'video.bin' not in artifacts:
                 continue
             if config.get('audio') == 'opus' and data.get('source', {}).get('media', {}).get('audio') and 'audio.opus' not in artifacts:
                 continue
             try:
+                validate_completion(data)
                 if all(not (artifact := artifact_path(path.parent, data, name)).is_symlink()
                        and artifact.is_file() and artifact.stat().st_size == record['size']
                        and (resume_check != 'full' or sha256(artifact) == record['sha256'])

@@ -233,19 +233,22 @@ class SharedWorkPool:
             "created_at": _now_iso(),
             "config": config,
         }
+        temporary = root / f".pipeline.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            fd = None
-        if fd is not None:
+            # A peer can only see a fully written profile. link() publishes
+            # exclusively, so racing creators cannot replace peer settings.
+            _atomic_write_json(temporary, payload)
             try:
-                data = _canonical_json(payload) + b"\n"
-                offset = 0
-                while offset < len(data):
-                    offset += os.write(fd, data[offset:])
-                os.fsync(fd)
+                os.link(temporary, path)
+            except FileExistsError:
+                pass
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
             finally:
-                os.close(fd)
+                os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
 
         existing = None
         for _ in range(50):
@@ -330,41 +333,72 @@ class SharedWorkPool:
         token = uuid.uuid4().hex
         recovered_stale = False
         for _ in range(4):
-            try:
-                claim_path.mkdir()
-            except FileExistsError:
-                info = self.read_claim(channel_out, video_id)
-                state_path = claim_path / "state.json"
-                try:
-                    age = max(0.0, time.time() - state_path.stat().st_mtime)
-                except FileNotFoundError:
-                    try:
-                        age = max(0.0, time.time() - claim_path.stat().st_mtime)
-                    except FileNotFoundError:
-                        continue
-                if age <= self.lease_seconds:
-                    return None, info
-                stale_path = self.root(channel_out) / "stale" / f"{job_key(video_id)}.{uuid.uuid4().hex}"
-                try:
-                    os.rename(claim_path, stale_path)
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    return None, info
-                shutil.rmtree(stale_path, ignore_errors=True)
-                recovered_stale = True
-                continue
-
-            directory_fd = os.open(claim_path, os.O_RDONLY | os.O_DIRECTORY)
-            lease = JobLease(
-                self, channel_out, video_id, claim_path, token, directory_fd,
-                recovered_stale=recovered_stale,
-            )
+            # Publish an initialized, nonempty directory atomically. Recovery
+            # only rmdir()s empty directories; it can never remove a new claim.
+            candidate = claim_path.with_name(f".{claim_path.name}.{uuid.uuid4().hex}")
+            candidate.mkdir()
+            directory_fd = os.open(candidate, os.O_RDONLY | os.O_DIRECTORY)
+            lease = JobLease(self, channel_out, video_id, claim_path, token, directory_fd,
+                             recovered_stale=recovered_stale)
             try:
                 lease._write_state({"status": "claimed"})
+                os.rename(candidate, claim_path)
+            except OSError as exc:
+                os.close(directory_fd)
+                lease._closed = True
+                shutil.rmtree(candidate, ignore_errors=True)
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                info = self.read_claim(channel_out, video_id)
+                if not self._retire_stale_claim(claim_path):
+                    return None, info
+                recovered_stale = True
+                continue
+            except BaseException:
+                os.close(directory_fd)
+                lease._closed = True
+                shutil.rmtree(candidate, ignore_errors=True)
+                raise
+            try:
                 lease.assert_owned()
             except BaseException:
                 lease.release()
                 raise
             return lease, None
         return None, self.read_claim(channel_out, video_id)
+
+    def _retire_stale_claim(self, path: Path) -> bool:
+        """Remove only entries in the opened generation, never a replacement.
+
+        No host-local flock is needed: directory fds and nonempty publication
+        also fence simultaneous recoverers over SSHFS. A crash halfway through
+        retirement is retryable without leaving a separate recovery lock.
+        """
+        try:
+            directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            return True
+        try:
+            try:
+                stamp = os.stat("state.json", dir_fd=directory_fd).st_mtime
+            except FileNotFoundError:
+                stamp = os.fstat(directory_fd).st_mtime
+            if max(0.0, time.time() - stamp) <= self.lease_seconds:
+                return False
+            for name in os.listdir(directory_fd):
+                if name != "state.json" and not name.startswith(".state.tmp."):
+                    return False
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            try:
+                path.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+            return True
+        finally:
+            os.close(directory_fd)

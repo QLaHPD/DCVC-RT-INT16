@@ -26,13 +26,22 @@ constexpr uint16_t MAX_BYPASS_VAL = (1 << BYPASS_PRECISION) - 1;
     #define FORCE_INLINE inline
 #endif
 
-FORCE_INLINE void RansDecAdvance(RansState& r, const uint8_t*& ptr, uint32_t start, uint32_t freq)
+FORCE_INLINE uint8_t RansReadByte(const uint8_t*& ptr, const uint8_t* end)
+{
+    if (ptr == end) {
+        throw std::runtime_error("Truncated rANS stream");
+    }
+    return *ptr++;
+}
+
+FORCE_INLINE void RansDecAdvance(RansState& r, const uint8_t*& ptr, const uint8_t* end,
+                                uint32_t start, uint32_t freq)
 {
     r = freq * (r >> SCALE_BITS) + (r & DEC_MASK) - start;
 
     // renormalize
     while (r < RANS_BYTE_L) {
-        r = (r << 8) | *ptr++;
+        r = (r << 8) | RansReadByte(ptr, end);
     }
 }
 
@@ -41,26 +50,27 @@ FORCE_INLINE int32_t RansDecGet(RansState& r)
     return r & DEC_MASK;
 }
 
-FORCE_INLINE uint32_t RansDecGetBits(RansState& r, const uint8_t*& ptr)
+FORCE_INLINE uint32_t RansDecGetBits(RansState& r, const uint8_t*& ptr, const uint8_t* end)
 {
     uint32_t val = r & ((1u << BYPASS_PRECISION) - 1);
 
     // renormalize
     r = r >> BYPASS_PRECISION;
     if (r < RANS_BYTE_L) {
-        r = (r << 8) | *ptr++;
-        assert(r >= RANS_BYTE_L);
+        r = (r << 8) | RansReadByte(ptr, end);
+        if (r < RANS_BYTE_L) throw std::runtime_error("Invalid rANS bypass state");
     }
 
     return val;
 }
 
-FORCE_INLINE void RansDecInit(RansState& r, const uint8_t*& ptr)
+FORCE_INLINE void RansDecInit(RansState& r, const uint8_t*& ptr, const uint8_t* end)
 {
-    r = (*ptr++) << 0;
-    r |= (*ptr++) << 8;
-    r |= (*ptr++) << 16;
-    r |= (*ptr++) << 24;
+    r = uint32_t(RansReadByte(ptr, end));
+    r |= uint32_t(RansReadByte(ptr, end)) << 8;
+    r |= uint32_t(RansReadByte(ptr, end)) << 16;
+    r |= uint32_t(RansReadByte(ptr, end)) << 24;
+    if (r < RANS_BYTE_L) throw std::runtime_error("Invalid rANS initial state");
 }
 
 FORCE_INLINE void RansEncFlush(const RansState& r, uint8_t*& ptr)
@@ -123,7 +133,7 @@ FORCE_INLINE void RansEncPutBits(RansState& r, uint8_t*& ptr, uint32_t val)
     r = (r << BYPASS_PRECISION) | val;
 }
 
-FORCE_INLINE int8_t decode_one_symbol(const uint8_t*& ptr8, RansState& rans, const int32_t* cdf,
+FORCE_INLINE int8_t decode_one_symbol(const uint8_t*& ptr8, const uint8_t* end8, RansState& rans, const int32_t* cdf,
                                       const int8_t max_value)
 {
     const int32_t cum_freq = RansDecGet(rans);
@@ -134,26 +144,28 @@ FORCE_INLINE int8_t decode_one_symbol(const uint8_t*& ptr8, RansState& rans, con
     }
     s--;
 
-    RansDecAdvance(rans, ptr8, cdf[s], cdf[s + 1] - cdf[s]);
+    RansDecAdvance(rans, ptr8, end8, cdf[s], cdf[s + 1] - cdf[s]);
 
     int32_t value = static_cast<int32_t>(s);
 
     if (value == max_value) {
         // Bypass decoding mode
-        int32_t val = RansDecGetBits(rans, ptr8);
+        int32_t val = RansDecGetBits(rans, ptr8, end8);
         int32_t n_bypass = val;
 
         while (val == MAX_BYPASS_VAL) {
-            val = RansDecGetBits(rans, ptr8);
+            val = RansDecGetBits(rans, ptr8, end8);
             n_bypass += val;
+            if (n_bypass > 4) throw std::runtime_error("Invalid rANS bypass length");
         }
 
         int32_t raw_val = 0;
         for (int j = 0; j < n_bypass; ++j) {
-            val = RansDecGetBits(rans, ptr8);
+            val = RansDecGetBits(rans, ptr8, end8);
             raw_val |= val << (j * BYPASS_PRECISION);
         }
         value = raw_val + max_value;
+        if (value > 256) throw std::runtime_error("Invalid rANS symbol");
     }
 
     return static_cast<int8_t>((value % 2 == 1) ? (value + 1) / 2 : -(value + 1) / 2);
@@ -555,13 +567,15 @@ void RansDecoderLib::decode_y_internal(int8_t* decoded_ptr,
                                        const std::shared_ptr<std::vector<uint8_t>>& indexes,
                                        const int symbol_size, const int symbol_offset)
 {
+    if (!m_stream || !m_cdfs[1] || !m_max_value[1]) throw std::runtime_error("rANS decoder is not initialized");
     const uint8_t* indexes_ptr = indexes->data();
     const int8_t* max_value_ptr = m_max_value[1]->data();
     const std::vector<int32_t>* cdfs = m_cdfs[1]->data();
     for (int i = 0; i < symbol_size; ++i) {
         const int32_t cdf_idx = indexes_ptr[i + symbol_offset];
+        if (static_cast<size_t>(cdf_idx) >= m_cdfs[1]->size()) throw std::runtime_error("Invalid rANS CDF index");
         decoded_ptr[i + symbol_offset] =
-            decode_one_symbol(m_ptr8, m_rans, cdfs[cdf_idx].data(), max_value_ptr[cdf_idx]);
+            decode_one_symbol(m_ptr8, m_end8, m_rans, cdfs[cdf_idx].data(), max_value_ptr[cdf_idx]);
     }
 }
 
@@ -589,13 +603,15 @@ void RansDecoderLib::decode_z(int8_t* decoded_ptr, const int symbol_size, const 
 void RansDecoderLib::decode_z_internal(int8_t* decoded_ptr, const int symbol_size,
                                        const int symbol_offset, const int cdf_offset, const int ch)
 {
+    if (!m_stream || !m_cdfs[0] || !m_max_value[0] || ch <= 0) throw std::runtime_error("rANS decoder is not initialized");
     const int8_t* max_value_ptr = m_max_value[0]->data();
     const std::vector<int32_t>* cdfs = m_cdfs[0]->data();
 
     for (int i = 0; i < symbol_size; ++i) {
         const int32_t cdf_idx = ((i + symbol_offset) % ch) + cdf_offset;
+        if (cdf_idx < 0 || static_cast<size_t>(cdf_idx) >= m_cdfs[0]->size()) throw std::runtime_error("Invalid rANS CDF index");
         decoded_ptr[i + symbol_offset] =
-            decode_one_symbol(m_ptr8, m_rans, cdfs[cdf_idx].data(), max_value_ptr[cdf_idx]);
+            decode_one_symbol(m_ptr8, m_end8, m_rans, cdfs[cdf_idx].data(), max_value_ptr[cdf_idx]);
     }
 }
 
@@ -609,15 +625,20 @@ void RansDecoderLib::set_cdf(const std::shared_ptr<std::vector<std::vector<int32
 
 void RansDecoderLib::set_stream(const std::shared_ptr<std::vector<uint8_t>> encoded)
 {
+    if (!encoded || encoded->size() < 4) throw std::runtime_error("Truncated rANS header");
     m_stream = encoded;
     m_ptr8 = m_stream->data();
-    RansDecInit(m_rans, m_ptr8);
+    m_end8 = m_ptr8 + m_stream->size();
+    RansDecInit(m_rans, m_ptr8, m_end8);
+    std::lock_guard<std::mutex> lk(m_mutex_result);
+    m_error = nullptr;
 }
 
 bool RansDecoderLib::wait_for_decoding_finish()
 {
     std::unique_lock<std::mutex> lk(m_mutex_result);
     m_cv_result.wait(lk, [this] { return m_result_ready || m_finish; });
+    if (m_error) std::rethrow_exception(m_error);
     return true;
 }
 
@@ -633,13 +654,20 @@ void RansDecoderLib::worker()
             auto p = std::move(m_pending.front());
             m_pending.pop();
             lk.unlock();
-            if (p.workType == WorkType::EncodeDecodeY) {
-                decode_y_internal(p.decoded_ptr, p.indexes, p.symbol_size, p.symbol_offset);
-            } else if (p.workType == WorkType::EncodeDecodeZ) {
-                decode_z_internal(p.decoded_ptr, p.symbol_size, p.symbol_offset, p.cdf_offset, p.ch);
+            std::exception_ptr error;
+            try {
+                if (m_error) std::rethrow_exception(m_error);
+                if (p.workType == WorkType::EncodeDecodeY) {
+                    decode_y_internal(p.decoded_ptr, p.indexes, p.symbol_size, p.symbol_offset);
+                } else if (p.workType == WorkType::EncodeDecodeZ) {
+                    decode_z_internal(p.decoded_ptr, p.symbol_size, p.symbol_offset, p.cdf_offset, p.ch);
+                }
+            } catch (...) {
+                error = std::current_exception();
             }
             {
                 std::lock_guard<std::mutex> lk_result(m_mutex_result);
+                m_error = error;
                 m_result_ready = true;
             }
             m_cv_result.notify_one();

@@ -60,8 +60,10 @@ encoder model initialization. Worker reuse does not change saved pipeline settin
 
 `--opus_frame_ms` defaults to 60, with `--opus_complexity 10 --opus_vbr on`.
 An older UF run used FFmpeg's default 20 ms; saved profiles inherit that value
-automatically. Existing valid sibling `.opus` files are reused, including
-when re-encoding only video. `--audio none` prevents source deletion when the
+automatically. Audio is reused only from a verified pending publication or a
+completed archive. An orphan sibling `.opus` cannot establish source/settings
+identity: audio is encoded afresh and different existing output is preserved
+with a collision error. `--audio none` prevents source deletion when the
 source contains audio.
 
 `--input_threads` sets the FFmpeg thread budget. INT16 defaults to up to four
@@ -225,6 +227,9 @@ its failures have been reported; cleanup remains an explicit separate command.
 Completed videos use `--resume-check fast` by default for `join`, `encode` and
 `stream`. This validates the committed manifest, pipeline compatibility, required
 audio/video, safe artifact paths, and each artifact's existence and recorded size.
+Both resume modes also check recorded video coverage against source duration,
+respect intentional frame limits, and check recorded audio coverage when present.
+Hashes alone do not establish that every source segment was downloaded.
 An original that still exists must be a regular file with the recorded size and
 modification time. Timestamps are compared exactly when both have fractional
 seconds; when either is rounded to whole seconds (as with SSHFS/SFTP), their
@@ -240,6 +245,13 @@ corruption or original content changes that also preserve the recorded mtime.
 Neither resume mode performs neural decoding. Explicit `verify`, playback,
 publication recovery and original deletion retain their full integrity checks;
 fast resume never grants approval to delete originals.
+
+HLS downloads abort when a fragment remains unavailable after retries. FFmpeg
+decoder errors fail the encode, and local inputs receive the same completeness
+check as remote sources. Local timing prefers the video stream's duration so
+an intentionally longer audio track does not make complete video look truncated.
+Failed inputs are retained. These safeguards do not repair old missing-content
+archives whose frozen frames already cover the expected duration.
 
 The existing claim namespaces, pipeline identities, archive layouts and atomic
 publication rules are unchanged. Helpers must share the physical output and

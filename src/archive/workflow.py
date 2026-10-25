@@ -15,11 +15,12 @@ import tempfile
 import time
 
 from src.archive.media import (VIDEO_EXTENSIONS, FrameReader, decoder_thread_budget,
-                               dimensions, encode_audio, probe, verify_audio)
+                               dimensions, encode_audio, probe, verify_audio, audio_duration)
 from src.archive.storage import (SharedWorkPool, Heartbeat, atomic_json, bundle_path, event,
                                  identity, load_bundle, sha256, sync_directory, artifact_path, control_path,
                                  archive_location, archive_lease, publish_flat, recover_flat,
-                                 memory_stage_root, completed_disk_stage, validate_resume_source)
+                                 memory_stage_root, completed_disk_stage, validate_resume_source,
+                                 validate_video_coverage, validate_completion)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -273,26 +274,19 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
                     event('decoder_fallback',source=str(source),error=str(exc),message='Retrying input with software decoding')
             if policy is not None: policy.release()
             if job.get('stream_near_end') is not None: job['stream_near_end'].set()
-            if remote and config['max_frames'] is None:
-                expected_seconds = float(original.get('duration') or 0)
-                encoded_seconds = result['frames'] / fps
-                if (math.isfinite(expected_seconds) and expected_seconds > 0
-                        and encoded_seconds + max(2.0, 2.0 / fps) < expected_seconds):
-                    raise ValueError(f'Source stream ended early: encoded {encoded_seconds:.2f}s '
-                                     f'of expected {expected_seconds:.2f}s; refusing to publish')
             result.update(width=width, height=height, fps=fps)
+            validate_video_coverage(result, original, config)
+            audio_record = None
             if config['audio'] == 'opus' and original['audio']:
-                existing_audio = parent / (final.name.removesuffix('.uf.json') + '.opus') if flat else None
                 if single_pass_audio:
                     pass  # Both tracks were consumed by the same FFmpeg process.
-                elif existing_audio is not None and existing_audio.is_file() and not existing_audio.is_symlink():
-                    verify_audio(existing_audio)
-                    shutil.copy2(existing_audio, stage / 'audio.opus')
-                    event('audio_reused', source=str(existing_audio))
                 else:
                     with (download_pipe(remote, remote['audio_format']) if remote else nullcontext(None)) as audio_pipe:
                         encode_audio('pipe:0' if remote else source, stage / 'audio.opus', config['opus_channels'], config['opus_bitrate'], result['frames'] / fps, input_pipe=audio_pipe,frame_ms=config.get('opus_frame_ms',20),complexity=config.get('opus_complexity',10),vbr=config.get('opus_vbr','on'))
                 verify_audio(stage / 'audio.opus')
+                expected_audio = min(result['frames'] / fps, original.get('audio_duration') or float('inf'))
+                audio_record = {'duration': audio_duration(stage / 'audio.opus'),
+                                'expected_duration': expected_audio}
             # Publication checks bytes and ownership, without a second neural pass.
             validation = {'mode': 'artifact-hashes', 'decode_performed': False}
             if not remote and (identity(source) != before or sha256(source) != source_sha):
@@ -316,6 +310,9 @@ def encode_job(job, config, paths, device, instance, codec_provider=None):
                         'video': result, 'validation': validation, 'artifacts': artifacts,
                         'environment': {'torch': torch.__version__, 'cuda': torch.version.cuda,
                                         'gpu': 'CPU reference' if device == 'cpu' else torch.cuda.get_device_name(device)}}
+            if audio_record is not None:
+                metadata['audio'] = audio_record
+            validate_completion(metadata)
             if flat and job.get('filename_style'):
                 metadata['filename_style'] = job['filename_style']
             atomic_json(stage / 'manifest.json', metadata)
