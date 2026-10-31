@@ -29,6 +29,7 @@ class Layers:
         self._native_swizzle = None
         self._native_cat_nhwc = None
         self._native_unshuffle_cat_nhwc = None
+        self._native_unshuffle2x_nhwc = None
         self._packed_chains = {}
         post_native = False
         if torch.device(device).type == 'cuda':
@@ -41,6 +42,7 @@ class Layers:
             self._native_swizzle = getattr(uf_int16_cuda, 'swizzle_weight', None)
             self._native_cat_nhwc = getattr(uf_int16_cuda, 'cat_pack_nhwc', None)
             self._native_unshuffle_cat_nhwc = getattr(uf_int16_cuda, 'from_bytes_unshuffle_cat_nhwc', None)
+            self._native_unshuffle2x_nhwc = getattr(uf_int16_cuda, 'unshuffle2x_pack_nhwc', None)
         for module in model.modules():
             if (callable(self._native_swizzle) and isinstance(module, nn.Conv2d)
                     and module.dilation == (1, 1) and module.padding_mode == 'zeros'
@@ -136,6 +138,17 @@ class Layers:
                                   and nxt.groups == 1
                                   and nxt.padding_mode == 'zeros'):
                                 eligible = nxt.in_channels == channels
+                            elif (callable(self._native_conv_packed)
+                                  and type(nxt).__name__ == 'ResidualBlockUpsample'
+                                  and len(nxt.up.conv) == 2
+                                  and isinstance(nxt.up.conv[0], nn.Conv2d)
+                                  and nxt.up.conv[0].kernel_size == (1, 1)
+                                  and nxt.up.conv[0].stride == (1, 1)
+                                  and nxt.up.conv[0].padding == (0, 0)
+                                  and nxt.up.conv[0].dilation == (1, 1)
+                                  and nxt.up.conv[0].groups == 1
+                                  and nxt.up.conv[0].padding_mode == 'zeros'):
+                                eligible = nxt.up.conv[0].in_channels == channels
                     entries.append((eligible, channels))
                 if any(eligible for eligible, _ in entries):
                     self._packed_chains[id(module)] = entries
@@ -164,14 +177,14 @@ class Layers:
     def _cat_for_chain(self, seq_module, a, b):
         if (self._native_cat_nhwc is not None and id(seq_module) in self._packed_chains
                 and a.is_cuda and b.is_cuda and a.dtype == torch.int16 and b.dtype == torch.int16
-                and a.shape[2] * a.shape[3] >= 128
+                and 128 <= a.shape[2] * a.shape[3] <= 8192
                 and (a.numel() + b.numel()) <= 8 * 1024 * 1024
                 and (a.shape[1] + b.shape[1]) >= 256 and (a.shape[1] + b.shape[1]) % 32 == 0):
             return self._native_cat_nhwc(a, b)
         return torch.cat((a, b), dim=1), None
 
     def __call__(self, module, *args, for_reset=False, output_frames=None,
-                 _packed_input=None, _pack_output=False):
+                 _packed_input=None, _pack_output=False, _packed_only=True):
         x = args[0]
         name = type(module).__name__
         source_bytes = x.dtype != torch.int16
@@ -184,19 +197,41 @@ class Layers:
                 weight, bias, projection = fused
                 return self(projection, ops.conv2d_wsilu4(x, weight, bias, self.values['tables.wsilu']))
             chain = self._packed_chains.get(id(module))
-            if chain is not None and self._native_packed_block is not None and x.shape[2]*x.shape[3] >= 128:
+            if chain is not None and self._native_packed_block is not None:
                 packed = _packed_input
-                for child, (eligible, channels) in zip(module, chain):
-                    emit = eligible and x.shape[0]*channels*x.shape[2]*x.shape[3] <= 8*1024*1024
+                last_idx = len(chain) - 1
+                for idx, (child, (eligible, channels)) in enumerate(zip(module, chain)):
+                    out_hw = x.shape[2] * x.shape[3] * (4 if type(child).__name__ == 'ResidualBlockUpsample' else 1)
+                    if idx == last_idx and _pack_output and 128 <= out_hw <= 8192:
+                        last_block = self._native_blocks.get(id(child))
+                        if last_block is None and type(child).__name__ == 'ResidualBlockUpsample':
+                            last_block = self._native_blocks.get(id(child.conv))
+                        if last_block is not None:
+                            last_ch, last_depth = last_block[0][2].shape[0], last_block[0][1].shape[0]
+                            if (last_ch >= 256 and last_ch <= 32768 and last_ch % 32 == 0
+                                    and last_depth >= 256 and last_depth % 32 == 0
+                                    and x.shape[0]*last_ch*out_hw <= 8*1024*1024):
+                                return self(child, x, _packed_input=packed,
+                                            _pack_output=True, _packed_only=_packed_only)
+                        elif (callable(self._native_conv_packed) and isinstance(child, nn.Conv2d)
+                              and child.kernel_size == (1, 1) and child.stride == (1, 1)
+                              and child.padding == (0, 0) and child.dilation == (1, 1)
+                              and child.groups == 1 and child.padding_mode == 'zeros'
+                              and child.out_channels >= 256 and child.out_channels <= 32768
+                              and child.out_channels % 32 == 0
+                              and x.shape[0]*child.out_channels*out_hw <= 8*1024*1024):
+                            return self(child, x, _packed_input=packed,
+                                        _pack_output=True, _packed_only=_packed_only)
+                    emit = eligible and 128 <= out_hw <= 8192 and x.shape[0]*channels*out_hw <= 8*1024*1024
                     result = self(child, x, _packed_input=packed, _pack_output=emit)
                     if emit:
                         x, packed = result
                     else:
                         x, packed = result, None
-                return x
+                return (x, None) if _pack_output else x
             for child in module:
                 x = self(child, x)
-            return x
+            return (x, None) if _pack_output else x
         if isinstance(module, nn.Conv2d):
             if module.dilation != (1, 1) or module.padding_mode != 'zeros':
                 raise ValueError('Unsupported integer convolution configuration')
@@ -207,7 +242,8 @@ class Layers:
                     and module.kernel_size == (1, 1) and module.stride == (1, 1)
                     and module.padding == (0, 0) and module.groups == 1
                     and (_pack_output or _packed_input is not None or sw is not None)):
-                out, packed = self._native_conv_packed(x, w, b, _packed_input, _pack_output, _pack_output, sw)
+                out, packed = self._native_conv_packed(
+                    x, w, b, _packed_input, _pack_output, _pack_output and _packed_only, sw)
                 return (out, packed) if _pack_output else out
             if (sw is not None and self._native_conv is not None and x.is_cuda
                     and module.kernel_size != (1, 1) and module.groups == 1):
@@ -226,7 +262,7 @@ class Layers:
         if name in ('DepthConvBlock', 'SpatialPriorAdaptor'):
             if len(args) == 2:
                 if (self._native_cat_nhwc is not None and self._native_packed_block is not None
-                        and args[0].is_cuda and args[0].shape[2] * args[0].shape[3] >= 128
+                        and args[0].is_cuda and 128 <= args[0].shape[2] * args[0].shape[3] <= 8192
                         and (args[0].numel() + args[1].numel()) <= 8 * 1024 * 1024
                         and (args[0].shape[1] + args[1].shape[1]) >= 256
                         and (args[0].shape[1] + args[1].shape[1]) % 32 == 0):
@@ -245,10 +281,12 @@ class Layers:
                 weights, biases, shortcut = native
                 swiz = self._swizzled_blocks.get(id(module))
                 if self._native_packed_block is not None and (_pack_output or _packed_input is not None):
-                    out, packed = self._native_packed_block(x, weights, biases,
-                        self.values['tables.wsilu'], shortcut, _packed_input, _pack_output, _pack_output, swiz)
+                    out, packed = self._native_packed_block(
+                        x, weights, biases, self.values['tables.wsilu'], shortcut,
+                        _packed_input, _pack_output, _pack_output and _packed_only, swiz)
                     return (out, packed) if _pack_output else out
-                return self._native_block(x, weights, biases, self.values['tables.wsilu'], shortcut, swiz)
+                out = self._native_block(x, weights, biases, self.values['tables.wsilu'], shortcut, swiz)
+                return (out, None) if _pack_output else out
             fused = self._fused_blocks.get(id(module))
             if fused is not None:
                 depth, w0, b0, w1, b1, w2, b2, w3, b3 = fused
@@ -256,21 +294,42 @@ class Layers:
                 out = self(depth, ops.conv2d_post(x, w0, b0, lut=lut))
                 out = ops.conv2d_post(out, w1, b1, residual=x)
                 expanded = ops.conv2d_wsilu4(out, w2, b2, lut)
-                return ops.conv2d_post(expanded, w3, b3, residual=out,
-                                       shortcut=x if module.shortcut else None)
+                out = ops.conv2d_post(expanded, w3, b3, residual=out,
+                                      shortcut=x if module.shortcut else None)
+                return (out, None) if _pack_output else out
             out = ops.add(self(module.dc, x), x)
             out = ops.add(self(module.ffn, out), out)
-            return ops.add(out, x) if module.shortcut else out
+            out = ops.add(out, x) if module.shortcut else out
+            return (out, None) if _pack_output else out
         if name == 'SubpelConv2x':
+            if _packed_input is not None and len(module.conv) == 2:
+                return self(module.conv[1], self(module.conv[0], x, _packed_input=_packed_input))
             return self(module.conv, x)
         if name == 'ResidualBlockUpsample':
-            return self(module.conv, self(module.up, x), _pack_output=_pack_output)
+            return self(module.conv, self(module.up, x, _packed_input=_packed_input),
+                        _pack_output=_pack_output, _packed_only=_packed_only)
         if name == 'ResidualBlockWithStride2':
+            scale = args[1] if len(args) == 2 else None
+            if (self._native_unshuffle2x_nhwc is not None
+                    and self._native_packed_block is not None
+                    and self._native_conv_packed is not None
+                    and x.is_cuda and x.shape[2] % 2 == 0 and x.shape[3] % 2 == 0
+                    and 128 <= (x.shape[2] // 2) * (x.shape[3] // 2) <= 8192
+                    and x.numel() <= 8 * 1024 * 1024
+                    and x.shape[1] * 4 >= 256 and (x.shape[1] * 4) % 32 == 0):
+                unshuffled, packed_u = self._native_unshuffle2x_nhwc(x, scale)
+                down, packed = self(module.down, unshuffled, _packed_input=packed_u, _pack_output=True)
+                return self(module.conv, down, _packed_input=packed,
+                            _pack_output=_pack_output, _packed_only=_packed_only)
+            if scale is not None:
+                x = ops.multiply(x, scale)
             unshuffled = F.pixel_unshuffle(x, 2)
             if self._native_packed_block is not None and self._native_conv_packed is not None:
                 down, packed = self(module.down, unshuffled, _pack_output=True)
-                return self(module.conv, down, _packed_input=packed)
-            return self(module.conv, self(module.down, unshuffled))
+                return self(module.conv, down, _packed_input=packed,
+                            _pack_output=_pack_output, _packed_only=_packed_only)
+            return self(module.conv, self(module.down, unshuffled),
+                        _pack_output=_pack_output, _packed_only=_packed_only)
         if name == 'IntraEncoder':
             source = ops.from_bytes_unshuffle(x) if source_bytes else F.pixel_unshuffle(x, 8)
             return self(module.enc_2, ops.multiply(self(module.enc_1, source), args[1]))
@@ -299,13 +358,15 @@ class Layers:
             return ops.multiply(out, args[2])
         if name == 'FeatureAdaptorM':
             cat_x, packed = self._cat_for_chain(module.conv, args[0], args[1])
-            return self(module.conv, cat_x, _packed_input=packed)
+            return self(module.conv, cat_x, _packed_input=packed,
+                        _pack_output=_pack_output, _packed_only=_packed_only)
         if name == 'TemporalPriorEncoder':
-            return self(module.conv, ops.multiply(x, args[1]) if len(args)==2 else x)
+            return self(module.conv, *args, _pack_output=_pack_output, _packed_only=_packed_only)
         if name == 'PriorFusion':
             other = ops.multiply(args[1], args[2]) if len(args)==3 else args[1]
             cat_x, packed = self._cat_for_chain(module.conv, x, other)
-            return self(module.conv, cat_x, _packed_input=packed)
+            return self(module.conv, cat_x, _packed_input=packed,
+                        _pack_output=_pack_output, _packed_only=_packed_only)
         if name == 'ReconHead':
             maximum = 1 if hasattr(module, 'head') else 8
             count = maximum if output_frames is None else output_frames
@@ -339,9 +400,12 @@ class Layers:
                     'IntraHyperEncoder', 'IntraHyperDecoder', 'IntraSpatialPrior', 'IntraYPriorFusion',
                     'SpatialPrior'):
             if len(args) == 1 and _packed_input is not None:
-                return self(module.conv, x, _packed_input=_packed_input)
+                return self(module.conv, x, _packed_input=_packed_input,
+                            _pack_output=_pack_output, _packed_only=_packed_only)
             if len(args) == 2:
                 cat_x, packed = self._cat_for_chain(module.conv, args[0], args[1])
-                return self(module.conv, cat_x, _packed_input=packed)
-            return self(module.conv, torch.cat(args, dim=1) if len(args)>1 else x)
+                return self(module.conv, cat_x, _packed_input=packed,
+                            _pack_output=_pack_output, _packed_only=_packed_only)
+            return self(module.conv, torch.cat(args, dim=1) if len(args)>1 else x,
+                        _pack_output=_pack_output, _packed_only=_packed_only)
         raise NotImplementedError(f'UF integer layer not implemented: {name}')

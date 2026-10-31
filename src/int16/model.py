@@ -70,10 +70,15 @@ class IntegerModel:
         if self.reference is None:
             raise ValueError('Integer P-frame has no reference')
         if self.memory is None:
-            self.memory = self.layers(self.model.feature_adaptor_i, self.reference)
+            self.memory, packed_mem = self.layers(
+                self.model.feature_adaptor_i, self.reference,
+                _pack_output=True, _packed_only=False)
         else:
-            self.memory = self.layers(self.model.feature_adaptor_m, self.memory, self.reference)
-        self.context = self.layers(self.model.feature_extractor, self.memory)
+            self.memory, packed_mem = self.layers(
+                self.model.feature_adaptor_m, self.memory, self.reference,
+                _pack_output=True, _packed_only=False)
+        self.context = self.layers(
+            self.model.feature_extractor, self.memory, _packed_input=packed_mem)
 
     def _decode_z(self, height, width, qp):
         ch = self.model.z_channel
@@ -130,7 +135,10 @@ class IntegerModel:
                     y = ops.multiply(y, q_enc)
         shape = scales.shape
         positions = self._mask_positions(shape)
-        reduced = run(m.y_spatial_prior_reduction, params) if self.variant != 'ld' else None
+        packed_params = getattr(self, '_packed_params', None)
+        self._packed_params = None
+        reduced = (run(m.y_spatial_prior_reduction, params, _packed_input=packed_params)
+                   if self.variant != 'ld' else None)
         if (native is not None and self.variant != 'ld' and shape[0] == 1
                 and reduced.shape == shape):
             adaptor_shape = (1, shape[1] * 2, shape[2], shape[3])
@@ -243,8 +251,10 @@ class IntegerModel:
 
     def _params(self, z, qp, height, width):
         m, run = self.model, self.layers
+        self._packed_params = None
         if self.variant == 'image':
-            params = run(m.y_prior_fusion, run(m.hyper_dec, ops.from_symbols(z)))
+            hyper, packed_h = run(m.hyper_dec, ops.from_symbols(z), _pack_output=True)
+            params = run(m.y_prior_fusion, hyper, _packed_input=packed_h)
             return params[:, :, :height, :width]
         hyper = run(m.hyper_decoder, ops.from_symbols(z))[:, :, :height, :width]
         quant = run.parameter('q_feature', qp)
@@ -252,7 +262,9 @@ class IntegerModel:
             temporal = run(m.temporal_prior_encoder, self.memory)
             return run(m.y_prior_fusion, hyper, temporal, quant)
         temporal = run(m.temporal_prior_encoder, self.memory, quant)
-        return run(m.y_prior_fusion, hyper, temporal)
+        params, self._packed_params = run(
+            m.y_prior_fusion, hyper, temporal, _pack_output=True, _packed_only=False)
+        return params
 
     def _reconstruct(self, y_hat, qp, reset, output_pixels=True, output_frames=None):
         m, run = self.model, self.layers

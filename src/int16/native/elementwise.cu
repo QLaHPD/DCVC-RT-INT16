@@ -198,6 +198,45 @@ __global__ void copy_nchw_to_nhwc_slice_kernel(int16_t* __restrict__ out,
             out[(static_cast<int64_t>(batch)*hw+out_pos)*out_c+c_offset+dst_c]=tile[tx][ty+dy];
     }
 }
+template<bool HAS_SCALE>
+__global__ void unshuffle2x_nhwc_kernel(int16_t* __restrict__ out,
+    const int16_t* __restrict__ x,const int16_t* __restrict__ scale,
+    int c_in,int h,int w,int oh,int ow,int hw_out,bool scalar_scale) {
+    __shared__ int32_t tile[32][33];
+    int pos_base=blockIdx.x*32,c_base=blockIdx.y*8,batch=blockIdx.z;
+    int tx=threadIdx.x,ty=threadIdx.y;
+    int pos=pos_base+tx,c=c_base+ty;
+    if(pos<hw_out && c<c_in) {
+        int oy=pos/ow,ox=pos%ow;
+        int64_t base=((static_cast<int64_t>(batch)*c_in+c)*h+oy*2)*w+ox*2;
+        int16_t v00=x[base],v01=x[base+1],v10=x[base+w],v11=x[base+w+1];
+        if constexpr(HAS_SCALE) {
+            int s=scale[scalar_scale?0:c];
+            auto scale_val=[&](int16_t v)->int16_t {
+                int prod=static_cast<int>(v)*s;
+                int rnd=prod<0?-((-prod+256)/512):(prod+256)/512;
+                return sat(rnd);
+            };
+            v00=scale_val(v00);
+            v01=scale_val(v01);
+            v10=scale_val(v10);
+            v11=scale_val(v11);
+        }
+        tile[ty*4+0][tx]=v00;
+        tile[ty*4+1][tx]=v01;
+        tile[ty*4+2][tx]=v10;
+        tile[ty*4+3][tx]=v11;
+    }
+    __syncthreads();
+    int out_c_total=c_in*4;
+    int out_c=c_base*4+tx;
+    #pragma unroll
+    for(int dy=0;dy<32;dy+=8) {
+        int out_pos=pos_base+ty+dy;
+        if(out_pos<hw_out && out_c<out_c_total)
+            out[(static_cast<int64_t>(batch)*hw_out+out_pos)*out_c_total+out_c]=tile[tx][ty+dy];
+    }
+}
 __global__ void symbols_kernel(int8_t* out,const int16_t* x,int64_t n) {
     int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(i<n) out[i]=rna(x[i],512);
@@ -374,6 +413,35 @@ std::pair<torch::Tensor,torch::Tensor> uf_bytes_unshuffle_cat_nhwc(
     dim3 grid((hw+31)/32,(ctx_c+31)/32,1);
     copy_nchw_to_nhwc_slice_kernel<<<grid,dim3(32,8),0,stream>>>(
         packed.data_ptr<int16_t>(),ctx.data_ptr<int16_t>(),ctx_c,total_c,src_c,hw);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {packed.permute({0,3,1,2}),packed};
+}
+std::pair<torch::Tensor,torch::Tensor> uf_unshuffle2x_pack_nhwc(
+    const torch::Tensor& input,const c10::optional<torch::Tensor>& scale) {
+    auto x=input.contiguous();
+    check(x);
+    TORCH_CHECK(x.dim()==4 && x.size(2)%2==0 && x.size(3)%2==0,
+                "even 4D NCHW tensor required for unshuffle2x_pack_nhwc");
+    int64_t batch=x.size(0),c=x.size(1),h=x.size(2),w=x.size(3);
+    int64_t oh=h/2,ow=w/2,hw_out=oh*ow;
+    c10::cuda::CUDAGuard guard(x.device());
+    auto packed=torch::empty({batch,oh,ow,c*4},x.options());
+    dim3 grid((hw_out+31)/32,(c+7)/8,batch);
+    auto stream=c10::cuda::getCurrentCUDAStream();
+    if(scale.has_value() && scale->defined()) {
+        auto sc=scale->contiguous();
+        check(sc);
+        TORCH_CHECK(sc.device()==x.device() &&
+                    (sc.numel()==1 || (sc.dim()==4 && sc.size(0)==1 && sc.size(1)==c && sc.size(2)==1 && sc.size(3)==1)),
+                    "invalid scale shape for unshuffle2x_pack_nhwc");
+        unshuffle2x_nhwc_kernel<true><<<grid,dim3(32,8),0,stream>>>(
+            packed.data_ptr<int16_t>(),x.data_ptr<int16_t>(),sc.data_ptr<int16_t>(),
+            c,h,w,oh,ow,hw_out,sc.numel()==1);
+    } else {
+        unshuffle2x_nhwc_kernel<false><<<grid,dim3(32,8),0,stream>>>(
+            packed.data_ptr<int16_t>(),x.data_ptr<int16_t>(),nullptr,
+            c,h,w,oh,ow,hw_out,false);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {packed.permute({0,3,1,2}),packed};
 }
