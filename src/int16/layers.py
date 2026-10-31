@@ -19,9 +19,14 @@ class Layers:
         self._fused_ffns = {}
         self._fused_blocks = {}
         self._native_blocks = {}
+        self._swizzled_blocks = {}
+        self._swizzled_convs = {}
+        self._swizzled_cache = {}
         self._native_block = None
         self._native_packed_block = None
         self._native_conv_packed = None
+        self._native_conv = None
+        self._native_swizzle = None
         self._native_cat_nhwc = None
         self._native_unshuffle_cat_nhwc = None
         self._packed_chains = {}
@@ -32,9 +37,19 @@ class Layers:
             self._native_block = getattr(uf_int16_cuda, 'depth_conv_block', None)
             self._native_packed_block = getattr(uf_int16_cuda, 'depth_conv_block_packed', None)
             self._native_conv_packed = getattr(uf_int16_cuda, 'conv2d_packed', None)
+            self._native_conv = getattr(uf_int16_cuda, 'conv2d', None)
+            self._native_swizzle = getattr(uf_int16_cuda, 'swizzle_weight', None)
             self._native_cat_nhwc = getattr(uf_int16_cuda, 'cat_pack_nhwc', None)
             self._native_unshuffle_cat_nhwc = getattr(uf_int16_cuda, 'from_bytes_unshuffle_cat_nhwc', None)
         for module in model.modules():
+            if (callable(self._native_swizzle) and isinstance(module, nn.Conv2d)
+                    and module.dilation == (1, 1) and module.padding_mode == 'zeros'
+                    and module.groups == 1 and id(module) in self.names):
+                w_conv = self.values.get(self.names[id(module)] + '.weight')
+                if w_conv is not None:
+                    sw_conv = self._maybe_swizzle(w_conv)
+                    if sw_conv is not None:
+                        self._swizzled_convs[id(module)] = sw_conv
             if (post_native and type(module).__name__ in ('DepthConvBlock', 'SpatialPriorAdaptor')
                     and len(module.dc) == 4 and len(module.ffn) == 3
                     and type(module.dc[1]).__name__ == 'WSiLU'
@@ -57,9 +72,19 @@ class Layers:
                             and depth.padding_mode == 'zeros'):
                         blocks = (module.dc[0], depth, module.dc[3], module.ffn[0], module.ffn[2])
                         prefixes = [self.names[id(conv)] for conv in blocks]
+                        block_weights = [self.values[prefix+'.weight'] for prefix in prefixes]
                         self._native_blocks[id(module)] = (
-                            [self.values[prefix+'.weight'] for prefix in prefixes],
+                            block_weights,
                             [self.values.get(prefix+'.bias') for prefix in prefixes], module.shortcut)
+                        if (callable(self._native_swizzle)
+                                and block_weights[0].shape[1] >= 128 and block_weights[0].shape[1] % 32 == 0
+                                and block_weights[1].shape[0] >= 128 and block_weights[1].shape[0] % 32 == 0):
+                            swiz = [
+                                self._maybe_swizzle(w) if idx != 1 else w
+                                for idx, w in enumerate(block_weights)
+                            ]
+                            if all(s is not None for s in swiz):
+                                self._swizzled_blocks[id(module)] = swiz
             if not isinstance(module, nn.Sequential) or len(module) != 3:
                 continue
             conv = module[0]
@@ -115,6 +140,21 @@ class Layers:
                 if any(eligible for eligible, _ in entries):
                     self._packed_chains[id(module)] = entries
 
+    def _maybe_swizzle(self, w):
+        if (callable(self._native_swizzle) and w.is_cuda and w.dtype == torch.int16
+                and w.is_contiguous() and w.dim() == 4):
+            ptr = w.data_ptr()
+            if ptr in self._swizzled_cache:
+                return self._swizzled_cache[ptr]
+            m = w.shape[0]
+            k = w.numel() // m
+            if (m >= 8 and m % 8 == 0 and k >= 32 and k % 32 == 0
+                    and not (ptr & 7) and not (k >= 1024 and m >= 512)):
+                sw = self._native_swizzle(w)
+                self._swizzled_cache[ptr] = sw
+                return sw
+        return None
+
     def parameter(self, name, qp):
         key = (name, qp)
         if key not in self._parameters:
@@ -162,11 +202,19 @@ class Layers:
                 raise ValueError('Unsupported integer convolution configuration')
             prefix = self.names[id(module)]
             w, b = self.values[prefix+'.weight'], self.values.get(prefix+'.bias')
-            if (self._native_conv_packed is not None and (_pack_output or _packed_input is not None)
+            sw = self._swizzled_convs.get(id(module))
+            if (self._native_conv_packed is not None
                     and module.kernel_size == (1, 1) and module.stride == (1, 1)
-                    and module.padding == (0, 0) and module.groups == 1):
-                out, packed = self._native_conv_packed(x, w, b, _packed_input, _pack_output, _pack_output)
+                    and module.padding == (0, 0) and module.groups == 1
+                    and (_pack_output or _packed_input is not None or sw is not None)):
+                out, packed = self._native_conv_packed(x, w, b, _packed_input, _pack_output, _pack_output, sw)
                 return (out, packed) if _pack_output else out
+            if (sw is not None and self._native_conv is not None and x.is_cuda
+                    and module.kernel_size != (1, 1) and module.groups == 1):
+                sh, sw_s = module.stride
+                ph, pw = module.padding
+                out = self._native_conv(x, w, b, sh, sw_s, ph, pw, 1, sw)
+                return (out, None) if _pack_output else out
             out = ops.conv2d(x, w, b, module.stride, module.padding, module.groups)
             return (out, None) if _pack_output else out
         if isinstance(module, nn.PixelShuffle):
@@ -195,11 +243,12 @@ class Layers:
                     _packed_input = None
             if native is not None:
                 weights, biases, shortcut = native
+                swiz = self._swizzled_blocks.get(id(module))
                 if self._native_packed_block is not None and (_pack_output or _packed_input is not None):
                     out, packed = self._native_packed_block(x, weights, biases,
-                        self.values['tables.wsilu'], shortcut, _packed_input, _pack_output, _pack_output)
+                        self.values['tables.wsilu'], shortcut, _packed_input, _pack_output, _pack_output, swiz)
                     return (out, packed) if _pack_output else out
-                return self._native_block(x, weights, biases, self.values['tables.wsilu'], shortcut)
+                return self._native_block(x, weights, biases, self.values['tables.wsilu'], shortcut, swiz)
             fused = self._fused_blocks.get(id(module))
             if fused is not None:
                 depth, w0, b0, w1, b1, w2, b2, w3, b3 = fused

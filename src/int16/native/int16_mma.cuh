@@ -27,40 +27,74 @@ __device__ __forceinline__ void uf_split(const int16_t* p,uint32_t& lo,uint32_t&
 }
 
 __device__ __forceinline__ void uf_split_aligned(const int16_t* p,uint32_t& lo,uint32_t& hi) {
-    const uint2 v=*reinterpret_cast<const uint2*>(p);
+    const uint2 v=__ldg(reinterpret_cast<const uint2*>(p));
     lo=__byte_perm(v.x,v.y,0x6420); hi=__byte_perm(v.x,v.y,0x7531);
+}
+
+__global__ void uf_swizzle_weight_kernel(uint4* __restrict__ out,const int16_t* __restrict__ weight,int M,int K) {
+    int idx=blockIdx.x*blockDim.x+threadIdx.x;
+    int k_tiles=K/32;
+    int total=(M/8)*k_tiles*32;
+    if(idx>=total) return;
+    int lane=idx%32,tile=idx/32;
+    int k_tile=tile%k_tiles,m_tile8=tile/k_tiles;
+    int group=lane/4,quad=lane%4;
+    int m=m_tile8*8+group;
+    const int16_t* wp=weight+static_cast<int64_t>(m)*K+k_tile*32+quad*4;
+    uint32_t lo0=0,hi0=0,lo1=0,hi1=0;
+    if(m<M) {
+        uf_split_aligned(wp,lo0,hi0);
+        uf_split_aligned(wp+16,lo1,hi1);
+    }
+    out[idx]=make_uint4(lo0,lo1,hi0,hi1);
 }
 
 // Pointwise MMA consumes channel-last input directly, avoiding shared-memory
 // transposes and block barriers. Inputs are packed once per convolution.
 template<int BN, bool REDUCE4, int STEPS=1, int WARPS=4,
-         bool OUT_LAST=false,bool RES_LAST=false,bool DUAL_OUT=false>
+         bool OUT_LAST=false,bool RES_LAST=false,bool DUAL_OUT=false,bool SWIZZLED_W=false>
 __global__ __launch_bounds__(WARPS*32) void uf_mma_direct(int16_t* __restrict__ out,const int16_t* __restrict__ x,
-    const int16_t* __restrict__ weight,const int16_t* bias,int M,int N,int K,const int16_t* lut,
-    const int16_t* residual,const int16_t* shortcut,int16_t* packed_output) {
+    const int16_t* __restrict__ weight,const int16_t* __restrict__ bias,int M,int N,int K,const int16_t* __restrict__ lut,
+    const int16_t* __restrict__ residual,const int16_t* __restrict__ shortcut,int16_t* __restrict__ packed_output) {
     static_assert(!DUAL_OUT || (!REDUCE4 && !OUT_LAST),"dual output requires a plain NCHW projection");
 #if __CUDA_ARCH__ >= 800
     const int warp=threadIdx.x/32,lane=threadIdx.x%32;
     const int group=lane/4,quad=lane%4,m0=blockIdx.y*(WARPS*16),n0=blockIdx.x*BN;
     uint32_t ll[BN/8][4]={},cross[BN/8][4]={},hh[BN/8][4]={};
     const int64_t stride8k=static_cast<int64_t>(8)*K;
-    const int m_base=m0+warp*16+group,n_base=n0+group;
-    const bool m0_ok=m_base<M,m1_ok=m_base+8<M;
+    const int n_base=n0+group;
+    const int16_t* xp=x+(static_cast<int64_t>(blockIdx.z)*N+n_base)*K+quad*4;
+    const int m_tile8=(blockIdx.y*WARPS+warp)*2,k_tiles=K/32;
+    const int m_base=m0+warp*16+group;
+    const bool m0_ok=SWIZZLED_W?(m_tile8*8<M):(m_base<M);
+    const bool m1_ok=SWIZZLED_W?(m_tile8*8+8<M):(m_base+8<M);
+    const uint4* w_swiz0=reinterpret_cast<const uint4*>(weight)+static_cast<int64_t>(m_tile8)*k_tiles*32+lane;
+    const uint4* w_swiz1=w_swiz0+static_cast<int64_t>(k_tiles)*32;
     const int16_t* wp0=weight+static_cast<int64_t>(m_base)*K+quad*4;
     const int16_t* wp1=wp0+stride8k;
-    const int16_t* xp=x+(static_cast<int64_t>(blockIdx.z)*N+n_base)*K+quad*4;
     for(int base=0;base<K;base+=32*STEPS) {
         uint32_t al[STEPS][4]={},ah[STEPS][4]={};
         #pragma unroll
         for(int step=0;step<STEPS;++step) {
             const bool k_ok=(STEPS==1) || (base+step*32<K);
-            if(m0_ok && k_ok) {
-                uf_split_aligned(wp0+step*32,al[step][0],ah[step][0]);
-                uf_split_aligned(wp0+step*32+16,al[step][2],ah[step][2]);
-            }
-            if(m1_ok && k_ok) {
-                uf_split_aligned(wp1+step*32,al[step][1],ah[step][1]);
-                uf_split_aligned(wp1+step*32+16,al[step][3],ah[step][3]);
+            if constexpr(SWIZZLED_W) {
+                if(m0_ok && k_ok) {
+                    uint4 v0=__ldg(w_swiz0+step*32);
+                    al[step][0]=v0.x; al[step][2]=v0.y; ah[step][0]=v0.z; ah[step][2]=v0.w;
+                }
+                if(m1_ok && k_ok) {
+                    uint4 v1=__ldg(w_swiz1+step*32);
+                    al[step][1]=v1.x; al[step][3]=v1.y; ah[step][1]=v1.z; ah[step][3]=v1.w;
+                }
+            } else {
+                if(m0_ok && k_ok) {
+                    uf_split_aligned(wp0+step*32,al[step][0],ah[step][0]);
+                    uf_split_aligned(wp0+step*32+16,al[step][2],ah[step][2]);
+                }
+                if(m1_ok && k_ok) {
+                    uf_split_aligned(wp1+step*32,al[step][1],ah[step][1]);
+                    uf_split_aligned(wp1+step*32+16,al[step][3],ah[step][3]);
+                }
             }
         }
         const int16_t* x_tile=xp;
@@ -84,7 +118,9 @@ __global__ __launch_bounds__(WARPS*32) void uf_mma_direct(int16_t* __restrict__ 
             }
             x_tile+=stride8k;
         }
-        wp0+=32*STEPS; wp1+=32*STEPS; xp+=32*STEPS;
+        if constexpr(SWIZZLED_W) { w_swiz0+=32*STEPS; w_swiz1+=32*STEPS; }
+        else { wp0+=32*STEPS; wp1+=32*STEPS; }
+        xp+=32*STEPS;
     }
     #pragma unroll
     for(int tile=0;tile<BN/8;++tile) {
@@ -95,7 +131,7 @@ __global__ __launch_bounds__(WARPS*32) void uf_mma_direct(int16_t* __restrict__ 
                 static_cast<int64_t>(static_cast<int32_t>(cross[tile][r]))*256+
                 static_cast<int64_t>(static_cast<int32_t>(hh[tile][r]))*65536;
             if constexpr(REDUCE4) {
-                int value=(m<M && n<N)?lut[static_cast<int>(finish(sum,bias?bias[m]:0))+32768]:0;
+                int value=(m<M && n<N)?__ldg(&lut[static_cast<int>(finish(sum,bias?__ldg(&bias[m]):0))+32768]):0;
                 value+=__shfl_xor_sync(0xffffffff,value,4);
                 value+=__shfl_xor_sync(0xffffffff,value,8);
                 if(group%4==0 && m<M && n<N) {
@@ -107,7 +143,7 @@ __global__ __launch_bounds__(WARPS*32) void uf_mma_direct(int16_t* __restrict__ 
             } else if(m<M && n<N) {
                 int64_t index=(static_cast<int64_t>(blockIdx.z)*M+m)*N+n;
                 int64_t last=(static_cast<int64_t>(blockIdx.z)*N+n)*M+m;
-                int16_t value=postprocess(finish(sum,bias?bias[m]:0),lut,residual,shortcut,
+                int16_t value=postprocess(finish(sum,bias?__ldg(&bias[m]):0),lut,residual,shortcut,
                                           index,RES_LAST?last:index);
                 out[OUT_LAST?last:index]=value;
                 if constexpr(DUAL_OUT) packed_output[last]=value;
@@ -142,20 +178,21 @@ __global__ __launch_bounds__(WARPS*32) void uf_mma_direct(int16_t* __restrict__ 
 // FFN output channels occupy the columns of the MMA instead of its rows.
 // Two adjacent channels then live in each lane, so four-channel activation
 // reduction needs one warp shuffle rather than two.
-template<int BN, int STEPS=1, int WARPS=4, int MIN_BLOCKS=1,bool OUT_LAST=false>
+template<int BN, int STEPS=1, int WARPS=4, int MIN_BLOCKS=1,bool OUT_LAST=false,bool SWIZZLED_W=false>
 __global__ __launch_bounds__(WARPS*32,MIN_BLOCKS) void uf_mma_ffn(int16_t* __restrict__ out,
-    const int16_t* __restrict__ x,const int16_t* __restrict__ weight,const int16_t* bias,
-    int M,int N,int K,const int16_t* lut) {
+    const int16_t* __restrict__ x,const int16_t* __restrict__ weight,const int16_t* __restrict__ bias,
+    int M,int N,int K,const int16_t* __restrict__ lut) {
 #if __CUDA_ARCH__ >= 800
     const int warp=threadIdx.x/32,lane=threadIdx.x%32;
     const int group=lane/4,quad=lane%4,n0=blockIdx.y*(WARPS*16),m0=blockIdx.x*BN;
     uint32_t ll[BN/8][4]={},cross[BN/8][4]={},hh[BN/8][4]={};
     const int64_t stride8k=static_cast<int64_t>(8)*K;
-    const int n_base=n0+warp*16+group,m_base=m0+group;
+    const int n_base=n0+warp*16+group,m_base=m0+group,m_tile8_base=m0/8,k_tiles=K/32;
     const bool n0_ok=n_base<N,n1_ok=n_base+8<N;
     const int16_t* xp0=x+(static_cast<int64_t>(blockIdx.z)*N+n_base)*K+quad*4;
     const int16_t* xp1=xp0+stride8k;
     const int16_t* wp=weight+static_cast<int64_t>(m_base)*K+quad*4;
+    const uint4* w_swiz_base=reinterpret_cast<const uint4*>(weight)+static_cast<int64_t>(m_tile8_base)*k_tiles*32+lane;
     for(int base=0;base<K;base+=32*STEPS) {
         uint32_t al[STEPS][4]={},ah[STEPS][4]={};
         #pragma unroll
@@ -171,15 +208,27 @@ __global__ __launch_bounds__(WARPS*32,MIN_BLOCKS) void uf_mma_ffn(int16_t* __res
             }
         }
         const int16_t* w_tile=wp;
+        const uint4* w_swiz=w_swiz_base;
         #pragma unroll
         for(int tile=0;tile<BN/8;++tile) {
             uint32_t bl[STEPS][2]={},bh[STEPS][2]={};
-            const bool m_ok=(m_base+tile*8)<M;
-            #pragma unroll
-            for(int step=0;step<STEPS;++step) {
-                if(m_ok && ((STEPS==1) || (base+step*32<K))) {
-                    uf_split_aligned(w_tile+step*32,bl[step][0],bh[step][0]);
-                    uf_split_aligned(w_tile+step*32+16,bl[step][1],bh[step][1]);
+            if constexpr(SWIZZLED_W) {
+                const bool m_ok=((m_tile8_base+tile)*8)<M;
+                #pragma unroll
+                for(int step=0;step<STEPS;++step) {
+                    if(m_ok && ((STEPS==1) || (base+step*32<K))) {
+                        uint4 v=__ldg(w_swiz+step*32);
+                        bl[step][0]=v.x; bl[step][1]=v.y; bh[step][0]=v.z; bh[step][1]=v.w;
+                    }
+                }
+            } else {
+                const bool m_ok=(m_base+tile*8)<M;
+                #pragma unroll
+                for(int step=0;step<STEPS;++step) {
+                    if(m_ok && ((STEPS==1) || (base+step*32<K))) {
+                        uf_split_aligned(w_tile+step*32,bl[step][0],bh[step][0]);
+                        uf_split_aligned(w_tile+step*32+16,bl[step][1],bh[step][1]);
+                    }
                 }
             }
             #pragma unroll
@@ -189,9 +238,12 @@ __global__ __launch_bounds__(WARPS*32,MIN_BLOCKS) void uf_mma_ffn(int16_t* __res
                 uf_mma_bytes<false,true>(cross[tile],al[step],bh[step]);
                 uf_mma_bytes<true,true>(hh[tile],ah[step],bh[step]);
             }
-            w_tile+=stride8k;
+            if constexpr(SWIZZLED_W) w_swiz+=static_cast<int64_t>(k_tiles)*32;
+            else w_tile+=stride8k;
         }
-        xp0+=32*STEPS; xp1+=32*STEPS; wp+=32*STEPS;
+        xp0+=32*STEPS; xp1+=32*STEPS;
+        if constexpr(SWIZZLED_W) w_swiz_base+=32*STEPS;
+        else wp+=32*STEPS;
     }
     #pragma unroll
     for(int tile=0;tile<BN/8;++tile) {
@@ -206,7 +258,7 @@ __global__ __launch_bounds__(WARPS*32,MIN_BLOCKS) void uf_mma_ffn(int16_t* __res
                     static_cast<int64_t>(static_cast<int32_t>(cross[tile][r]))*256+
                     static_cast<int64_t>(static_cast<int32_t>(hh[tile][r]))*65536;
                 if(m+col<M && n<N)
-                    value+=lut[static_cast<int>(finish(sum,bias?bias[m+col]:0))+32768];
+                    value+=__ldg(&lut[static_cast<int>(finish(sum,bias?__ldg(&bias[m+col]):0))+32768]);
             }
             value+=__shfl_xor_sync(0xffffffff,value,1);
             if(quad%2==0 && m<M && n<N) {

@@ -16,13 +16,13 @@ __device__ __forceinline__ int16_t finish(int64_t sum, int16_t bias) {
 
 __device__ int16_t postprocess(int16_t value,const int16_t* lut,
     const int16_t* residual,const int16_t* shortcut,int64_t index,int64_t residual_index) {
-    if(lut) value=lut[static_cast<int>(value)+32768];
+    if(lut) value=__ldg(&lut[static_cast<int>(value)+32768]);
     if(residual) {
-        int sum=static_cast<int>(value)+residual[residual_index];
+        int sum=static_cast<int>(value)+__ldg(&residual[residual_index]);
         value=sum<-32768?-32768:(sum>32767?32767:sum);
     }
     if(shortcut) {
-        int sum=static_cast<int>(value)+shortcut[residual_index];
+        int sum=static_cast<int>(value)+__ldg(&shortcut[residual_index]);
         value=sum<-32768?-32768:(sum>32767?32767:sum);
     }
     return value;
@@ -127,7 +127,8 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
     const c10::optional<torch::Tensor>& bias, int sh,int sw,int ph,int pw,int groups,bool use_mma,
     const c10::optional<torch::Tensor>& table=c10::nullopt,
     const c10::optional<torch::Tensor>& residual=c10::nullopt,
-    const c10::optional<torch::Tensor>& shortcut=c10::nullopt) {
+    const c10::optional<torch::Tensor>& shortcut=c10::nullopt,
+    const c10::optional<torch::Tensor>& swizzled_weight=c10::nullopt) {
     TORCH_CHECK(input.is_cuda() && weights.device()==input.device(), "CUDA device mismatch");
     TORCH_CHECK(input.scalar_type()==at::kShort && weights.scalar_type()==at::kShort, "int16 required");
     TORCH_CHECK(input.dim()==4 && weights.dim()==4, "4D tensors required");
@@ -176,21 +177,48 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
                     packed.data_ptr<int16_t>(),x.data_ptr<int16_t>(),reduction,ci,h,w,oh,ow,kh,kw,sh,sw,ph,pw);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
                 auto out=torch::empty({x.size(0),co,oh,ow},x.options());
-                if(n>=256 && reduction%64==0) {
+                bool has_swiz=swizzled_weight.has_value() && co%8==0;
+                const int16_t* w_ptr=has_swiz?swizzled_weight->data_ptr<int16_t>():weight.data_ptr<int16_t>();
+                if(n>=256 && co<=256) {
+                    dim3 grid((n+31)/32,(co+31)/32,x.size(0));
+                    if(has_swiz)
+                        uf_mma_direct<32,false,1,2,false,false,false,true><<<grid,64,0,stream>>>(
+                            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),w_ptr,
+                            ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                    else
+                        uf_mma_direct<32,false,1,2><<<grid,64,0,stream>>>(
+                            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),w_ptr,
+                            ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                } else if(n>=256 && reduction%64==0) {
                     dim3 grid((n+63)/64,(co+63)/64,x.size(0));
-                    uf_mma_direct<64,false,2,4><<<grid,128,0,stream>>>(
-                        out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),weight.data_ptr<int16_t>(),
-                        ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                    if(has_swiz)
+                        uf_mma_direct<64,false,2,4,false,false,false,true><<<grid,128,0,stream>>>(
+                            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),w_ptr,
+                            ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                    else
+                        uf_mma_direct<64,false,2,4><<<grid,128,0,stream>>>(
+                            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),w_ptr,
+                            ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
                 } else if(reduction%64==0) {
                     dim3 grid((n+31)/32,(co+63)/64,x.size(0));
-                    uf_mma_direct<32,false,2,4><<<grid,128,0,stream>>>(
-                        out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),weight.data_ptr<int16_t>(),
-                        ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                    if(has_swiz)
+                        uf_mma_direct<32,false,2,4,false,false,false,true><<<grid,128,0,stream>>>(
+                            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),w_ptr,
+                            ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                    else
+                        uf_mma_direct<32,false,2,4><<<grid,128,0,stream>>>(
+                            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),w_ptr,
+                            ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
                 } else {
                     dim3 grid((n+31)/32,(co+63)/64,x.size(0));
-                    uf_mma_direct<32,false,1,4><<<grid,128,0,stream>>>(
-                        out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),weight.data_ptr<int16_t>(),
-                        ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                    if(has_swiz)
+                        uf_mma_direct<32,false,1,4,false,false,false,true><<<grid,128,0,stream>>>(
+                            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),w_ptr,
+                            ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
+                    else
+                        uf_mma_direct<32,false,1,4><<<grid,128,0,stream>>>(
+                            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),w_ptr,
+                            ptr,co,n,reduction,nullptr,nullptr,nullptr,nullptr);
                 }
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
                 return out;
@@ -233,16 +261,29 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
     if constexpr(DIRECT) {
         auto channels_last=x.permute({0,2,3,1}).contiguous();
         constexpr int bm=DIRECT_WARPS*16;
+        bool has_swiz=swizzled_weight.has_value() && co%8==0;
+        const int16_t* w_ptr=has_swiz?swizzled_weight->data_ptr<int16_t>():weight.data_ptr<int16_t>();
         if constexpr(FFN_SWAP) {
             static_assert(REDUCE4,"swapped MMA is an FFN reduction");
             dim3 grid((co+TILE_N-1)/TILE_N,(oh*ow+bm-1)/bm,x.size(0));
-            uf_mma_ffn<TILE_N,DIRECT_STEPS,DIRECT_WARPS,MIN_BLOCKS><<<grid,DIRECT_WARPS*32,0,stream>>>(
-                out.data_ptr<int16_t>(),channels_last.data_ptr<int16_t>(),weight.data_ptr<int16_t>(),
-                ptr,co,oh*ow,ci,lut);
+            if(has_swiz)
+                uf_mma_ffn<TILE_N,DIRECT_STEPS,DIRECT_WARPS,MIN_BLOCKS,false,true><<<grid,DIRECT_WARPS*32,0,stream>>>(
+                    out.data_ptr<int16_t>(),channels_last.data_ptr<int16_t>(),w_ptr,
+                    ptr,co,oh*ow,ci,lut);
+            else
+                uf_mma_ffn<TILE_N,DIRECT_STEPS,DIRECT_WARPS,MIN_BLOCKS><<<grid,DIRECT_WARPS*32,0,stream>>>(
+                    out.data_ptr<int16_t>(),channels_last.data_ptr<int16_t>(),w_ptr,
+                    ptr,co,oh*ow,ci,lut);
         } else {
             dim3 grid((oh*ow+TILE_N-1)/TILE_N,(co+bm-1)/bm,x.size(0));
-            uf_mma_direct<TILE_N,REDUCE4,DIRECT_STEPS,DIRECT_WARPS><<<grid,DIRECT_WARPS*32,0,stream>>>(out.data_ptr<int16_t>(),channels_last.data_ptr<int16_t>(),
-                weight.data_ptr<int16_t>(),ptr,co,oh*ow,ci,lut,residual_ptr,shortcut_ptr,nullptr);
+            if(has_swiz)
+                uf_mma_direct<TILE_N,REDUCE4,DIRECT_STEPS,DIRECT_WARPS,false,false,false,true><<<grid,DIRECT_WARPS*32,0,stream>>>(
+                    out.data_ptr<int16_t>(),channels_last.data_ptr<int16_t>(),
+                    w_ptr,ptr,co,oh*ow,ci,lut,residual_ptr,shortcut_ptr,nullptr);
+            else
+                uf_mma_direct<TILE_N,REDUCE4,DIRECT_STEPS,DIRECT_WARPS><<<grid,DIRECT_WARPS*32,0,stream>>>(
+                    out.data_ptr<int16_t>(),channels_last.data_ptr<int16_t>(),
+                    w_ptr,ptr,co,oh*ow,ci,lut,residual_ptr,shortcut_ptr,nullptr);
         }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return out;
@@ -271,24 +312,24 @@ static torch::Tensor uf_conv_impl(const torch::Tensor& input, const torch::Tenso
 template<bool REDUCE4>
 static torch::Tensor pointwise_tiled(const torch::Tensor&,const torch::Tensor&,
     const c10::optional<torch::Tensor>&,const c10::optional<torch::Tensor>&,int,
-    const c10::optional<torch::Tensor>&,const c10::optional<torch::Tensor>&);
+    const c10::optional<torch::Tensor>&,const c10::optional<torch::Tensor>&,
+    const c10::optional<torch::Tensor>& =c10::nullopt);
 
 static int pointwise_tile_shape(int64_t ci,int64_t co,int64_t spatial,int64_t elements,bool reduce4=false) {
     // Transposing the MMA improves these measured FFN shapes. The 512-channel
-    // 144p expansion and wider 768-channel priors retain their existing path.
+    // 144p expansion and wider 768-channel priors retain their direct path.
     if(reduce4 && co>=ci*4 && elements<=8*1024*1024 && spatial>=128) {
         if(ci==128 && spatial>=256) return 19;
-        if(ci==256) return spatial<=1024?16:9;
-        if(ci==384) return spatial<=1024?9:16;
-        if(ci==512) return spatial<256?9:(spatial>1024?12:8);
-        if(ci==768) return 9;
+        if(ci==256) return spatial>=256?19:16;
+        if(ci==384) return spatial<=1024?11:16;
+        if(ci==512) return spatial>1024?12:11;
+        if(ci==768) return 11;
     }
     // Packing is amortized by larger matrix products. Keep scratch <= 16 MiB.
     if(ci>=256 && ci%32==0 && ci<=32768 && elements<=8*1024*1024 && spatial>=128) {
-        // Two reduction fragments are prefetched together. Keep the smaller
-        // live register set for the four-channel activation reduction.
         if(!reduce4) {
-            if(spatial>=256 && spatial<=8192 && (ci>=256 || co>=ci*2)) return (ci==256 && spatial>1024)?11:10;
+            if(spatial>=256 && spatial<=8192 && (ci>=256 || co>=ci*2))
+                return ((ci==256 && spatial>1024) || (spatial<=1024 && ci<=768 && co<=768))?11:10;
             if(spatial<256 && ci>=640) return 9;
             if(spatial<256 && ci>=256 && co<=ci) return 11;
         }
@@ -305,13 +346,29 @@ static int pointwise_tile(const torch::Tensor& x,const torch::Tensor& w,bool red
     return pointwise_tile_shape(x.size(1),w.size(0),x.size(2)*x.size(3),x.numel(),reduce4);
 }
 
+torch::Tensor uf_swizzle_weight(const torch::Tensor& weight) {
+    TORCH_CHECK(weight.is_cuda() && weight.scalar_type()==at::kShort && weight.is_contiguous() && weight.dim()>=2,
+                "contiguous CUDA int16 weight tensor required");
+    int M=weight.size(0),K=weight.numel()/M;
+    TORCH_CHECK(M>=8 && M%8==0 && K>=32 && K%32==0 && !(reinterpret_cast<uintptr_t>(weight.data_ptr())&7),
+                "weight shape/alignment incompatible with MMA swizzle");
+    c10::cuda::CUDAGuard guard(weight.device());
+    auto out=torch::empty_like(weight);
+    int total=(M/8)*(K/32)*32;
+    uf_swizzle_weight_kernel<<<(total+255)/256,256,0,c10::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<uint4*>(out.data_ptr<int16_t>()),weight.data_ptr<int16_t>(),M,K);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 torch::Tensor uf_conv(const torch::Tensor& x,const torch::Tensor& w,
-    const c10::optional<torch::Tensor>& b,int sh,int sw,int ph,int pw,int g) {
+    const c10::optional<torch::Tensor>& b,int sh,int sw,int ph,int pw,int g,
+    const c10::optional<torch::Tensor>& swizzled_weight=c10::nullopt) {
     if(x.dim()==4 && w.dim()==4 && w.size(2)==1 && w.size(3)==1 &&
        sh==1 && sw==1 && ph==0 && pw==0 && g==1) {
-        return pointwise_tiled<false>(x,w,b,c10::nullopt,pointwise_tile(x,w),c10::nullopt,c10::nullopt);
+        return pointwise_tiled<false>(x,w,b,c10::nullopt,pointwise_tile(x,w),c10::nullopt,c10::nullopt,swizzled_weight);
     }
-    return uf_conv_impl<0,32,32,false,true>(x,w,b,sh,sw,ph,pw,g,true);
+    return uf_conv_impl<0,32,32,false,true>(x,w,b,sh,sw,ph,pw,g,true,c10::nullopt,c10::nullopt,c10::nullopt,swizzled_weight);
 }
 torch::Tensor uf_conv_generic(const torch::Tensor& x,const torch::Tensor& w,
     const c10::optional<torch::Tensor>& b,int sh,int sw,int ph,int pw,int g) {
@@ -325,7 +382,8 @@ torch::Tensor uf_conv_baseline(const torch::Tensor& x,const torch::Tensor& w,
 template<bool REDUCE4>
 static torch::Tensor pointwise_tiled(const torch::Tensor& x,const torch::Tensor& w,
     const c10::optional<torch::Tensor>& b,const c10::optional<torch::Tensor>& lut,int tile,
-    const c10::optional<torch::Tensor>& residual,const c10::optional<torch::Tensor>& shortcut) {
+    const c10::optional<torch::Tensor>& residual,const c10::optional<torch::Tensor>& shortcut,
+    const c10::optional<torch::Tensor>& swizzled_weight) {
     TORCH_CHECK(x.dim()==4 && w.dim()==4 && w.size(2)==1 && w.size(3)==1,"pointwise tensors required");
     switch(tile) {
     case 1: return uf_conv_impl<16,16,64,REDUCE4>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut);
@@ -334,19 +392,19 @@ static torch::Tensor pointwise_tiled(const torch::Tensor& x,const torch::Tensor&
     case 4: return uf_conv_impl<16,64,64,REDUCE4>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut);
     case 5: return uf_conv_impl<16,32,128,REDUCE4>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut);
     case 6: return uf_conv_impl<16,32,64,REDUCE4,false,8>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut);
-    case 7: return uf_conv_impl<16,32,64,REDUCE4,false,2,true>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut);
-    case 8: return uf_conv_impl<16,64,64,REDUCE4,false,2,true>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut);
-    case 9: return uf_conv_impl<16,32,64,REDUCE4,false,2,true,2>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut);
-    case 10: return uf_conv_impl<16,64,64,REDUCE4,false,2,true,2>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut);
-    case 11: return uf_conv_impl<16,32,64,REDUCE4,false,2,true,1,2>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut);
+    case 7: return uf_conv_impl<16,32,64,REDUCE4,false,2,true>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut,swizzled_weight);
+    case 8: return uf_conv_impl<16,64,64,REDUCE4,false,2,true>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut,swizzled_weight);
+    case 9: return uf_conv_impl<16,32,64,REDUCE4,false,2,true,2>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut,swizzled_weight);
+    case 10: return uf_conv_impl<16,64,64,REDUCE4,false,2,true,2>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut,swizzled_weight);
+    case 11: return uf_conv_impl<16,32,64,REDUCE4,false,2,true,1,2>(x,w,b,1,1,0,0,1,true,lut,residual,shortcut,swizzled_weight);
     case 12:
-        if constexpr(REDUCE4) return uf_conv_impl<16,32,64,true,false,2,true,1,4,true>(x,w,b,1,1,0,0,1,true,lut);
+        if constexpr(REDUCE4) return uf_conv_impl<16,32,64,true,false,2,true,1,4,true>(x,w,b,1,1,0,0,1,true,lut,c10::nullopt,c10::nullopt,swizzled_weight);
         else TORCH_CHECK(false,"FFN-only tile");
     case 16:
-        if constexpr(REDUCE4) return uf_conv_impl<16,32,64,true,false,2,true,1,2,true>(x,w,b,1,1,0,0,1,true,lut);
+        if constexpr(REDUCE4) return uf_conv_impl<16,32,64,true,false,2,true,1,2,true>(x,w,b,1,1,0,0,1,true,lut,c10::nullopt,c10::nullopt,swizzled_weight);
         else TORCH_CHECK(false,"FFN-only tile");
     case 19:
-        if constexpr(REDUCE4) return uf_conv_impl<16,32,64,true,false,2,true,1,4,true,6>(x,w,b,1,1,0,0,1,true,lut);
+        if constexpr(REDUCE4) return uf_conv_impl<16,32,64,true,false,2,true,1,4,true,6>(x,w,b,1,1,0,0,1,true,lut,c10::nullopt,c10::nullopt,swizzled_weight);
         else TORCH_CHECK(false,"FFN-only tile");
     default: TORCH_CHECK(false,"unsupported pointwise tile");
     }
@@ -371,36 +429,57 @@ torch::Tensor uf_conv_post(const torch::Tensor& x,const torch::Tensor& w,
 
 // Keep the block's intermediate features in channel-last storage. Its public
 // input/output remain contiguous NCHW, and every integer epilogue is unchanged.
-template<bool REDUCE4,bool OUT_LAST,bool RES_LAST=false,bool DUAL_OUT=false>
-static torch::Tensor block_pointwise(const torch::Tensor& x,const torch::Tensor& weight,
+template<bool REDUCE4,bool OUT_LAST,bool RES_LAST=false,bool DUAL_OUT=false,bool SWIZZLED_W=false>
+static torch::Tensor block_pointwise_impl(const torch::Tensor& x,const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias,const int16_t* lut,int tile,
     const c10::optional<torch::Tensor>& residual=c10::nullopt,
     const c10::optional<torch::Tensor>& shortcut=c10::nullopt,
     const c10::optional<torch::Tensor>& packed_input=c10::nullopt,
     const c10::optional<torch::Tensor>& packed_output=c10::nullopt) {
-    auto packed=packed_input.has_value()?*packed_input:x.permute({0,2,3,1}).contiguous();
+    torch::Tensor packed_holder;
+    const int16_t* packed_ptr=nullptr;
+    if(packed_input.has_value()) {
+        packed_ptr=packed_input->data_ptr<int16_t>();
+    } else if(x.is_contiguous(at::MemoryFormat::ChannelsLast)) {
+        packed_ptr=x.data_ptr<int16_t>();
+    } else {
+        packed_holder=x.permute({0,2,3,1}).contiguous();
+        packed_ptr=packed_holder.data_ptr<int16_t>();
+    }
     int ci=x.size(1),co=weight.size(0),n=x.size(2)*x.size(3),outc=REDUCE4?co/4:co;
     auto out=OUT_LAST?torch::empty({x.size(0),x.size(2),x.size(3),outc},x.options()).permute({0,3,1,2}):
                       torch::empty({x.size(0),outc,x.size(2),x.size(3)},x.options());
     const int16_t* b=bias.has_value()?bias->data_ptr<int16_t>():nullptr;
     torch::Tensor res,skip;
-    if(residual.has_value())
-        res=RES_LAST?residual->permute({0,2,3,1}).contiguous():residual->contiguous();
-    if(shortcut.has_value())
-        skip=RES_LAST?shortcut->permute({0,2,3,1}).contiguous():shortcut->contiguous();
-    const int16_t* r=residual.has_value()?res.data_ptr<int16_t>():nullptr;
-    const int16_t* s=shortcut.has_value()?skip.data_ptr<int16_t>():nullptr;
+    const int16_t* r=nullptr;
+    const int16_t* s=nullptr;
+    if(residual.has_value()) {
+        if(RES_LAST && (residual->is_contiguous(at::MemoryFormat::ChannelsLast) || residual->is_contiguous()))
+            r=residual->data_ptr<int16_t>();
+        else {
+            res=RES_LAST?residual->permute({0,2,3,1}).contiguous():residual->contiguous();
+            r=res.data_ptr<int16_t>();
+        }
+    }
+    if(shortcut.has_value()) {
+        if(RES_LAST && (shortcut->is_contiguous(at::MemoryFormat::ChannelsLast) || shortcut->is_contiguous()))
+            s=shortcut->data_ptr<int16_t>();
+        else {
+            skip=RES_LAST?shortcut->permute({0,2,3,1}).contiguous():shortcut->contiguous();
+            s=skip.data_ptr<int16_t>();
+        }
+    }
     int16_t* dual=packed_output.has_value()?packed_output->data_ptr<int16_t>():nullptr;
     auto stream=c10::cuda::getCurrentCUDAStream();
 #define UF_BLOCK_DIRECT(TN,STEPS,WARPS) \
-    uf_mma_direct<TN,REDUCE4,STEPS,WARPS,OUT_LAST,RES_LAST,DUAL_OUT> \
+    uf_mma_direct<TN,REDUCE4,STEPS,WARPS,OUT_LAST,RES_LAST,DUAL_OUT,SWIZZLED_W> \
         <<<dim3((n+TN-1)/TN,(co+WARPS*16-1)/(WARPS*16),x.size(0)),WARPS*32,0,stream>>>( \
-            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),weight.data_ptr<int16_t>(), \
+            out.data_ptr<int16_t>(),packed_ptr,weight.data_ptr<int16_t>(), \
             b,co,n,ci,lut,r,s,dual)
 #define UF_BLOCK_FFN(WARPS,MIN_BLOCKS) \
-    uf_mma_ffn<32,1,WARPS,MIN_BLOCKS,OUT_LAST> \
+    uf_mma_ffn<32,1,WARPS,MIN_BLOCKS,OUT_LAST,SWIZZLED_W> \
         <<<dim3((co+31)/32,(n+WARPS*16-1)/(WARPS*16),x.size(0)),WARPS*32,0,stream>>>( \
-            out.data_ptr<int16_t>(),packed.data_ptr<int16_t>(),weight.data_ptr<int16_t>(), \
+            out.data_ptr<int16_t>(),packed_ptr,weight.data_ptr<int16_t>(), \
             b,co,n,ci,lut)
     switch(tile) {
     case 7: UF_BLOCK_DIRECT(32,1,4); break;
@@ -425,6 +504,22 @@ static torch::Tensor block_pointwise(const torch::Tensor& x,const torch::Tensor&
 #undef UF_BLOCK_FFN
 #undef UF_BLOCK_DIRECT
     C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
+}
+
+template<bool REDUCE4,bool OUT_LAST,bool RES_LAST=false,bool DUAL_OUT=false>
+static torch::Tensor block_pointwise(const torch::Tensor& x,const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias,const int16_t* lut,int tile,
+    const c10::optional<torch::Tensor>& residual=c10::nullopt,
+    const c10::optional<torch::Tensor>& shortcut=c10::nullopt,
+    const c10::optional<torch::Tensor>& packed_input=c10::nullopt,
+    const c10::optional<torch::Tensor>& packed_output=c10::nullopt,
+    const c10::optional<torch::Tensor>& swizzled_weight=c10::nullopt) {
+    if(swizzled_weight.has_value() && weight.size(0)%8==0) {
+        return block_pointwise_impl<REDUCE4,OUT_LAST,RES_LAST,DUAL_OUT,true>(
+            x,*swizzled_weight,bias,lut,tile,residual,shortcut,packed_input,packed_output);
+    }
+    return block_pointwise_impl<REDUCE4,OUT_LAST,RES_LAST,DUAL_OUT,false>(
+        x,weight,bias,lut,tile,residual,shortcut,packed_input,packed_output);
 }
 
 __device__ __forceinline__ int64_t dw_row(
@@ -515,7 +610,8 @@ static bool packed_block(const torch::Tensor& x,const std::vector<torch::Tensor>
 static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
     const torch::Tensor& x,const std::vector<torch::Tensor>& weights,
     const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut,bool shortcut,
-    const c10::optional<torch::Tensor>& packed_input,bool emit_packed,bool packed_only=false) {
+    const c10::optional<torch::Tensor>& packed_input,bool emit_packed,bool packed_only=false,
+    const c10::optional<std::vector<torch::Tensor>>& swizzled_weights=c10::nullopt) {
     TORCH_CHECK(weights.size()==5 && biases.size()==5,"five block convolutions required");
     const auto& depth=weights[1];
     TORCH_CHECK(depth.dim()==4 && depth.size(1)==1 && depth.size(2)==3 && depth.size(3)==3,
@@ -531,10 +627,13 @@ static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
                 p.size(3)==x.size(1) && p.is_contiguous() &&
                 !(reinterpret_cast<uintptr_t>(p.data_ptr())&7),"invalid packed block input");
         }
+        bool has_swiz=swizzled_weights.has_value() && swizzled_weights->size()==5;
+        auto swiz_at=[&](int i)->c10::optional<torch::Tensor> {
+            return has_swiz?c10::optional<torch::Tensor>((*swizzled_weights)[i]):c10::nullopt;
+        };
         auto x_packed=packed_input.has_value()?*packed_input:x.permute({0,2,3,1}).contiguous();
-        auto x_nhwc=x_packed.permute({0,3,1,2});
         auto first=block_pointwise<false,true>(x,weights[0],biases[0],table,tile,
-                                              c10::nullopt,c10::nullopt,x_packed);
+                                               c10::nullopt,c10::nullopt,x_packed,c10::nullopt,swiz_at(0));
         auto spatial=torch::empty({x.size(0),x.size(2),x.size(3),dc},x.options()).permute({0,3,1,2});
         int h_tiles=(x.size(2)+3)/4;
         block_depthwise<<<dim3((dc+127)/128,x.size(3),x.size(0)*h_tiles),128,0,c10::cuda::getCurrentCUDAStream()>>>(
@@ -542,22 +641,24 @@ static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
             biases[1].has_value()?biases[1]->data_ptr<int16_t>():nullptr,dc,x.size(2),x.size(3));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         int projection_tile=pointwise_tile(spatial,weights[2]);
-        auto residual=block_pointwise<false,true,true>(spatial,weights[2],biases[2],nullptr,projection_tile,x_nhwc);
-        auto expanded=block_pointwise<true,true>(residual,weights[3],biases[3],table,ffn_tile);
-        auto skip=shortcut?c10::optional<torch::Tensor>(x_nhwc):c10::nullopt;
+        auto residual=block_pointwise<false,true,true>(spatial,weights[2],biases[2],nullptr,projection_tile,
+                                                       x_packed,c10::nullopt,c10::nullopt,c10::nullopt,swiz_at(2));
+        auto expanded=block_pointwise<true,true>(residual,weights[3],biases[3],table,ffn_tile,
+                                                 c10::nullopt,c10::nullopt,c10::nullopt,c10::nullopt,swiz_at(3));
+        auto skip=shortcut?c10::optional<torch::Tensor>(x_packed):c10::nullopt;
         if(emit_packed && packed_only) {
             auto result=block_pointwise<false,true,true>(expanded,weights[4],biases[4],nullptr,
-                projection_tile,residual,skip);
+                projection_tile,residual,skip,c10::nullopt,c10::nullopt,swiz_at(4));
             return {result,result.permute({0,2,3,1})};
         }
         if(emit_packed) {
             auto p=torch::empty({x.size(0),x.size(2),x.size(3),x.size(1)},x.options());
             auto result=block_pointwise<false,false,true,true>(expanded,weights[4],biases[4],nullptr,
-                projection_tile,residual,skip,c10::nullopt,p);
+                projection_tile,residual,skip,c10::nullopt,p,swiz_at(4));
             return {result,p};
         }
         return {block_pointwise<false,false,true>(expanded,weights[4],biases[4],nullptr,
-                                                  projection_tile,residual,skip),c10::nullopt};
+                                                  projection_tile,residual,skip,c10::nullopt,c10::nullopt,swiz_at(4)),c10::nullopt};
     }
     auto xc=x.contiguous();
     auto first=uf_conv_post(xc,weights[0],biases[0],lut,c10::nullopt,c10::nullopt,0);
@@ -569,15 +670,17 @@ static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
 }
 
 torch::Tensor uf_depth_block(const torch::Tensor& x,const std::vector<torch::Tensor>& weights,
-    const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut,bool shortcut) {
-    return depth_block_impl(x,weights,biases,lut,shortcut,c10::nullopt,false,false).first;
+    const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut,bool shortcut,
+    const c10::optional<std::vector<torch::Tensor>>& swizzled_weights=c10::nullopt) {
+    return depth_block_impl(x,weights,biases,lut,shortcut,c10::nullopt,false,false,swizzled_weights).first;
 }
 
 std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_depth_block_packed(
     const torch::Tensor& x,const std::vector<torch::Tensor>& weights,
     const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut,bool shortcut,
-    const c10::optional<torch::Tensor>& packed_input,bool emit_packed,bool packed_only) {
-    return depth_block_impl(x,weights,biases,lut,shortcut,packed_input,emit_packed,packed_only);
+    const c10::optional<torch::Tensor>& packed_input,bool emit_packed,bool packed_only,
+    const c10::optional<std::vector<torch::Tensor>>& swizzled_weights=c10::nullopt) {
+    return depth_block_impl(x,weights,biases,lut,shortcut,packed_input,emit_packed,packed_only,swizzled_weights);
 }
 
 static bool packed_pointwise(const torch::Tensor& x,const torch::Tensor& w,
@@ -600,7 +703,8 @@ static bool packed_pointwise(const torch::Tensor& x,const torch::Tensor& w,
 
 std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_conv_packed(
     const torch::Tensor& x,const torch::Tensor& w,const c10::optional<torch::Tensor>& b,
-    const c10::optional<torch::Tensor>& packed_input,bool emit_packed,bool packed_only) {
+    const c10::optional<torch::Tensor>& packed_input,bool emit_packed,bool packed_only,
+    const c10::optional<torch::Tensor>& swizzled_weight=c10::nullopt) {
     if(packed_pointwise(x,w,b,packed_input.has_value())) {
         c10::cuda::CUDAGuard guard(x.device());
         if(packed_input.has_value()) {
@@ -615,16 +719,16 @@ std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_conv_packed(
         if(emit_packed && co>=256 && co<=32768 && co%32==0 && out_elements<=8*1024*1024) {
             if(packed_only) {
                 auto result=block_pointwise<false,true>(x,w,b,nullptr,tile,
-                    c10::nullopt,c10::nullopt,packed_input);
+                    c10::nullopt,c10::nullopt,packed_input,c10::nullopt,swizzled_weight);
                 return {result,result.permute({0,2,3,1})};
             }
             auto p=torch::empty({x.size(0),x.size(2),x.size(3),co},x.options());
             auto result=block_pointwise<false,false,false,true>(x,w,b,nullptr,tile,
-                c10::nullopt,c10::nullopt,packed_input,p);
+                c10::nullopt,c10::nullopt,packed_input,p,swizzled_weight);
             return {result,p};
         }
         return {block_pointwise<false,false>(x,w,b,nullptr,tile,
-            c10::nullopt,c10::nullopt,packed_input),c10::nullopt};
+            c10::nullopt,c10::nullopt,packed_input,c10::nullopt,swizzled_weight),c10::nullopt};
     }
-    return {uf_conv(x.contiguous(),w,b,1,1,0,0,1),c10::nullopt};
+    return {uf_conv(x.contiguous(),w,b,1,1,0,0,1,swizzled_weight),c10::nullopt};
 }

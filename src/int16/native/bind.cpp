@@ -1,6 +1,8 @@
 #include <torch/extension.h>
+torch::Tensor uf_swizzle_weight(const torch::Tensor&);
 torch::Tensor uf_conv(const torch::Tensor&, const torch::Tensor&,
-    const c10::optional<torch::Tensor>&, int, int, int, int, int);
+    const c10::optional<torch::Tensor>&, int, int, int, int, int,
+    const c10::optional<torch::Tensor>&);
 torch::Tensor uf_conv_generic(const torch::Tensor&, const torch::Tensor&,
     const c10::optional<torch::Tensor>&, int, int, int, int, int);
 torch::Tensor uf_conv_baseline(const torch::Tensor&, const torch::Tensor&,
@@ -19,14 +21,17 @@ torch::Tensor uf_symbols(const torch::Tensor&);
 torch::Tensor uf_from_symbols(const torch::Tensor&);
 torch::Tensor uf_reciprocal(const torch::Tensor&);
 torch::Tensor uf_depth_block(const torch::Tensor&,const std::vector<torch::Tensor>&,
-    const std::vector<c10::optional<torch::Tensor>>&,const torch::Tensor&,bool);
+    const std::vector<c10::optional<torch::Tensor>>&,const torch::Tensor&,bool,
+    const c10::optional<std::vector<torch::Tensor>>&);
 std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_depth_block_packed(
     const torch::Tensor&,const std::vector<torch::Tensor>&,
     const std::vector<c10::optional<torch::Tensor>>&,const torch::Tensor&,bool,
-    const c10::optional<torch::Tensor>&,bool,bool);
+    const c10::optional<torch::Tensor>&,bool,bool,
+    const c10::optional<std::vector<torch::Tensor>>&);
 std::pair<torch::Tensor,c10::optional<torch::Tensor>> uf_conv_packed(
     const torch::Tensor&,const torch::Tensor&,const c10::optional<torch::Tensor>&,
-    const c10::optional<torch::Tensor>&,bool,bool);
+    const c10::optional<torch::Tensor>&,bool,bool,
+    const c10::optional<torch::Tensor>&);
 torch::Tensor uf_conv_tiled(const torch::Tensor&, const torch::Tensor&, const c10::optional<torch::Tensor>&, int);
 torch::Tensor uf_conv_wsilu4(const torch::Tensor&, const torch::Tensor&, const c10::optional<torch::Tensor>&,
     const torch::Tensor&,int);
@@ -45,7 +50,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("ffn_transposed")=true;
     m.attr("block_channels_last")=true;
     m.attr("supports_yuv420_unshuffle")=true;
-    m.def("conv2d", &uf_conv);
+    m.def("swizzle_weight", &uf_swizzle_weight);
+    m.def("conv2d", &uf_conv,
+          pybind11::arg("x"),pybind11::arg("weight"),pybind11::arg("bias"),
+          pybind11::arg("sh"),pybind11::arg("sw"),pybind11::arg("ph"),pybind11::arg("pw"),pybind11::arg("g"),
+          pybind11::arg("swizzled_weight")=pybind11::none());
     m.def("conv2d_generic", &uf_conv_generic);
     m.def("conv2d_baseline", &uf_conv_baseline);
     m.def("add", &uf_add);
@@ -61,16 +70,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("symbols", &uf_symbols);
     m.def("from_symbols", &uf_from_symbols);
     m.def("reciprocal", &uf_reciprocal);
-    m.def("depth_conv_block", &uf_depth_block,pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("depth_conv_block", &uf_depth_block,
+          pybind11::arg("x"),pybind11::arg("weights"),pybind11::arg("biases"),
+          pybind11::arg("lut"),pybind11::arg("shortcut"),
+          pybind11::arg("swizzled_weights")=pybind11::none(),
+          pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("depth_conv_block_packed", &uf_depth_block_packed,
           pybind11::arg("x"),pybind11::arg("weights"),pybind11::arg("biases"),
           pybind11::arg("lut"),pybind11::arg("shortcut"),pybind11::arg("packed_input"),
           pybind11::arg("emit_packed"),pybind11::arg("packed_only")=false,
+          pybind11::arg("swizzled_weights")=pybind11::none(),
           pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("conv2d_packed", &uf_conv_packed,
           pybind11::arg("x"),pybind11::arg("weight"),pybind11::arg("bias"),
           pybind11::arg("packed_input"),pybind11::arg("emit_packed"),
           pybind11::arg("packed_only")=false,
+          pybind11::arg("swizzled_weight")=pybind11::none(),
           pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("conv2d_tiled", &uf_conv_tiled);
     m.def("conv2d_wsilu4", &uf_conv_wsilu4,pybind11::arg("x"),pybind11::arg("weight"),
