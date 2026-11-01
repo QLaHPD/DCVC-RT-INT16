@@ -430,6 +430,42 @@ torch::Tensor uf_conv_post(const torch::Tensor& x,const torch::Tensor& w,
 // Keep the block's intermediate features in channel-last storage. Its public
 // input/output remain contiguous NCHW, and every integer epilogue is unchanged.
 template<bool REDUCE4,bool OUT_LAST,bool RES_LAST=false,bool DUAL_OUT=false,bool SWIZZLED_W=false>
+static void launch_block_pointwise(int16_t* out_ptr,const int16_t* packed_ptr,
+    const int16_t* w_ptr,const int16_t* b,int co,int n,int ci,int batch,int tile,
+    const int16_t* lut,const int16_t* r,const int16_t* s,int16_t* dual,cudaStream_t stream) {
+#define UF_BLOCK_DIRECT(TN,STEPS,WARPS) \
+    uf_mma_direct<TN,REDUCE4,STEPS,WARPS,OUT_LAST,RES_LAST,DUAL_OUT,SWIZZLED_W> \
+        <<<dim3((n+TN-1)/TN,(co+WARPS*16-1)/(WARPS*16),batch),WARPS*32,0,stream>>>( \
+            out_ptr,packed_ptr,w_ptr,b,co,n,ci,lut,r,s,dual)
+#define UF_BLOCK_FFN(WARPS,MIN_BLOCKS) \
+    uf_mma_ffn<32,1,WARPS,MIN_BLOCKS,OUT_LAST,SWIZZLED_W> \
+        <<<dim3((co+31)/32,(n+WARPS*16-1)/(WARPS*16),batch),WARPS*32,0,stream>>>( \
+            out_ptr,packed_ptr,w_ptr,b,co,n,ci,lut)
+    switch(tile) {
+    case 7: UF_BLOCK_DIRECT(32,1,4); break;
+    case 8: UF_BLOCK_DIRECT(64,1,4); break;
+    case 9: UF_BLOCK_DIRECT(32,2,4); break;
+    case 10: UF_BLOCK_DIRECT(64,2,4); break;
+    case 11: UF_BLOCK_DIRECT(32,1,2); break;
+    case 12:
+        if constexpr(REDUCE4) { UF_BLOCK_FFN(4,1); }
+        else TORCH_CHECK(false,"FFN-only block tile");
+        break;
+    case 16:
+        if constexpr(REDUCE4) { UF_BLOCK_FFN(2,1); }
+        else TORCH_CHECK(false,"FFN-only block tile");
+        break;
+    case 19:
+        if constexpr(REDUCE4) { UF_BLOCK_FFN(4,6); }
+        else TORCH_CHECK(false,"FFN-only block tile");
+        break;
+    default: TORCH_CHECK(false,"channel-last block requires a direct tile");
+    }
+#undef UF_BLOCK_FFN
+#undef UF_BLOCK_DIRECT
+}
+
+template<bool REDUCE4,bool OUT_LAST,bool RES_LAST=false,bool DUAL_OUT=false,bool SWIZZLED_W=false>
 static torch::Tensor block_pointwise_impl(const torch::Tensor& x,const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias,const int16_t* lut,int tile,
     const c10::optional<torch::Tensor>& residual=c10::nullopt,
@@ -471,38 +507,9 @@ static torch::Tensor block_pointwise_impl(const torch::Tensor& x,const torch::Te
     }
     int16_t* dual=packed_output.has_value()?packed_output->data_ptr<int16_t>():nullptr;
     auto stream=c10::cuda::getCurrentCUDAStream();
-#define UF_BLOCK_DIRECT(TN,STEPS,WARPS) \
-    uf_mma_direct<TN,REDUCE4,STEPS,WARPS,OUT_LAST,RES_LAST,DUAL_OUT,SWIZZLED_W> \
-        <<<dim3((n+TN-1)/TN,(co+WARPS*16-1)/(WARPS*16),x.size(0)),WARPS*32,0,stream>>>( \
-            out.data_ptr<int16_t>(),packed_ptr,weight.data_ptr<int16_t>(), \
-            b,co,n,ci,lut,r,s,dual)
-#define UF_BLOCK_FFN(WARPS,MIN_BLOCKS) \
-    uf_mma_ffn<32,1,WARPS,MIN_BLOCKS,OUT_LAST,SWIZZLED_W> \
-        <<<dim3((co+31)/32,(n+WARPS*16-1)/(WARPS*16),x.size(0)),WARPS*32,0,stream>>>( \
-            out.data_ptr<int16_t>(),packed_ptr,weight.data_ptr<int16_t>(), \
-            b,co,n,ci,lut)
-    switch(tile) {
-    case 7: UF_BLOCK_DIRECT(32,1,4); break;
-    case 8: UF_BLOCK_DIRECT(64,1,4); break;
-    case 9: UF_BLOCK_DIRECT(32,2,4); break;
-    case 10: UF_BLOCK_DIRECT(64,2,4); break;
-    case 11: UF_BLOCK_DIRECT(32,1,2); break;
-    case 12:
-        if constexpr(REDUCE4) { UF_BLOCK_FFN(4,1); }
-        else TORCH_CHECK(false,"FFN-only block tile");
-        break;
-    case 16:
-        if constexpr(REDUCE4) { UF_BLOCK_FFN(2,1); }
-        else TORCH_CHECK(false,"FFN-only block tile");
-        break;
-    case 19:
-        if constexpr(REDUCE4) { UF_BLOCK_FFN(4,6); }
-        else TORCH_CHECK(false,"FFN-only block tile");
-        break;
-    default: TORCH_CHECK(false,"channel-last block requires a direct tile");
-    }
-#undef UF_BLOCK_FFN
-#undef UF_BLOCK_DIRECT
+    launch_block_pointwise<REDUCE4,OUT_LAST,RES_LAST,DUAL_OUT,SWIZZLED_W>(
+        out.data_ptr<int16_t>(),packed_ptr,weight.data_ptr<int16_t>(),
+        b,co,n,ci,x.size(0),tile,lut,r,s,dual,stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK(); return out;
 }
 
@@ -607,6 +614,19 @@ static bool packed_block(const torch::Tensor& x,const std::vector<torch::Tensor>
         pointwise_tile_shape(c,dc*4,spatial,x.numel(),true)>=7;
 }
 
+static int16_t* get_block_scratch(const torch::Tensor& x,int64_t needed,cudaStream_t stream) {
+    thread_local torch::Tensor buffers[8];
+    thread_local cudaStream_t streams[8]={nullptr};
+    int dev=x.device().index();
+    if(dev<0 || dev>=8) dev=0;
+    if(!buffers[dev].defined() || buffers[dev].device()!=x.device() ||
+       buffers[dev].numel()<needed || streams[dev]!=stream) {
+        buffers[dev]=torch::empty({needed},x.options());
+        streams[dev]=stream;
+    }
+    return buffers[dev].data_ptr<int16_t>();
+}
+
 static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
     const torch::Tensor& x,const std::vector<torch::Tensor>& weights,
     const std::vector<c10::optional<torch::Tensor>>& biases,const torch::Tensor& lut,bool shortcut,
@@ -618,47 +638,73 @@ static std::pair<torch::Tensor,c10::optional<torch::Tensor>> depth_block_impl(
                 "3x3 depthwise block required");
     if(packed_block(x,weights,biases,lut,packed_input.has_value())) {
         c10::cuda::CUDAGuard guard(x.device());
-        int tile=pointwise_tile(x,weights[0]),ffn_tile=pointwise_tile(x,weights[3],true),dc=depth.size(0);
+        int batch=x.size(0),c=x.size(1),h=x.size(2),w=x.size(3),dc=depth.size(0);
+        int64_t spatial_hw=static_cast<int64_t>(h)*w,n_elem=x.numel(),depth_elem=n_elem/c*dc;
+        int tile=pointwise_tile_shape(c,dc,spatial_hw,n_elem);
+        int projection_tile=pointwise_tile_shape(dc,c,spatial_hw,depth_elem);
+        int ffn_tile=pointwise_tile_shape(c,dc*4,spatial_hw,n_elem,true);
         const int16_t* table=lut.data_ptr<int16_t>();
+        torch::Tensor x_packed_holder;
+        const int16_t* x_ptr=nullptr;
         if(packed_input.has_value()) {
             const auto& p=*packed_input;
             TORCH_CHECK(p.device()==x.device() && p.scalar_type()==at::kShort && p.dim()==4 &&
-                p.size(0)==x.size(0) && p.size(1)==x.size(2) && p.size(2)==x.size(3) &&
-                p.size(3)==x.size(1) && p.is_contiguous() &&
+                p.size(0)==batch && p.size(1)==h && p.size(2)==w &&
+                p.size(3)==c && p.is_contiguous() &&
                 !(reinterpret_cast<uintptr_t>(p.data_ptr())&7),"invalid packed block input");
+            x_ptr=p.data_ptr<int16_t>();
+        } else if(x.is_contiguous(at::MemoryFormat::ChannelsLast)) {
+            x_ptr=x.data_ptr<int16_t>();
+        } else {
+            x_packed_holder=x.permute({0,2,3,1}).contiguous();
+            x_ptr=x_packed_holder.data_ptr<int16_t>();
         }
+        auto stream=c10::cuda::getCurrentCUDAStream();
+        int16_t* first_ptr=get_block_scratch(x,2*depth_elem+n_elem,stream);
+        int16_t* spatial_ptr=first_ptr+depth_elem;
+        int16_t* residual_ptr=spatial_ptr+depth_elem;
+        const int16_t* b0=biases[0].has_value()?biases[0]->data_ptr<int16_t>():nullptr;
+        const int16_t* b1=biases[1].has_value()?biases[1]->data_ptr<int16_t>():nullptr;
+        const int16_t* b2=biases[2].has_value()?biases[2]->data_ptr<int16_t>():nullptr;
+        const int16_t* b3=biases[3].has_value()?biases[3]->data_ptr<int16_t>():nullptr;
+        const int16_t* b4=biases[4].has_value()?biases[4]->data_ptr<int16_t>():nullptr;
         bool has_swiz=swizzled_weights.has_value() && swizzled_weights->size()==5;
-        auto swiz_at=[&](int i)->c10::optional<torch::Tensor> {
-            return has_swiz?c10::optional<torch::Tensor>((*swizzled_weights)[i]):c10::nullopt;
+        auto w_ptr=[&](int i)->const int16_t* {
+            return (has_swiz && weights[i].size(0)%8==0)
+                ? (*swizzled_weights)[i].data_ptr<int16_t>()
+                : weights[i].data_ptr<int16_t>();
         };
-        auto x_packed=packed_input.has_value()?*packed_input:x.permute({0,2,3,1}).contiguous();
-        auto first=block_pointwise<false,true>(x,weights[0],biases[0],table,tile,
-                                               c10::nullopt,c10::nullopt,x_packed,c10::nullopt,swiz_at(0));
-        auto spatial=torch::empty({x.size(0),x.size(2),x.size(3),dc},x.options()).permute({0,3,1,2});
-        int h_tiles=(x.size(2)+3)/4;
-        block_depthwise<<<dim3((dc+127)/128,x.size(3),x.size(0)*h_tiles),128,0,c10::cuda::getCurrentCUDAStream()>>>(
-            spatial.data_ptr<int16_t>(),first.data_ptr<int16_t>(),depth.data_ptr<int16_t>(),
-            biases[1].has_value()?biases[1]->data_ptr<int16_t>():nullptr,dc,x.size(2),x.size(3));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        int projection_tile=pointwise_tile(spatial,weights[2]);
-        auto residual=block_pointwise<false,true,true>(spatial,weights[2],biases[2],nullptr,projection_tile,
-                                                       x_packed,c10::nullopt,c10::nullopt,c10::nullopt,swiz_at(2));
-        auto expanded=block_pointwise<true,true>(residual,weights[3],biases[3],table,ffn_tile,
-                                                 c10::nullopt,c10::nullopt,c10::nullopt,c10::nullopt,swiz_at(3));
-        auto skip=shortcut?c10::optional<torch::Tensor>(x_packed):c10::nullopt;
+        auto launch_pt=[&]<bool R4,bool OL,bool RL,bool DO>(
+            int i,int16_t* out_p,const int16_t* in_p,const int16_t* bp,
+            int co,int ci,int t,const int16_t* l,const int16_t* r,const int16_t* s,int16_t* d) {
+            if(has_swiz && weights[i].size(0)%8==0)
+                launch_block_pointwise<R4,OL,RL,DO,true>(out_p,in_p,w_ptr(i),bp,co,spatial_hw,ci,batch,t,l,r,s,d,stream);
+            else
+                launch_block_pointwise<R4,OL,RL,DO,false>(out_p,in_p,w_ptr(i),bp,co,spatial_hw,ci,batch,t,l,r,s,d,stream);
+        };
+        launch_pt.template operator()<false,true,false,false>(0,first_ptr,x_ptr,b0,dc,c,tile,table,nullptr,nullptr,nullptr);
+        int h_tiles=(h+3)/4;
+        block_depthwise<<<dim3((dc+127)/128,w,batch*h_tiles),128,0,stream>>>(
+            spatial_ptr,first_ptr,depth.data_ptr<int16_t>(),b1,dc,h,w);
+        launch_pt.template operator()<false,true,true,false>(2,residual_ptr,spatial_ptr,b2,c,dc,projection_tile,nullptr,x_ptr,nullptr,nullptr);
+        launch_pt.template operator()<true,true,false,false>(3,first_ptr,residual_ptr,b3,dc*4,c,ffn_tile,table,nullptr,nullptr,nullptr);
+        const int16_t* skip_ptr=shortcut?x_ptr:nullptr;
         if(emit_packed && packed_only) {
-            auto result=block_pointwise<false,true,true>(expanded,weights[4],biases[4],nullptr,
-                projection_tile,residual,skip,c10::nullopt,c10::nullopt,swiz_at(4));
-            return {result,result.permute({0,2,3,1})};
+            auto p=torch::empty({batch,h,w,c},x.options());
+            launch_pt.template operator()<false,true,true,false>(4,p.data_ptr<int16_t>(),first_ptr,b4,c,dc,projection_tile,nullptr,residual_ptr,skip_ptr,nullptr);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return {p.permute({0,3,1,2}),p};
         }
+        auto result=torch::empty({batch,c,h,w},x.options());
         if(emit_packed) {
-            auto p=torch::empty({x.size(0),x.size(2),x.size(3),x.size(1)},x.options());
-            auto result=block_pointwise<false,false,true,true>(expanded,weights[4],biases[4],nullptr,
-                projection_tile,residual,skip,c10::nullopt,p,swiz_at(4));
+            auto p=torch::empty({batch,h,w,c},x.options());
+            launch_pt.template operator()<false,false,true,true>(4,result.data_ptr<int16_t>(),first_ptr,b4,c,dc,projection_tile,nullptr,residual_ptr,skip_ptr,p.data_ptr<int16_t>());
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
             return {result,p};
         }
-        return {block_pointwise<false,false,true>(expanded,weights[4],biases[4],nullptr,
-                                                  projection_tile,residual,skip,c10::nullopt,c10::nullopt,swiz_at(4)),c10::nullopt};
+        launch_pt.template operator()<false,false,true,false>(4,result.data_ptr<int16_t>(),first_ptr,b4,c,dc,projection_tile,nullptr,residual_ptr,skip_ptr,nullptr);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return {result,c10::nullopt};
     }
     auto xc=x.contiguous();
     auto first=uf_conv_post(xc,weights[0],biases[0],lut,c10::nullopt,c10::nullopt,0);
