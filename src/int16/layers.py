@@ -30,6 +30,9 @@ class Layers:
         self._native_cat_nhwc = None
         self._native_unshuffle_cat_nhwc = None
         self._native_unshuffle2x_nhwc = None
+        self._native_ps2x_nhwc = None
+        self._native_mul_nhwc = None
+        self._last_packed = None
         self._packed_chains = {}
         post_native = False
         if torch.device(device).type == 'cuda':
@@ -43,6 +46,8 @@ class Layers:
             self._native_cat_nhwc = getattr(uf_int16_cuda, 'cat_pack_nhwc', None)
             self._native_unshuffle_cat_nhwc = getattr(uf_int16_cuda, 'from_bytes_unshuffle_cat_nhwc', None)
             self._native_unshuffle2x_nhwc = getattr(uf_int16_cuda, 'unshuffle2x_pack_nhwc', None)
+            self._native_ps2x_nhwc = getattr(uf_int16_cuda, 'pixel_shuffle2x_pack_nhwc', None)
+            self._native_mul_nhwc = getattr(uf_int16_cuda, 'mul_pack_nhwc', None)
         for module in model.modules():
             if (callable(self._native_swizzle) and isinstance(module, nn.Conv2d)
                     and module.dilation == (1, 1) and module.padding_mode == 'zeros'
@@ -306,6 +311,19 @@ class Layers:
                 return self(module.conv[1], self(module.conv[0], x, _packed_input=_packed_input))
             return self(module.conv, x)
         if name == 'ResidualBlockUpsample':
+            if (self._native_ps2x_nhwc is not None and self._native_packed_block is not None
+                    and id(module.conv) in self._native_blocks and len(module.up.conv) == 2
+                    and isinstance(module.up.conv[1], nn.PixelShuffle)
+                    and module.up.conv[1].upscale_factor == 2):
+                u = self(module.up.conv[0], x, _packed_input=_packed_input)
+                if (u.is_cuda and 128 <= (u.shape[2] * 2) * (u.shape[3] * 2) <= 8192
+                        and u.numel() <= 8 * 1024 * 1024
+                        and (u.shape[1] // 4) >= 256 and (u.shape[1] // 4) % 32 == 0):
+                    up, packed_up = self._native_ps2x_nhwc(u)
+                    return self(module.conv, up, _packed_input=packed_up,
+                                _pack_output=_pack_output, _packed_only=_packed_only)
+                return self(module.conv, F.pixel_shuffle(u, 2),
+                            _pack_output=_pack_output, _packed_only=_packed_only)
             return self(module.conv, self(module.up, x, _packed_input=_packed_input),
                         _pack_output=_pack_output, _packed_only=_packed_only)
         if name == 'ResidualBlockWithStride2':
@@ -332,9 +350,24 @@ class Layers:
                         _pack_output=_pack_output, _packed_only=_packed_only)
         if name == 'IntraEncoder':
             source = ops.from_bytes_unshuffle(x) if source_bytes else F.pixel_unshuffle(x, 8)
-            return self(module.enc_2, ops.multiply(self(module.enc_1, source), args[1]))
+            enc1 = self(module.enc_1, source)
+            if (self._native_mul_nhwc is not None and id(module.enc_2) in self._packed_chains
+                    and enc1.is_cuda and 128 <= enc1.shape[2] * enc1.shape[3] <= 8192
+                    and enc1.numel() <= 8 * 1024 * 1024
+                    and enc1.shape[1] >= 256 and enc1.shape[1] % 32 == 0):
+                scaled, packed_s = self._native_mul_nhwc(enc1, args[1], True)
+                return self(module.enc_2, scaled, _packed_input=packed_s)
+            return self(module.enc_2, ops.multiply(enc1, args[1]))
         if name == 'IntraDecoder':
-            return F.pixel_shuffle(self(module.dec_2, ops.multiply(self(module.dec_1, x), args[1])), 8)
+            dec1 = self(module.dec_1, x)
+            if (self._native_mul_nhwc is not None and self._native_packed_block is not None
+                    and id(module.dec_2) in self._native_blocks
+                    and dec1.is_cuda and 128 <= dec1.shape[2] * dec1.shape[3] <= 8192
+                    and dec1.numel() <= 8 * 1024 * 1024
+                    and dec1.shape[1] >= 256 and dec1.shape[1] % 32 == 0):
+                scaled, packed_s = self._native_mul_nhwc(dec1, args[1], True)
+                return F.pixel_shuffle(self(module.dec_2, scaled, _packed_input=packed_s), 8)
+            return F.pixel_shuffle(self(module.dec_2, ops.multiply(dec1, args[1])), 8)
         if name == 'Encoder':
             if (source_bytes and x.dim() == 5 and self._native_unshuffle_cat_nhwc is not None
                     and id(module.conv1) in self._packed_chains
@@ -350,12 +383,34 @@ class Layers:
                 out = self(module.conv2, out)
             return self(module.down, ops.multiply(out, args[2]))
         if name == 'Decoder':
-            up = self(module.up, x)
-            cat_x, packed = self._cat_for_chain(module.conv1, up, args[1])
+            ctx = args[1]
+            if (self._native_ps2x_nhwc is not None and id(module.conv1) in self._packed_chains
+                    and len(module.up.conv) == 2 and isinstance(module.up.conv[1], nn.PixelShuffle)
+                    and module.up.conv[1].upscale_factor == 2 and x.is_cuda and ctx.is_cuda
+                    and 128 <= ctx.shape[2] * ctx.shape[3] <= 8192):
+                u = self(module.up.conv[0], x)
+                c_total = u.shape[1] // 4 + ctx.shape[1]
+                if ((u.numel() + ctx.numel()) <= 8 * 1024 * 1024
+                        and c_total >= 256 and c_total % 32 == 0):
+                    cat_x, packed = self._native_ps2x_nhwc(u, ctx)
+                else:
+                    cat_x, packed = self._cat_for_chain(module.conv1, F.pixel_shuffle(u, 2), ctx)
+            else:
+                up = self(module.up, x)
+                cat_x, packed = self._cat_for_chain(module.conv1, up, ctx)
             out = self(module.conv1, cat_x, _packed_input=packed)
             if hasattr(module, 'conv2'):
                 out = self(module.conv2, out)
-            return ops.multiply(out, args[2])
+            if (self._native_mul_nhwc is not None and out.is_cuda
+                    and 128 <= out.shape[2] * out.shape[3] <= 8192
+                    and out.numel() <= 8 * 1024 * 1024
+                    and out.shape[1] >= 256 and out.shape[1] % 32 == 0):
+                res, packed_res = self._native_mul_nhwc(out, args[2], False)
+                self._last_packed = (res.data_ptr(), res.shape, packed_res)
+                return (res, packed_res) if _pack_output else res
+            res = ops.multiply(out, args[2])
+            self._last_packed = None
+            return (res, None) if _pack_output else res
         if name == 'FeatureAdaptorM':
             cat_x, packed = self._cat_for_chain(module.conv, args[0], args[1])
             return self(module.conv, cat_x, _packed_input=packed,
@@ -372,26 +427,31 @@ class Layers:
             count = maximum if output_frames is None else output_frames
             if type(count) is not int or not 1 <= count <= maximum:
                 raise ValueError('Invalid UF reconstruction frame count')
+            if _packed_input is None and self._last_packed is not None and x.is_cuda:
+                ptr, shape, cached_packed = self._last_packed
+                if x.data_ptr() == ptr and x.shape == shape:
+                    _packed_input = cached_packed
             if hasattr(module, 'head'):  # LD
-                out = self(module.head, self(module.conv, x))
+                out = self(module.head, self(module.conv, x, _packed_input=_packed_input))
                 return out if for_reset else F.pixel_shuffle(out, 8)
             if module.is_hts:
                 if for_reset:
-                    return self(module.conv2[-1], self(module.conv1[-1], x))
+                    return self(module.conv2[-1], self(module.conv1[-1], x, _packed_input=_packed_input))
                 frames = []
                 for index in range(count):
                     if index % 2 == 0:
-                        shared = self(module.conv1[index//2], x)
+                        shared = self(module.conv1[index//2], x, _packed_input=_packed_input)
                     frames.append(F.pixel_shuffle(self(module.conv2[index], shared), 8))
                 return frames
             if for_reset:
-                return self(module.conv[-1], x)
-            packed_x = (x.permute(0, 2, 3, 1).contiguous()
-                        if (count > 1 and self._native_packed_block is not None
-                            and self._native_conv_packed is not None and x.is_cuda
-                            and x.is_contiguous() and x.shape[2]*x.shape[3] >= 128
-                            and x.numel() <= 8*1024*1024 and not (x.data_ptr() & 7))
-                        else None)
+                return self(module.conv[-1], x, _packed_input=_packed_input)
+            packed_x = (_packed_input if _packed_input is not None else
+                        (x.permute(0, 2, 3, 1).contiguous()
+                         if (count > 1 and self._native_packed_block is not None
+                             and self._native_conv_packed is not None and x.is_cuda
+                             and x.is_contiguous() and x.shape[2]*x.shape[3] >= 128
+                             and x.numel() <= 8*1024*1024 and not (x.data_ptr() & 7))
+                         else None))
             return ([F.pixel_shuffle(self(child, x, _packed_input=packed_x), 8)
                      for child in module.conv[:count]]
                     if packed_x is not None

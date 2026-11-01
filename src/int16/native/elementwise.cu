@@ -237,6 +237,65 @@ __global__ void unshuffle2x_nhwc_kernel(int16_t* __restrict__ out,
             out[(static_cast<int64_t>(batch)*hw_out+out_pos)*out_c_total+out_c]=tile[tx][ty+dy];
     }
 }
+__global__ void pixel_shuffle2x_cat_nhwc_kernel(int16_t* __restrict__ out,
+    const int16_t* __restrict__ u,const int16_t* __restrict__ ctx,
+    int c_up,int c_ctx,int w_in,int hw_in,int w_out,int hw_out) {
+    __shared__ int32_t tile[32][33];
+    int c_total=c_up+c_ctx;
+    int pos_base=blockIdx.x*32,c_base=blockIdx.y*32,batch=blockIdx.z;
+    int tx=threadIdx.x,ty=threadIdx.y;
+    int pos=pos_base+tx;
+    int oy=pos/w_out,ox=pos%w_out;
+    int in_pos=(oy>>1)*w_in+(ox>>1);
+    int sub=((oy&1)<<1)|(ox&1);
+    #pragma unroll
+    for(int dy=0;dy<32;dy+=8) {
+        int c=c_base+ty+dy;
+        if(pos<hw_out && c<c_total) {
+            tile[ty+dy][tx]=(c<c_up)
+                ? u[(static_cast<int64_t>(batch)*(c_up*4)+c*4+sub)*hw_in+in_pos]
+                : ctx[(static_cast<int64_t>(batch)*c_ctx+(c-c_up))*hw_out+pos];
+        }
+    }
+    __syncthreads();
+    int out_c=c_base+tx;
+    #pragma unroll
+    for(int dy=0;dy<32;dy+=8) {
+        int out_pos=pos_base+ty+dy;
+        if(out_pos<hw_out && out_c<c_total)
+            out[(static_cast<int64_t>(batch)*hw_out+out_pos)*c_total+out_c]=tile[tx][ty+dy];
+    }
+}
+template<bool DUAL_OUT>
+__global__ void mul_pack_nhwc_kernel(int16_t* __restrict__ out_nhwc,
+    int16_t* __restrict__ out_nchw,const int16_t* __restrict__ x,
+    const int16_t* __restrict__ scale,int c_total,int hw,bool scalar_scale) {
+    __shared__ int32_t tile[32][33];
+    int pos_base=blockIdx.x*32,c_base=blockIdx.y*32,batch=blockIdx.z;
+    int tx=threadIdx.x,ty=threadIdx.y;
+    int pos=pos_base+tx;
+    #pragma unroll
+    for(int dy=0;dy<32;dy+=8) {
+        int c=c_base+ty+dy;
+        if(pos<hw && c<c_total) {
+            int64_t idx=(static_cast<int64_t>(batch)*c_total+c)*hw+pos;
+            int s=scale[scalar_scale?0:c];
+            int prod=static_cast<int>(x[idx])*s;
+            int rnd=prod<0?-((-prod+256)/512):(prod+256)/512;
+            int16_t val=sat(rnd);
+            if constexpr(DUAL_OUT) out_nchw[idx]=val;
+            tile[ty+dy][tx]=val;
+        }
+    }
+    __syncthreads();
+    int out_c=c_base+tx;
+    #pragma unroll
+    for(int dy=0;dy<32;dy+=8) {
+        int out_pos=pos_base+ty+dy;
+        if(out_pos<hw && out_c<c_total)
+            out_nhwc[(static_cast<int64_t>(batch)*hw+out_pos)*c_total+out_c]=tile[tx][ty+dy];
+    }
+}
 __global__ void symbols_kernel(int8_t* out,const int16_t* x,int64_t n) {
     int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(i<n) out[i]=rna(x[i],512);
@@ -444,6 +503,61 @@ std::pair<torch::Tensor,torch::Tensor> uf_unshuffle2x_pack_nhwc(
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {packed.permute({0,3,1,2}),packed};
+}
+std::pair<torch::Tensor,torch::Tensor> uf_pixel_shuffle2x_pack_nhwc(
+    const torch::Tensor& u_in,const c10::optional<torch::Tensor>& ctx_in) {
+    auto u=u_in.contiguous();
+    check(u);
+    TORCH_CHECK(u.dim()==4 && u.size(1)%4==0,
+                "4D NCHW tensor with C%4==0 required for pixel_shuffle2x_pack_nhwc");
+    int64_t batch=u.size(0),c_up=u.size(1)/4,h_in=u.size(2),w_in=u.size(3),hw_in=h_in*w_in;
+    int64_t h_out=h_in*2,w_out=w_in*2,hw_out=h_out*w_out,c_ctx=0;
+    torch::Tensor ctx;
+    const int16_t* ctx_ptr=nullptr;
+    if(ctx_in.has_value() && ctx_in->defined()) {
+        ctx=ctx_in->contiguous();
+        check(ctx);
+        TORCH_CHECK(ctx.device()==u.device() && ctx.dim()==4 &&
+                    ctx.size(0)==batch && ctx.size(2)==h_out && ctx.size(3)==w_out,
+                    "context shape mismatch in pixel_shuffle2x_pack_nhwc");
+        c_ctx=ctx.size(1);
+        ctx_ptr=ctx.data_ptr<int16_t>();
+    }
+    int64_t c_total=c_up+c_ctx;
+    c10::cuda::CUDAGuard guard(u.device());
+    auto packed=torch::empty({batch,h_out,w_out,c_total},u.options());
+    dim3 grid((hw_out+31)/32,(c_total+31)/32,batch);
+    pixel_shuffle2x_cat_nhwc_kernel<<<grid,dim3(32,8),0,c10::cuda::getCurrentCUDAStream()>>>(
+        packed.data_ptr<int16_t>(),u.data_ptr<int16_t>(),ctx_ptr,
+        c_up,c_ctx,w_in,hw_in,w_out,hw_out);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {packed.permute({0,3,1,2}),packed};
+}
+std::pair<torch::Tensor,torch::Tensor> uf_mul_pack_nhwc(
+    const torch::Tensor& input,const torch::Tensor& factor,bool packed_only) {
+    auto x=input.contiguous(),sc=factor.contiguous();
+    check(x); check(sc);
+    TORCH_CHECK(x.device()==sc.device() && x.dim()==4 &&
+                (sc.numel()==1 || (sc.dim()==4 && sc.size(0)==1 && sc.size(1)==x.size(1) && sc.size(2)==1 && sc.size(3)==1)),
+                "invalid shape for mul_pack_nhwc");
+    int64_t batch=x.size(0),c=x.size(1),h=x.size(2),w=x.size(3),hw=h*w;
+    c10::cuda::CUDAGuard guard(x.device());
+    auto packed=torch::empty({batch,h,w,c},x.options());
+    dim3 grid((hw+31)/32,(c+31)/32,batch);
+    auto stream=c10::cuda::getCurrentCUDAStream();
+    if(packed_only) {
+        mul_pack_nhwc_kernel<false><<<grid,dim3(32,8),0,stream>>>(
+            packed.data_ptr<int16_t>(),nullptr,x.data_ptr<int16_t>(),
+            sc.data_ptr<int16_t>(),c,hw,sc.numel()==1);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return {packed.permute({0,3,1,2}),packed};
+    }
+    auto out=torch::empty_like(x);
+    mul_pack_nhwc_kernel<true><<<grid,dim3(32,8),0,stream>>>(
+        packed.data_ptr<int16_t>(),out.data_ptr<int16_t>(),x.data_ptr<int16_t>(),
+        sc.data_ptr<int16_t>(),c,hw,sc.numel()==1);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {out,packed};
 }
 torch::Tensor uf_wsilu4(const torch::Tensor& input,const torch::Tensor& table) {
     auto x=input.contiguous(),lut=table.contiguous(); check(x); check(lut);

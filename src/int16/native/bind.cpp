@@ -16,6 +16,10 @@ std::pair<torch::Tensor,torch::Tensor> uf_cat_pack_nhwc(const torch::Tensor&,con
 std::pair<torch::Tensor,torch::Tensor> uf_bytes_unshuffle_cat_nhwc(const torch::Tensor&,const torch::Tensor&);
 std::pair<torch::Tensor,torch::Tensor> uf_unshuffle2x_pack_nhwc(
     const torch::Tensor&,const c10::optional<torch::Tensor>& =c10::nullopt);
+std::pair<torch::Tensor,torch::Tensor> uf_pixel_shuffle2x_pack_nhwc(
+    const torch::Tensor&,const c10::optional<torch::Tensor>& =c10::nullopt);
+std::pair<torch::Tensor,torch::Tensor> uf_mul_pack_nhwc(
+    const torch::Tensor&,const torch::Tensor&,bool=false);
 torch::Tensor uf_wsilu4(const torch::Tensor&, const torch::Tensor&);
 torch::Tensor uf_raw_frame(const torch::Tensor&,int,int);
 torch::Tensor uf_raw_frames(const std::vector<torch::Tensor>&,int,int);
@@ -68,6 +72,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("from_bytes_unshuffle_cat_nhwc", &uf_bytes_unshuffle_cat_nhwc,pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("unshuffle2x_pack_nhwc", &uf_unshuffle2x_pack_nhwc,
           pybind11::arg("x"),pybind11::arg("scale")=pybind11::none(),
+          pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("pixel_shuffle2x_pack_nhwc", &uf_pixel_shuffle2x_pack_nhwc,
+          pybind11::arg("u"),pybind11::arg("ctx")=pybind11::none(),
+          pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("mul_pack_nhwc", &uf_mul_pack_nhwc,
+          pybind11::arg("x"),pybind11::arg("scale"),pybind11::arg("packed_only")=false,
           pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("wsilu4", &uf_wsilu4);
     m.def("raw_frame", &uf_raw_frame);
