@@ -316,6 +316,12 @@ static torch::Tensor pointwise_tiled(const torch::Tensor&,const torch::Tensor&,
     const c10::optional<torch::Tensor>& =c10::nullopt);
 
 static int pointwise_tile_shape(int64_t ci,int64_t co,int64_t spatial,int64_t elements,bool reduce4=false) {
+    // Measured with the 10k-frame protocol on the target GPU: the 32-column
+    // single-step direct tile (7) beats the wider two-step tiles for every
+    // evaluated non-reduce4 pointwise shape. Keep the direct-kernel geometry
+    // guards so unsupported shapes fall through to the existing paths.
+    if(!reduce4 && ci%32==0 && ci<=32768 && elements<=8*1024*1024)
+        return 7;
     // Transposing the MMA improves these measured FFN shapes. The 512-channel
     // 144p expansion and wider 768-channel priors retain their direct path.
     if(reduce4 && co>=ci*4 && elements<=8*1024*1024 && spatial>=128) {
@@ -327,12 +333,6 @@ static int pointwise_tile_shape(int64_t ci,int64_t co,int64_t spatial,int64_t el
     }
     // Packing is amortized by larger matrix products. Keep scratch <= 16 MiB.
     if(ci>=256 && ci%32==0 && ci<=32768 && elements<=8*1024*1024 && spatial>=128) {
-        if(!reduce4) {
-            if(spatial>=256 && spatial<=8192 && (ci>=256 || co>=ci*2))
-                return ((ci==256 && spatial>1024) || (spatial<=1024 && ci<=768 && co<=768))?11:10;
-            if(spatial<256 && ci>=640) return 9;
-            if(spatial<256 && ci>=256 && co<=ci) return 11;
-        }
         if(co>=ci*2) return spatial>=256 && spatial<=1024?9:7;
         if(ci>=256 && spatial>1024 && spatial<=8192) return 7;
     }
