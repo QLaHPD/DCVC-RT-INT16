@@ -4,7 +4,10 @@ import json
 import math
 from pathlib import Path
 
-BENCHMARK = Path(__file__).resolve().parents[2] / 'benchmarks/uf-int16-htl-144p-pareto.json'
+BENCHMARKS = {
+    'hts': Path(__file__).resolve().parents[2] / 'benchmarks/uf-int16-hts-144p-pareto.json',
+    'htl': Path(__file__).resolve().parents[2] / 'benchmarks/uf-int16-htl-144p-pareto.json',
+}
 CONFIG_FIELDS = {'qp_i': 'qp_i', 'qp_p': 'qp_p', 'reset_interval': 'reset_interval',
                  'intra_period': 'intra_period', 'skip_thres': 'skip_threshold'}
 
@@ -41,7 +44,12 @@ def apply_target_psnr(args):
     target = getattr(args, 'target_psnr', None)
     if target is None:
         return
-    benchmark = json.loads(BENCHMARK.read_text())
+    model = getattr(args, 'model_structure', None)
+    if model not in BENCHMARKS:
+        raise ValueError(f'No bundled --target-psnr benchmark for --model_structure {model}; '
+                         'use hts or htl, or omit --target-psnr for manual encoding')
+    benchmark_path = BENCHMARKS[model]
+    benchmark = json.loads(benchmark_path.read_text())
     explicit = getattr(args, '_explicit_codec_options', set())
     settings = benchmark['settings']
     benchmark_resolution = settings['resolution'].split(' -> ')[-1]
@@ -59,11 +67,13 @@ def apply_target_psnr(args):
     for field, key in CONFIG_FIELDS.items():
         setattr(args, field, trial['config'][key])
     args.target_psnr_selection = dict(
-        target_psnr=target, benchmark=BENCHMARK.name, trial=trial['trial'],
+        target_psnr=target, benchmark=benchmark_path.name,
+        model_structure=settings['model_structure'], trial=trial['trial'],
         measured_psnr=trial['psnr_db'], encode_seconds=trial['encode_seconds'],
         bitstream_bytes=trial['bitstream_bytes'], config=trial['config'],
         benchmark_resolution=benchmark_resolution, resolution=args.resolution,
-        message=(f"Benchmark trial {trial['trial']}: {trial['psnr_db']:.3f} dB, "
+        message=(f"{settings['model_structure'].upper()} benchmark trial {trial['trial']}: "
+                 f"{trial['psnr_db']:.3f} dB, "
                  f"{trial['encode_seconds']:.3f}s, {trial['bitstream_bytes']} bytes; "
                  f"{trial['config']}. Reference measurements at {benchmark_resolution}; "
                  f"output short edge {args.resolution}px. Actual video quality can vary."))

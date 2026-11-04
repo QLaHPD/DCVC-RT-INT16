@@ -93,24 +93,28 @@ Restart an existing streaming run to activate this scheduler.
 ### Benchmark quality selection
 
 `--target-psnr 30` works with local `encode`, `stream`, and `encode --source_urls`.
-It uses the bundled [benchmark](../benchmarks/README.md), including all successful
-trials, rather than only the size/quality Pareto frontier (which excludes some
-fast configurations). Candidates must reach the requested PSNR; ordering is
+It uses the bundled [benchmark](../benchmarks/README.md) for the selected
+`--model_structure`: HT-S (`hts`, the CLI default) or HT-L (`htl`). LD has no
+bundled benchmark. All successful trials in the matching file are searched,
+rather than only the size/quality Pareto frontier (which excludes some fast
+configurations). Candidates must reach the requested PSNR; ordering is
 encoding seconds, then bitstream bytes, then trial number for deterministic ties.
 Time and size are competing objectives, so time has priority.
 
-The selector fills `--runtime int16 --model_structure htl` and `--qp_i`,
-`--qp_p`, `--reset_interval`, `--intra_period`, `--skip_thres`. Any explicit
-`--resolution` is preserved; for a new channel, omitting it defaults to the
-benchmark's 144p short edge. Saved profiles retain their resolution.
-For example, `--target-psnr 30 --resolution 480` selects
-parameters from the calibration table and encodes at a 480p short edge.
+The selector fills `--runtime int16` and the benchmark's model structure, plus
+`--qp_i`, `--qp_p`, `--reset_interval`, `--intra_period`, `--skip_thres`. Any
+explicit `--resolution` is preserved; for a new channel, omitting it defaults to
+the benchmark's 144p short edge. Saved profiles retain their resolution.
+For example, `--target-psnr 30 --model_structure htl --resolution 480` selects
+parameters from the HT-L calibration table and encodes at a 480p short edge.
 Explicit codec parameters, including aliases `--qi`, `--qp`, and
 `--force_intra_period`, constrain selection and are retained. If no measured
 candidate qualifies, the command fails before downloading or loading models.
-Explicitly requesting another runtime or model structure also fails;
-omit `--target-psnr` for unrestricted manual settings. Audio, process count,
-source FPS and other options retain their usual behavior.
+Explicitly requesting `--runtime fp16` fails. Selecting `--model_structure ld`
+fails because no LD benchmark is bundled; explicitly selecting `hts` or `htl`
+uses that model's benchmark. Omit `--target-psnr` for unrestricted manual
+settings. Audio, process count, source FPS and other options retain their usual
+behavior.
 
 The selected trial, parameters and measured size/time/PSNR are printed in a
 `target_psnr_selected` event. PSNR comes from the benchmark source, and speed

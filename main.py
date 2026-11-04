@@ -60,7 +60,7 @@ def build_parser():
     encode.add_argument('--recursive', action=argparse.BooleanOptionalAction, default=True)
     encode.add_argument('--qi', '--qp_i', action=ExplicitCodecOption, dest='qp_i', type=int, choices=range(64), default=36)
     encode.add_argument('--qp', '--qp_p', action=ExplicitCodecOption, dest='qp_p', type=int, choices=range(64), default=30)
-    encode.add_argument('--target-psnr', type=positive, help='Select the fastest measured configuration meeting benchmark PSNR; smaller bytes break ties')
+    encode.add_argument('--target-psnr', type=positive, help='Select the fastest measured configuration for the selected model meeting benchmark PSNR; smaller bytes break ties')
     encode.add_argument('--fps', action=ExplicitCodecOption, type=positive)
     encode.add_argument('--resolution', action=ExplicitCodecOption, type=int, help='Short edge; preserve aspect ratio. Default: original size')
     encode.add_argument('--model_structure', action=ExplicitCodecOption, choices=('hts', 'htl', 'ld'), default='hts')

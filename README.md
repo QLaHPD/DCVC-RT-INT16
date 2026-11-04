@@ -85,15 +85,17 @@ are local; matching prepared models must already exist on the helper. See
 ### Choose settings by benchmark PSNR
 
 Add `--target-psnr 30` to `encode` or `stream` to select the fastest measured
-configuration with PSNR ≥30 dB; smaller bitstream size breaks equal-time ties.
-This fills INT16, HT-L and the five codec parameters automatically. Use any
-`--resolution`; omitting it defaults to the benchmark's 144p short edge.
-Explicit codec parameters constrain the candidate search; omit the target to
-keep fully manual settings. The target is a **benchmark reference**, not a
-quality guarantee for new content. See the [published 2,000-trial benchmark](benchmarks/README.md).
+configuration with PSNR ≥30 dB for the selected model; smaller bitstream size
+breaks equal-time ties. The benchmark is selected by `--model_structure`: HT-S
+by default, or HT-L with `--model_structure htl`. This fills INT16, the model
+and the five codec parameters automatically. Use any `--resolution`; omitting
+it defaults to the benchmark's 144p short edge. Explicit codec parameters
+constrain the candidate search; omit the target to keep fully manual settings.
+The target is a **benchmark reference**, not a quality guarantee for new
+content. See the [published 2,000-trial benchmarks](benchmarks/README.md).
 
 ```bash
-./scripts/uf-python main.py encode --input_file video.mp4 --output_root output --target-psnr 30 --resolution 480
+./scripts/uf-python main.py encode --input_file video.mp4 --output_root output --target-psnr 30 --model_structure htl --resolution 480
 ```
 
 ### YouTube streaming

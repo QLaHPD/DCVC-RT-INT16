@@ -166,7 +166,9 @@ def codec_options(args):
     from main import build_parser
     options = build_parser().parse_args(['encode', '--runtime', 'int16', '--target-psnr',
                                          str(args.target_psnr), '--fps', str(args.fps),
-                                         '--resolution', str(args.resolution)])
+                                         '--resolution', str(args.resolution),
+                                         '--model_structure',
+                                         getattr(args, 'model_structure', None) or 'htl'])
     apply_target_psnr(options)
     return options
 
@@ -308,6 +310,8 @@ def main():
     parser.add_argument('--fps', type=float, default=8)
     parser.add_argument('--resolution', type=int, default=288, help='Shortest side; preserve aspect ratio, no bars')
     parser.add_argument('--target-psnr', type=float, default=35, help='Bundled benchmark target, not a per-video guarantee')
+    parser.add_argument('--model-structure', choices=('hts', 'htl'), default='htl',
+                        help='Model and matching target-PSNR benchmark (default: htl)')
     parser.add_argument('--cuda-idx', type=int, default=0)
     parser.add_argument('--ytdlp-bin', default='yt-dlp')
     parser.add_argument('--min-free-gib', type=float, default=1)

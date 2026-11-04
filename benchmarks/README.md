@@ -1,33 +1,48 @@
-# UF INT16 HT-L calibration benchmark
+# UF INT16 144p calibration benchmarks
 
-[uf-int16-htl-144p-pareto.json](uf-int16-htl-144p-pareto.json) is the complete,
-unchanged result of our earlier 2,000-trial search, completed September 13, 2026
-UTC on the Jetson. All 2,000 trials succeeded. The published copy lives outside
-the ignored `runs/` directory and ships with the code; models and test media do
-not. Original local paths in the metadata record provenance and are not needed
-to use the results.
+Two complete 2,000-trial searches share the same source, resolution, search
+space and seed:
+
+- [uf-int16-hts-144p-pareto.json](uf-int16-hts-144p-pareto.json) — HT-S,
+  measured on the local RTX 3050 laptop, November 4, 2026.
+- [uf-int16-htl-144p-pareto.json](uf-int16-htl-144p-pareto.json) — HT-L,
+  measured on the Jetson, September 13, 2026 UTC.
+
+All 2,000 trials in each file succeeded. The selector uses the file matching
+`--model_structure`: HT-S (`hts`, the CLI default) or HT-L (`htl`). LD has no
+bundled benchmark. The published copies live outside the ignored `runs/`
+directory and ship with the code; models and test media do not. Original local
+paths in the metadata record provenance and are not needed to use the results.
 
 The source was the 10-second, 300-frame Big Buck Bunny sample, resized from
 1280×720 to **256×144**, at 30 FPS. Source SHA-256, prepared-model identities,
 search seed, parameter domains and measurements are retained in the JSON.
 PSNR is mean per-frame YUV420 PSNR with 6:1:1 Y:U:V weighting. Byte sizes are
 video bitstreams only, excluding audio and metadata. Encoding seconds are the
-codec's measured encoding duration, excluding decoding and download startup.
+codec's measured encoding duration, excluding decoding and download startup;
+they were measured on different hardware, so compare PSNR and bytes across the
+two files, not absolute speed.
 
-`encode`/`stream --target-psnr` searches every successful trial with measured
-PSNR at least the target, choosing minimum encoding time, then minimum bytes
-for a time tie, then trial number. Restricting selection to the 2D size/PSNR
-frontier would discard potentially faster choices. This is a speed-first
-selection, not simultaneous independent minimization of size and time.
-The selected codec parameters can be used with any explicit `--resolution`;
-without one, the selector defaults to the benchmark's 144p short edge.
-The recorded PSNR, speed and sizes remain measurements at 256×144.
+`encode`/`stream --target-psnr` searches every successful trial in the selected
+model's file with measured PSNR at least the target, choosing minimum encoding
+time, then minimum bytes for a time tie, then trial number. Restricting
+selection to the 2D size/PSNR frontier would discard potentially faster
+choices. This is a speed-first selection, not simultaneous independent
+minimization of size and time. The selected codec parameters can be used with
+any explicit `--resolution`; without one, the selector defaults to the
+benchmark's 144p short edge. The recorded PSNR, speed and sizes remain
+measurements at 256×144.
 
-For `--target-psnr 30`, trial **783** is selected:
+For `--target-psnr 30`:
 
-| QI | QP | Reset interval | Intra period | Skip threshold | PSNR (dB) | Encode seconds | Bytes |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 10 | 14 | 2 | -1 | 0.2 | 31.225371 | 3.992191 | 17,830 |
+| Model | Trial | QI | QP | Reset interval | Intra period | Skip threshold | PSNR (dB) | Encode seconds | Bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| HT-S | 8 | 53 | 22 | 5 | -1 | 0.15 | 33.570 | 0.2967 | 17,702 |
+| HT-L | 783 | 10 | 14 | 2 | -1 | 0.2 | 31.225371 | 3.992191 | 17,830 |
+
+The HT-S encoder is fast enough that many trials cluster near 0.297 seconds for
+300 frames; its speed-first ordering can therefore be decided by sub-millisecond
+timing differences.
 
 These are reference measurements, not a promise that arbitrary videos reach
 the same PSNR or encode at the same speed. The selector does not retrain models,

@@ -17,13 +17,22 @@ class PresetTests(unittest.TestCase):
         self.assertEqual(vars(args), before)
         self.assertEqual((args.runtime, args.model_structure, args.qp_i, args.qp_p), ('fp16', 'hts', 36, 30))
 
-    def test_published_target_30_matches_known_fastest_trial(self):
+    def test_target_30_uses_selected_model_benchmark(self):
         args = self.parse('--target-psnr', '30')
+        apply_target_psnr(args)
+        self.assertEqual((args.runtime, args.model_structure, args.resolution), ('int16', 'hts', 144))
+        self.assertEqual((args.qp_i, args.qp_p, args.reset_interval, args.intra_period, args.skip_thres),
+                         (53, 22, 5, -1, .15))
+        self.assertEqual(args.target_psnr_selection['trial'], 8)
+        self.assertEqual(args.target_psnr_selection['benchmark'], 'uf-int16-hts-144p-pareto.json')
+
+        args = self.parse('--target-psnr', '30', '--model_structure', 'htl')
         apply_target_psnr(args)
         self.assertEqual((args.runtime, args.model_structure, args.resolution), ('int16', 'htl', 144))
         self.assertEqual((args.qp_i, args.qp_p, args.reset_interval, args.intra_period, args.skip_thres),
                          (10, 14, 2, -1, .2))
         self.assertEqual(args.target_psnr_selection['trial'], 783)
+        self.assertEqual(args.target_psnr_selection['benchmark'], 'uf-int16-htl-144p-pareto.json')
 
     def test_explicit_aliases_constrain_selection_even_if_equal_to_default(self):
         args = self.parse('--target-psnr=30', '--qi=36', '--qp', '30')
@@ -32,9 +41,10 @@ class PresetTests(unittest.TestCase):
         self.assertGreaterEqual(args.target_psnr_selection['measured_psnr'], 30)
 
     def test_incompatible_benchmark_settings_fail(self):
-        for option, value in [('runtime', 'fp16'), ('model_structure', 'hts')]:
-            with self.subTest(option=option), self.assertRaisesRegex(ValueError, 'requires'):
-                apply_target_psnr(self.parse('--target-psnr', '30', '--'+option, value))
+        with self.assertRaisesRegex(ValueError, 'requires'):
+            apply_target_psnr(self.parse('--target-psnr', '30', '--runtime', 'fp16'))
+        with self.assertRaisesRegex(ValueError, 'No bundled'):
+            apply_target_psnr(self.parse('--target-psnr', '30', '--model_structure', 'ld'))
 
     def test_impossible_target_and_unmeasured_constraints_fail(self):
         for options in [('--target-psnr', '1000'), ('--target-psnr', '30', '--skip_thres', '0.123')]:

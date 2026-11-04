@@ -14,8 +14,10 @@ show's inventory, including records SRF labels `CLIP`.
 
 The shortest side becomes 288 pixels, preserving aspect ratio without padding:
 16:9 becomes 512×288; 4:3 becomes 384×288. Target PSNR selects a measured preset
-from the bundled benchmark; its reference quality is not a per-broadcast
-guarantee. Audio uses the archive defaults (mono Opus, 6 kbit/s, 60 ms frames).
+from the bundled benchmark for the selected model; this runner defaults to HT-L
+and accepts `--model-structure hts` for the HT-S benchmark. Its reference
+quality is not a per-broadcast guarantee. Audio uses the archive defaults
+(mono Opus, 6 kbit/s, 60 ms frames).
 
 The runner processes the inventory newest first, with one persistent INT16 GPU
 worker. It selects the highest available source resolution, and extracts video and audio in one
