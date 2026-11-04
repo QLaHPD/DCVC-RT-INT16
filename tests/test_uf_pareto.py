@@ -64,6 +64,25 @@ class ParetoTests(unittest.TestCase):
         self.assertAlmostEqual(result['psnr_db'], (6*y + u + v) / 8)
         self.assertTrue(np.isfinite(list(result.values())).all())
 
+    def test_psnr_sink_splits_multiframe_packets(self):
+        width, height = 4, 2
+        size = width * height * 3 // 2
+        first = bytes([1] * (size - 4)) + bytes([2, 3, 4, 5])
+        second = bytes([6] * (size - 4)) + bytes([7, 8, 9, 10])
+        references = [bytes([0] * size), bytes([255] * size)]
+        sink = PsnrSink(references, width, height)
+        sink.write(first + second)
+        self.assertEqual(sink.index, 2)
+        expected = {}
+        for index, frame in enumerate((first, second)):
+            single = PsnrSink([references[index]], width, height)
+            single.write(frame)
+            for key, value in single.result().items():
+                expected[key] = expected.get(key, 0.0) + value / 2
+        result = sink.result()
+        for key, value in expected.items():
+            self.assertAlmostEqual(result[key], value)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -115,6 +115,14 @@ class PsnrSink:
         return 99.9 if mse <= 1e-10 else min(99.9, 10 * math.log10(255 * 255 / mse))
 
     def write(self, raw):
+        # Temporal decoders deliver up to eight concatenated frames per packet.
+        size = self.width * self.height * 3 // 2
+        if len(raw) % size:
+            raise ValueError('Decoder produced a partial frame')
+        for offset in range(0, len(raw), size):
+            self._write_frame(raw[offset:offset + size])
+
+    def _write_frame(self, raw):
         if self.index >= len(self.references):
             raise ValueError('Decoder produced more frames than the source reference')
         reference = np.frombuffer(self.references[self.index], dtype=np.uint8)
