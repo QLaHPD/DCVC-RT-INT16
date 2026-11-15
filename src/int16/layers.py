@@ -1,5 +1,7 @@
 """Execute UF layer topology using integer tensors and prepared parameters only."""
 
+import weakref
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -369,10 +371,11 @@ class Layers:
                 return F.pixel_shuffle(self(module.dec_2, scaled, _packed_input=packed_s), 8)
             return F.pixel_shuffle(self(module.dec_2, ops.multiply(dec1, args[1])), 8)
         if name == 'Encoder':
-            if (source_bytes and x.dim() == 5 and self._native_unshuffle_cat_nhwc is not None
+            if (source_bytes and x.dim() == 5 and x.shape[0] == args[1].shape[0]
+                    and self._native_unshuffle_cat_nhwc is not None
                     and id(module.conv1) in self._packed_chains
                     and args[1].shape[2] * args[1].shape[3] >= 128
-                    and (x.shape[1] * 3 * 64 + args[1].shape[1]) * args[1].shape[2] * args[1].shape[3] <= 8 * 1024 * 1024):
+                    and x.shape[0] * (x.shape[1] * 3 * 64 + args[1].shape[1]) * args[1].shape[2] * args[1].shape[3] <= 8 * 1024 * 1024):
                 cat_x, packed = self._native_unshuffle_cat_nhwc(x, args[1])
                 out = self(module.conv1, cat_x, _packed_input=packed)
             else:
@@ -406,7 +409,7 @@ class Layers:
                     and out.numel() <= 8 * 1024 * 1024
                     and out.shape[1] >= 256 and out.shape[1] % 32 == 0):
                 res, packed_res = self._native_mul_nhwc(out, args[2], False)
-                self._last_packed = (res.data_ptr(), res.shape, packed_res)
+                self._last_packed = (weakref.ref(res), res.data_ptr(), res.shape, packed_res)
                 return (res, packed_res) if _pack_output else res
             res = ops.multiply(out, args[2])
             self._last_packed = None
@@ -428,8 +431,8 @@ class Layers:
             if type(count) is not int or not 1 <= count <= maximum:
                 raise ValueError('Invalid UF reconstruction frame count')
             if _packed_input is None and self._last_packed is not None and x.is_cuda:
-                ptr, shape, cached_packed = self._last_packed
-                if x.data_ptr() == ptr and x.shape == shape:
+                ref, ptr, shape, cached_packed = self._last_packed
+                if ref() is x and x.data_ptr() == ptr and x.shape == shape:
                     _packed_input = cached_packed
             if hasattr(module, 'head'):  # LD
                 out = self(module.head, self(module.conv, x, _packed_input=_packed_input))

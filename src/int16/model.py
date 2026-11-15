@@ -289,6 +289,7 @@ class IntegerModel:
                 reference = run(m.recon_head, feature, for_reset=True)
             self.clear_dpb()
             self.reference = reference
+        run._last_packed = None
         return frames
 
     @torch.no_grad()

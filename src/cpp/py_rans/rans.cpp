@@ -325,6 +325,7 @@ void RansEncoderLib::encode_chunk_flush(const int32_t* y_ptr, int y_size, const 
     }
     {
         std::lock_guard<std::mutex> lk_result(m_mutex_result);
+        m_error = nullptr;
         m_result_ready = false;
     }
     PendingTask p;
@@ -455,6 +456,7 @@ std::shared_ptr<std::vector<uint8_t>> RansEncoderLib::get_encoded_stream()
 {
     std::unique_lock<std::mutex> lk(m_mutex_result);
     m_cv_result.wait(lk, [this] { return m_result_ready || m_finish; });
+    if (m_error) std::rethrow_exception(m_error);
     return m_stream;
 }
 
@@ -468,6 +470,7 @@ void RansEncoderLib::reset()
     m_ptr = ptrEnd;
 
     std::lock_guard<std::mutex> lk(m_mutex_result);
+    m_error = nullptr;
     m_result_ready = false;
 }
 
@@ -491,32 +494,42 @@ void RansEncoderLib::worker()
             auto p = std::move(m_pending.front());
             m_pending.pop();
             lk.unlock();
-            if (p.workType == WorkType::EncodeDecodeY) {
-                RansEncoderLib::encode_y_internal(p.symbols_y, p.symbol_size, p.symbol_offset);
-            } else if (p.workType == WorkType::EncodeDecodeZ) {
-                RansEncoderLib::encode_z_internal(p.symbols_z, p.symbol_size, p.symbol_offset,
-                                                  p.cdf_offset, p.ch);
-            } else if (p.workType == WorkType::Flush) {
-                RansEncFlush(m_rans, m_ptr);
+            try {
+                if (m_error) std::rethrow_exception(m_error);
+                if (p.workType == WorkType::EncodeDecodeY) {
+                    RansEncoderLib::encode_y_internal(p.symbols_y, p.symbol_size, p.symbol_offset);
+                } else if (p.workType == WorkType::EncodeDecodeZ) {
+                    RansEncoderLib::encode_z_internal(p.symbols_z, p.symbol_size, p.symbol_offset,
+                                                      p.cdf_offset, p.ch);
+                } else if (p.workType == WorkType::Flush) {
+                    RansEncFlush(m_rans, m_ptr);
 
-                uint8_t* ptrEnd = m_stream_buffer + max_stream_buffer_size;
-                const int nbytes = static_cast<int>(std::distance(m_ptr, ptrEnd));
+                    uint8_t* ptrEnd = m_stream_buffer + max_stream_buffer_size;
+                    const int nbytes = static_cast<int>(std::distance(m_ptr, ptrEnd));
 
-                if (m_ptr < m_stream_buffer || nbytes > max_stream_buffer_size) {
-                    throw std::runtime_error("rANS stream buffer overflow: encoded size ("
-                                             + std::to_string(nbytes) + ") exceeds buffer capacity ("
-                                             + std::to_string(max_stream_buffer_size) + ")");
+                    if (m_ptr < m_stream_buffer || nbytes > max_stream_buffer_size) {
+                        throw std::runtime_error("rANS stream buffer overflow: encoded size ("
+                                                 + std::to_string(nbytes) + ") exceeds buffer capacity ("
+                                                 + std::to_string(max_stream_buffer_size) + ")");
+                    }
+
+                    m_stream->resize(nbytes);
+                    std::copy(m_ptr, m_ptr + nbytes, m_stream->data());
+                    {
+                        std::lock_guard<std::mutex> lk_result(m_mutex_result);
+                        m_result_ready = true;
+                    }
+                    m_cv_result.notify_one();
+                } else if (p.workType == WorkType::EncodeChunkFlush) {
+                    RansEncoderLib::encode_chunk_flush_internal(p.cdf_offset, p.ch);
                 }
-
-                m_stream->resize(nbytes);
-                std::copy(m_ptr, m_ptr + nbytes, m_stream->data());
+            } catch (...) {
                 {
                     std::lock_guard<std::mutex> lk_result(m_mutex_result);
+                    m_error = std::current_exception();
                     m_result_ready = true;
                 }
                 m_cv_result.notify_one();
-            } else if (p.workType == WorkType::EncodeChunkFlush) {
-                RansEncoderLib::encode_chunk_flush_internal(p.cdf_offset, p.ch);
             }
             lk.lock();
         }

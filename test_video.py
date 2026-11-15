@@ -359,7 +359,7 @@ def run_one_point_with_stream(p_net, i_net, args):
                     y_rec, uv_rec = yuv_444_to_420(x_hat + 0.5)
                     y_rec = torch.clamp(y_rec * 255, 0, 255).round().byte()
                     y_rec = y_rec.squeeze(0).cpu().numpy()
-                    uv_rec = torch.clamp(uv_rec * 255, 0, 255).byte()
+                    uv_rec = torch.clamp(uv_rec * 255, 0, 255).round().byte()
                     uv_rec = uv_rec.squeeze(0).cpu().numpy()
                     recon_writer.write_one_frame(y_rec, uv_rec)
                 else:
@@ -463,7 +463,7 @@ def worker(args):
     args['src_path'] = os.path.join(args['dataset_path'], sub_dir_name)
     args['bin_folder'] = bin_folder
     args['curr_bin_path'] = os.path.join(bin_folder, f"{args['seq']}_q{args['qp_i']}.bin")
-    args['curr_rec_path'] = args['curr_bin_path'].replace('.bin', '.mp4')
+    args['curr_rec_path'] = args['curr_bin_path'].replace('.bin', '.yuv')
     args['curr_json_path'] = args['curr_bin_path'].replace('.bin', '.json')
 
     result = run_one_point_with_stream(g_p_net, g_i_net, args)

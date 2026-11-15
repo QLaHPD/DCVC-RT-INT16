@@ -113,10 +113,11 @@ __global__ void bytes_unshuffle_yuv420_kernel(int16_t* out,const uint8_t* x,
     }
 }
 __global__ void bytes_unshuffle_yuv420_nhwc_kernel(int16_t* __restrict__ out,const uint8_t* __restrict__ x,
-    int h,int w,int oh,int ow,int tiles_w,int out_c) {
+    int h,int w,int oh,int ow,int tiles_w,int planes_per_batch,int out_c) {
     __shared__ int16_t tile[32][66];
     int ox=(blockIdx.x%tiles_w)*32,group=blockIdx.x/tiles_w;
     int oy=group%oh,plane=group/oh;
+    int batch=plane/planes_per_batch,local_plane=plane%planes_per_batch;
     int frame=plane/3,comp=plane%3;
     int position=threadIdx.x/8,sub_x=threadIdx.x%8;
     if(ox+position<ow) {
@@ -148,7 +149,7 @@ __global__ void bytes_unshuffle_yuv420_nhwc_kernel(int16_t* __restrict__ out,con
     for(int i=threadIdx.x;i<32*64;i+=256) {
         int pos=i/64,channel=i%64;
         if(ox+pos<ow)
-            out[(static_cast<int64_t>(oy*ow+ox+pos)*out_c)+plane*64+channel]=tile[pos][channel];
+            out[(static_cast<int64_t>(batch*oh+oy)*ow+ox+pos)*out_c+local_plane*64+channel]=tile[pos][channel];
     }
 }
 __global__ void cat_pack_nhwc_kernel(int16_t* __restrict__ out,
@@ -451,25 +452,25 @@ std::pair<torch::Tensor,torch::Tensor> uf_cat_pack_nhwc(
 std::pair<torch::Tensor,torch::Tensor> uf_bytes_unshuffle_cat_nhwc(
     const torch::Tensor& input,const torch::Tensor& ctx_in) {
     TORCH_CHECK(input.is_cuda() && input.scalar_type()==at::kByte && input.dim()==5 &&
-                input.size(0)==1 && input.size(2)==3 && input.size(4)%2==0 &&
+                input.size(0)>=1 && input.size(2)==3 && input.size(4)%2==0 &&
                 input.numel()>0 && input.numel()<=INT32_MAX,
                 "invalid packed YUV420 dimensions for unshuffle_cat_nhwc");
     auto x=input.contiguous(),ctx=ctx_in.contiguous();
     check(ctx);
-    int64_t h=x.size(3)*2,w=x.size(4);
+    int64_t batch=x.size(0),h=x.size(3)*2,w=x.size(4);
     int64_t planes=x.size(1)*3,src_c=planes*64;
     int64_t oh=(h+15)/16*2,ow=(w+15)/16*2,hw=oh*ow;
-    TORCH_CHECK(ctx.device()==x.device() && ctx.dim()==4 && ctx.size(0)==1 &&
+    TORCH_CHECK(ctx.device()==x.device() && ctx.dim()==4 && ctx.size(0)==batch &&
                 ctx.size(2)==oh && ctx.size(3)==ow,"context shape mismatch in unshuffle_cat_nhwc");
     int64_t ctx_c=ctx.size(1),total_c=src_c+ctx_c;
-    TORCH_CHECK(total_c*hw<=INT32_MAX,"unshuffled cat exceeds indexing bounds");
+    TORCH_CHECK(batch*total_c*hw<=INT32_MAX,"unshuffled cat exceeds indexing bounds");
     c10::cuda::CUDAGuard guard(x.device());
-    auto packed=torch::empty({1,oh,ow,total_c},ctx.options());
+    auto packed=torch::empty({batch,oh,ow,total_c},ctx.options());
     auto stream=c10::cuda::getCurrentCUDAStream();
-    int64_t tiles_w=(ow+31)/32,blocks=planes*oh*tiles_w;
+    int64_t tiles_w=(ow+31)/32,blocks=batch*planes*oh*tiles_w;
     bytes_unshuffle_yuv420_nhwc_kernel<<<blocks,256,0,stream>>>(
-        packed.data_ptr<int16_t>(),x.data_ptr<uint8_t>(),h,w,oh,ow,tiles_w,total_c);
-    dim3 grid((hw+31)/32,(ctx_c+31)/32,1);
+        packed.data_ptr<int16_t>(),x.data_ptr<uint8_t>(),h,w,oh,ow,tiles_w,planes,total_c);
+    dim3 grid((hw+31)/32,(ctx_c+31)/32,batch);
     copy_nchw_to_nhwc_slice_kernel<<<grid,dim3(32,8),0,stream>>>(
         packed.data_ptr<int16_t>(),ctx.data_ptr<int16_t>(),ctx_c,total_c,src_c,hw);
     C10_CUDA_KERNEL_LAUNCH_CHECK();

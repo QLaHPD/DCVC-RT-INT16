@@ -490,7 +490,7 @@ static torch::Tensor block_pointwise_impl(const torch::Tensor& x,const torch::Te
     const int16_t* r=nullptr;
     const int16_t* s=nullptr;
     if(residual.has_value()) {
-        if(RES_LAST && (residual->is_contiguous(at::MemoryFormat::ChannelsLast) || residual->is_contiguous()))
+        if(RES_LAST ? residual->is_contiguous(at::MemoryFormat::ChannelsLast) : residual->is_contiguous())
             r=residual->data_ptr<int16_t>();
         else {
             res=RES_LAST?residual->permute({0,2,3,1}).contiguous():residual->contiguous();
@@ -498,7 +498,7 @@ static torch::Tensor block_pointwise_impl(const torch::Tensor& x,const torch::Te
         }
     }
     if(shortcut.has_value()) {
-        if(RES_LAST && (shortcut->is_contiguous(at::MemoryFormat::ChannelsLast) || shortcut->is_contiguous()))
+        if(RES_LAST ? shortcut->is_contiguous(at::MemoryFormat::ChannelsLast) : shortcut->is_contiguous())
             s=shortcut->data_ptr<int16_t>();
         else {
             skip=RES_LAST?shortcut->permute({0,2,3,1}).contiguous():shortcut->contiguous();
@@ -615,12 +615,19 @@ static bool packed_block(const torch::Tensor& x,const std::vector<torch::Tensor>
 }
 
 static int16_t* get_block_scratch(const torch::Tensor& x,int64_t needed,cudaStream_t stream) {
-    thread_local torch::Tensor buffers[8];
-    thread_local cudaStream_t streams[8]={nullptr};
+    thread_local std::vector<torch::Tensor> buffers;
+    thread_local std::vector<cudaStream_t> streams;
     int dev=x.device().index();
-    if(dev<0 || dev>=8) dev=0;
+    if(dev<0) dev=0;
+    if(static_cast<size_t>(dev)>=buffers.size()) {
+        buffers.resize(dev+1);
+        streams.resize(dev+1,nullptr);
+    }
     if(!buffers[dev].defined() || buffers[dev].device()!=x.device() ||
        buffers[dev].numel()<needed || streams[dev]!=stream) {
+        if(buffers[dev].defined() && streams[dev]!=nullptr && streams[dev]!=stream) {
+            cudaStreamSynchronize(streams[dev]);
+        }
         buffers[dev]=torch::empty({needed},x.options());
         streams[dev]=stream;
     }

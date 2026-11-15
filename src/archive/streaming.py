@@ -273,6 +273,10 @@ def stream_jobs(args, binary, counts, cancel_event=None, config=None):
                       audio_format=remote['audio_format'], audio_language=audio.get('language') if audio else None,
                       audio_note=audio.get('format_note') if audio else None, archive=str(final))
                 yield job
+            except InterruptedError:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                raise
             except Exception as exc:
                 counts['failed'] += 1
                 event('stream_failed', video_id=entry.get('id'), error=str(exc))
@@ -408,6 +412,10 @@ def catalog_jobs(args, binary, counts, cancel_event):
             event('stream_selected', video_id=video_id, channel_id=channel,
                   video_format=remote['video_format'], audio_format=remote['audio_format'], archive=str(final))
             yield job
+        except InterruptedError:
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            raise
         except Exception as exc:
             counts['failed'] += 1
             event('encode_failed', job_key=video_url, source=video_url, error=f'{type(exc).__name__}: {exc}')

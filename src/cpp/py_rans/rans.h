@@ -83,6 +83,7 @@ private:
     uint8_t* m_stream_buffer{ nullptr };
     RansState m_rans;
     uint8_t* m_ptr{ nullptr };
+    std::exception_ptr m_error;
     std::shared_ptr<std::vector<uint8_t>> m_stream;
 
     std::vector<std::shared_ptr<std::vector<std::vector<RansSymbol>>>> m_ransSymbols;
