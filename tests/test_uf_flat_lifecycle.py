@@ -70,6 +70,20 @@ class FlatLifecycleTests(unittest.TestCase):
         self.flat();self.assertEqual(self.encode(),'encoded')
         row=next(iter(inventory([self.final.parent]).values()))
         self.assertTrue(channel_blockers(row,self.options(allow_missing_metadata=False)))
+        # Channel-level _NA.info.json / playlist metadata must not block validation.
+        channel_na=self.source.with_name(f'{self.source.parent.name}_NA.info.json')
+        channel_na.write_text(json.dumps({'id':self.source.parent.name,'_type':'playlist'}))
+        yt_channel_na=self.source.with_name('UC1234567890123456789012_NA.info.json')
+        yt_channel_na.write_text(json.dumps({'id':'UC1234567890123456789012','channel_id':'UC1234567890123456789012'}))
+        playlist_na=self.source.with_name('TabVideos_NA.info.json')
+        playlist_na.write_text(json.dumps({'id':'TabVideos','_type':'playlist','entries':[]}))
+        self.assertEqual(channel_blockers(row,self.options(allow_missing_metadata=True)),[])
+        # A real unarchived video's .info.json still blocks cleanup.
+        video_info=self.source.with_name('dQw4w9WgXcQ_20250101.info.json')
+        video_info.write_text(json.dumps({'id':'dQw4w9WgXcQ','ext':'mp4','duration':42}))
+        self.assertEqual(channel_blockers(row,self.options(allow_missing_metadata=True)),
+                         ['Missing video archive for dQw4w9WgXcQ_20250101.info.json'])
+        video_info.unlink()
         self.source.with_name('another.mkv').write_bytes(b'pending')
         self.assertTrue(channel_blockers(row,self.options(allow_missing_metadata=True)))
 

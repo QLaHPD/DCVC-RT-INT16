@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import json
 import os
+import re
 import time
 
 from src.archive.storage import event, manifest_path, has_completion_record
@@ -224,6 +225,24 @@ def revalidate_channel(channel, args):
         return False
 
 
+def is_channel_metadata(path, directory):
+    base = path.name.removesuffix('.info.json')
+    if base in (directory.name, f'{directory.name}_NA') or re.fullmatch(r'U[CU][A-Za-z0-9_-]{22}(?:_NA)?', base):
+        return True
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get('_type') in ('playlist', 'multi_video') or 'entries' in data:
+        return True
+    item_id = data.get('id')
+    if item_id and item_id in (directory.name, data.get('channel_id'), data.get('uploader_id')):
+        return True
+    return base.endswith('_NA') and not (data.get('formats') or data.get('ext') or data.get('duration'))
+
+
 def channel_blockers(row,args):
     from src.archive.media import VIDEO_EXTENSIONS
     reasons=[]
@@ -243,5 +262,6 @@ def channel_blockers(row,args):
                 reasons.append('Unprocessed source: '+path.name)
             elif path.name.endswith('.info.json') and not path.name.endswith('.uf.info.json'):
                 base=path.name.removesuffix('.info.json')
-                if base not in covered: reasons.append('Missing video archive for '+path.name)
+                if base not in covered and not is_channel_metadata(path, directory):
+                    reasons.append('Missing video archive for '+path.name)
     return reasons[:10]
